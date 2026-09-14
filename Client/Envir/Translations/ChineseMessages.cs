@@ -138,6 +138,12 @@ namespace Client.Envir.Translations
         public override string BigMapRecenterLabel { get; set; } = "重新居中";
         public override string BigMapNPCTabLabel { get; set; } = "NPC";
         public override string BigMapMonsterTabLabel { get; set; } = "怪物";
+        public override string BigMapDropsTitle { get; set; } = "{0} - 掉落";
+        public override string BigMapDropsItemColumn { get; set; } = "物品";
+        public override string BigMapDropsChanceColumn { get; set; } = "几率";
+        public override string BigMapDropsPartLabel { get; set; } = "仅碎片";
+        public override string BigMapDropsNone { get; set; } = "此地图没有已知掉落。";
+        public override string BigMapDropsBaseRateNote { get; set; } = "仅为基础几率，实际几率会有变化。";
         public override string CommonControlConfirm { get; set; } = "确认";
         public override string CommonControlExit { get; set; } = "退出";
         public override string CommonControlNo { get; set; } = "否";

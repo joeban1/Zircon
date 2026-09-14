@@ -15,11 +15,11 @@
 	<AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
-    <OutputPath>..\..\Debug\Client\</OutputPath>
+    <OutputPath>C:\ZirconBuild\Debug\Client\</OutputPath>
     <GenerateSerializationAssemblies>Off</GenerateSerializationAssemblies>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
-    <OutputPath>..\..\Debug\Client\</OutputPath>
+    <OutputPath>C:\ZirconBuild\Debug\Client\</OutputPath>
   </PropertyGroup>
   <PropertyGroup>
     <ApplicationIcon>Zircon.ico</ApplicationIcon>

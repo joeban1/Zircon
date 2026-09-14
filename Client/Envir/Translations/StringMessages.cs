@@ -137,6 +137,12 @@ namespace Client.Envir.Translations
         public abstract string BigMapRecenterLabel { get; set; }
         public abstract string BigMapNPCTabLabel { get; set; }
         public abstract string BigMapMonsterTabLabel { get; set; }
+        public abstract string BigMapDropsTitle { get; set; }
+        public abstract string BigMapDropsItemColumn { get; set; }
+        public abstract string BigMapDropsChanceColumn { get; set; }
+        public abstract string BigMapDropsPartLabel { get; set; }
+        public abstract string BigMapDropsNone { get; set; }
+        public abstract string BigMapDropsBaseRateNote { get; set; }
         public abstract string CommonControlConfirm { get; set; }
         public abstract string CommonControlExit { get; set; }
         public abstract string CommonControlNo { get; set; }

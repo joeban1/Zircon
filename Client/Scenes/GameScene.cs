@@ -267,6 +267,7 @@ namespace Client.Scenes
         public NPCRollDialog NPCRollBox;
         public MiniMapDialog MiniMapBox;
         public BigMapDialog BigMapBox;
+        public MonsterDropsDialog MonsterDropsBox;
         public MagicDialog MagicBox;
         public GroupDialog GroupBox;
         public GroupHealthDialog GroupHealthBox;
@@ -668,6 +669,11 @@ namespace Client.Scenes
             };
 
             BigMapBox = new BigMapDialog
+            {
+                Parent = this,
+                Visible = false,
+            };
+            MonsterDropsBox = new MonsterDropsDialog
             {
                 Parent = this,
                 Visible = false,
@@ -2420,7 +2426,7 @@ namespace Client.Scenes
             return item.Info;
         }
 
-        private static Color GetItemLabelRarityColour(Rarity rarity)
+        internal static Color GetItemLabelRarityColour(Rarity rarity)
         {
             switch (rarity)
             {
@@ -5013,6 +5019,14 @@ namespace Client.Scenes
                         BigMapBox.Dispose();
 
                     BigMapBox = null;
+                }
+
+                if (MonsterDropsBox != null)
+                {
+                    if (!MonsterDropsBox.IsDisposed)
+                        MonsterDropsBox.Dispose();
+
+                    MonsterDropsBox = null;
                 }
 
                 if (MagicBox != null)

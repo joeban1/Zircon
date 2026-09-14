@@ -137,6 +137,12 @@ namespace Client.Envir.Translations
         public override string BigMapRecenterLabel { get; set; } = "Recenter";
         public override string BigMapNPCTabLabel { get; set; } = "NPC";
         public override string BigMapMonsterTabLabel { get; set; } = "Monster";
+        public override string BigMapDropsTitle { get; set; } = "{0} - Drops";
+        public override string BigMapDropsItemColumn { get; set; } = "Item";
+        public override string BigMapDropsChanceColumn { get; set; } = "Chance";
+        public override string BigMapDropsPartLabel { get; set; } = "Part only";
+        public override string BigMapDropsNone { get; set; } = "No known drops on this map.";
+        public override string BigMapDropsBaseRateNote { get; set; } = "Base rates only - actual rates vary.";
         public override string CommonControlConfirm { get; set; } = "Confirm";
         public override string CommonControlExit { get; set; } = "Exit";
         public override string CommonControlNo { get; set; } = "No";

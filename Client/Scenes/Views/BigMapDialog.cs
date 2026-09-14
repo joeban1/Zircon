@@ -57,6 +57,10 @@ namespace Client.Scenes.Views
             MapInfoObjects.Clear();
             SelectedNPC = null;
 
+            // Drops are filtered per map, so a window left open would be showing the previous map's data.
+            SelectedMonster = null;
+            GameScene.Game?.MonsterDropsBox?.Close();
+
             if (SelectedInfo == null) return;
 
             TitleLabel.Text = SelectedInfo.PlayerDescription;
@@ -212,6 +216,19 @@ namespace Client.Scenes.Views
         }
         private NPCInfo _SelectedNPC;
 
+        private MonsterInfo SelectedMonster
+        {
+            get => _SelectedMonster;
+            set
+            {
+                if (_SelectedMonster == value) return;
+
+                _SelectedMonster = value;
+                RefreshMonsterList();
+            }
+        }
+        private MonsterInfo _SelectedMonster;
+
         public Dictionary<object, DXControl> MapInfoObjects = new Dictionary<object, DXControl>();
         public List<AutoPathRouteControl> AutoPathRoutes = new List<AutoPathRouteControl>();
 
@@ -362,7 +379,10 @@ namespace Client.Scenes.Views
             }
 
             foreach (BigMapListRow row in MonsterRows)
+            {
+                row.MouseClick += MonsterRow_MouseClick;
                 row.MouseWheel += MonsterScrollBar.DoMouseWheel;
+            }
 
             SideTabControl.SelectedTab = NPCTab;
         }
@@ -549,7 +569,7 @@ namespace Client.Scenes.Views
                 MonsterRows[i].Entry = monster;
                 MonsterRows[i].DisplayText = monster?.MonsterName ?? string.Empty;
                 MonsterRows[i].IsBoss = monster?.IsBoss == true;
-                MonsterRows[i].Selected = false;
+                MonsterRows[i].Selected = monster != null && monster == SelectedMonster;
                 MonsterRows[i].Visible = i < visibleRows;
             }
         }
@@ -567,6 +587,17 @@ namespace Client.Scenes.Views
 
             SelectedNPC = npc;
             CEnvir.Enqueue(new C.AutoPathStart { NPCIndex = npc.Index });
+        }
+
+        private void MonsterRow_MouseClick(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left || sender is not BigMapListRow row || row.Entry is not MonsterInfo monster) return;
+
+            SelectedMonster = monster;
+
+            if (GameScene.Game?.MonsterDropsBox == null || SelectedInfo == null) return;
+
+            GameScene.Game.MonsterDropsBox.Show(monster, SelectedInfo.Regions.SelectMany(x => x.Respawns));
         }
 
         public void SelectNPC(int index)
@@ -1048,6 +1079,7 @@ namespace Client.Scenes.Views
             {
                 _SelectedInfo = null;
                 _SelectedNPC = null;
+                _SelectedMonster = null;
                 SelectedInfoChanged = null;
 
                 Area = Rectangle.Empty;
@@ -1141,6 +1173,8 @@ namespace Client.Scenes.Views
                     foreach (BigMapListRow row in MonsterRows)
                     {
                         if (row == null) continue;
+
+                        row.MouseClick -= MonsterRow_MouseClick;
 
                         if (MonsterScrollBar != null)
                             row.MouseWheel -= MonsterScrollBar.DoMouseWheel;
