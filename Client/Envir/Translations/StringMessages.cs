@@ -143,6 +143,28 @@ namespace Client.Envir.Translations
         public abstract string BigMapDropsPartLabel { get; set; }
         public abstract string BigMapDropsNone { get; set; }
         public abstract string BigMapDropsBaseRateNote { get; set; }
+        public abstract string BigMapDropsTabLabel { get; set; }
+        public abstract string BigMapBrowserTabLabel { get; set; }
+        public abstract string BigMapBrowserTitle { get; set; }
+        public abstract string BigMapBrowserButtonLabel { get; set; }
+        public abstract string BigMapBrowserSearchLabel { get; set; }
+        public abstract string BigMapBrowserAnyType { get; set; }
+        public abstract string BigMapBrowserAnyClass { get; set; }
+        public abstract string BigMapBrowserNoItems { get; set; }
+        public abstract string BigMapBrowserNoSources { get; set; }
+        public abstract string BigMapBrowserSelectItem { get; set; }
+        public abstract string BigMapBrowserLevelFormat { get; set; }
+        public abstract string BigMapBrowserNotSpawned { get; set; }
+        public abstract string GuidesTitle { get; set; }
+        public abstract string GuidesItemProgressionTitle { get; set; }
+        public abstract string GuidesSectionWeapons { get; set; }
+        public abstract string GuidesSectionArmour { get; set; }
+        public abstract string GuidesSectionAccessories { get; set; }
+        public abstract string GuidesSectionCritical { get; set; }
+        public abstract string GuidesNoItems { get; set; }
+        public abstract string GuidesColumnItem { get; set; }
+        public abstract string GuidesColumnCritChance { get; set; }
+        public abstract string GuidesColumnCritDamage { get; set; }
         public abstract string CommonControlConfirm { get; set; }
         public abstract string CommonControlExit { get; set; }
         public abstract string CommonControlNo { get; set; }

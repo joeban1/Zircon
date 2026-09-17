@@ -52,6 +52,8 @@ namespace Client.Scenes
             Size newSize = UISize;
 
             NPCBox?.RefreshTextLayoutForScale();
+            GuidesBox?.RefreshForScale();
+            MonsterDropsBox?.RefreshForScale();
 
             foreach (DXControl control in Controls)
             {
@@ -240,6 +242,7 @@ namespace Client.Scenes
         public MenuDialog MenuBox;
         public DXConfigWindow ConfigBox;
         public HelpDialog HelpBox;
+        public GuidesDialog GuidesBox;
         public CaptionDialog CaptionBox;
         public InventoryDialog InventoryBox;
         public CharacterDialog CharacterBox;
@@ -506,6 +509,9 @@ namespace Client.Scenes
             GameStoreBox?.LoadSettings();
             ConsignmentBox?.LoadSettings();
 
+            GuidesBox?.RefreshForScale();
+            MonsterDropsBox?.RefreshForScale();
+
             LoadChatTabs();
             ClampUIControls();
         }
@@ -560,6 +566,12 @@ namespace Client.Scenes
             {
                 Parent = this,
                 Visible = false
+            };
+
+            GuidesBox = new GuidesDialog
+            {
+                Parent = this,
+                Visible = false,
             };
 
             ExitBox = new ExitDialog
@@ -1350,6 +1362,9 @@ namespace Client.Scenes
                         break;
                     case KeyBindAction.HelpWindow:
                         HelpBox.Visible = !HelpBox.Visible;
+                        break;
+                    case KeyBindAction.GuidesWindow:
+                        GuidesBox.Visible = !GuidesBox.Visible;
                         break;
                     case KeyBindAction.ConfigWindow:
                         ConfigBox.Visible = !ConfigBox.Visible;
@@ -4843,6 +4858,14 @@ namespace Client.Scenes
                         HelpBox.Dispose();
 
                     HelpBox = null;
+                }
+
+                if (GuidesBox != null)
+                {
+                    if (!GuidesBox.IsDisposed)
+                        GuidesBox.Dispose();
+
+                    GuidesBox = null;
                 }
 
                 if (ChatTextBox != null)

@@ -57,9 +57,10 @@ namespace Client.Scenes.Views
             MapInfoObjects.Clear();
             SelectedNPC = null;
 
-            // Drops are filtered per map, so a window left open would be showing the previous map's data.
+            // Drops are filtered per map, so stale data must go - but the item browser is not
+            // map-specific, so only the drops side is cleared.
             SelectedMonster = null;
-            GameScene.Game?.MonsterDropsBox?.Close();
+            GameScene.Game?.MonsterDropsBox?.CloseDrops();
 
             if (SelectedInfo == null) return;
 
@@ -196,7 +197,7 @@ namespace Client.Scenes.Views
         public BigMapListRow[] NPCRows, MonsterRows;
         public BigMapSelectionControl NPCSelectionControl;
 
-        public DXButton RecenterButton;
+        public DXButton RecenterButton, BrowseItemsButton;
 
         public static float ScaleX, ScaleY;
         private Size _MapClientSize;
@@ -325,6 +326,16 @@ namespace Client.Scenes.Views
             };
             RecenterButton.MouseClick += RecenterButton_MouseClick;
 
+            BrowseItemsButton = new DXButton
+            {
+                ButtonType = ButtonType.Default,
+                Label = { Text = CEnvir.Language.BigMapBrowserButtonLabel },
+                Parent = this,
+                Size = new Size(80, DefaultHeight),
+                LabelStyle = ButtonLabelStyle.Gold,
+            };
+            BrowseItemsButton.MouseClick += BrowseItemsButton_MouseClick;
+
             CreateSidePanel();
         }
 
@@ -432,6 +443,10 @@ namespace Client.Scenes.Views
             if (RecenterButton == null) return;
 
             RecenterButton.Location = new Point(Size.Width - 30 - RecenterButton.Size.Width, Size.Height - 43);
+
+            if (BrowseItemsButton == null) return;
+
+            BrowseItemsButton.Location = new Point(RecenterButton.Location.X - 6 - BrowseItemsButton.Size.Width, RecenterButton.Location.Y);
         }
 
         private void LayoutSidePanel()
@@ -653,6 +668,11 @@ namespace Client.Scenes.Views
         private void RecenterButton_MouseClick(object sender, MouseEventArgs e)
         {
             GameScene.Game.BigMapBox.SelectedInfo = GameScene.Game.MapControl.MapInfo;
+        }
+
+        private void BrowseItemsButton_MouseClick(object sender, MouseEventArgs e)
+        {
+            GameScene.Game?.MonsterDropsBox?.ShowBrowser();
         }
 
         private void Image_MouseClick(object sender, MouseEventArgs e)
@@ -1140,6 +1160,16 @@ namespace Client.Scenes.Views
                         RecenterButton.Dispose();
 
                     RecenterButton = null;
+                }
+
+                if (BrowseItemsButton != null)
+                {
+                    BrowseItemsButton.MouseClick -= BrowseItemsButton_MouseClick;
+
+                    if (!BrowseItemsButton.IsDisposed)
+                        BrowseItemsButton.Dispose();
+
+                    BrowseItemsButton = null;
                 }
 
                 if (NPCSelectionControl != null)

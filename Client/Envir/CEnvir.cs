@@ -603,6 +603,10 @@ namespace Client.Envir
                     bind.Category = "Windows";
                     bind.Key1 = Keys.H;
                     break;
+                case KeyBindAction.GuidesWindow:
+                    bind.Category = "Windows";
+                    bind.Key1 = Keys.Home;
+                    break;
                 case KeyBindAction.ConfigWindow:
                     bind.Category = "Windows";
                     bind.Key1 = Keys.O;

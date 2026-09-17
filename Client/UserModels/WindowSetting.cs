@@ -159,6 +159,7 @@ namespace Client.UserModels
         HelpBox,
         GameStoreBox,
         ConsignmentBox,
-        CraftingBox
+        CraftingBox,
+        GuidesBox
     }
 }

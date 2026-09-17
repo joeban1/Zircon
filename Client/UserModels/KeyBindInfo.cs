@@ -336,6 +336,9 @@ namespace Client.UserModels
         MenuWindow,
 
         [Description("Help Window")]
-        HelpWindow
+        HelpWindow,
+
+        [Description("Guides Window")]
+        GuidesWindow
     }
 }
