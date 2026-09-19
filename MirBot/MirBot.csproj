@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>MirBot</AssemblyName>
+    <RootNamespace>MirBot</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LibraryCore\LibraryCore.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="bot.ini.example" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

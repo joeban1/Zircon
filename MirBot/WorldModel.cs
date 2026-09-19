@@ -1,0 +1,592 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using Library;
+using Library.SystemModels;
+
+namespace MirBot
+{
+    public enum ObjectKind { Player, Monster, NPC, Item }
+
+    public sealed class WorldObject
+    {
+        public uint ObjectID;
+        public ObjectKind Kind;
+        public string Name;
+        public Point Location;
+        public MirDirection Direction;
+
+        public bool Dead;
+        public int Health;
+        public int MaxHealth;
+        public int Level;
+
+        /// <summary>MonsterInfo.AI. -1 is a town Guard; 1 and 2 are passive harvestable animals.</summary>
+        public int AI;
+
+        /// <summary>For ObjectKind.Item: what is lying there, so loot can be judged before walking to it.</summary>
+        public ItemInfo ItemInfo;
+
+        /// <summary>The full instance when the packet carried one - needed to see added stats.</summary>
+        public ClientUserItem Item;
+
+        public DateTime LastSeen;
+
+        public bool IsLiveMonster => Kind == ObjectKind.Monster && !Dead;
+
+        /// <summary>
+        /// Guards (AI -1) are monsters in the data model but are town furniture: they cannot be
+        /// usefully fought and are often standing somewhere unreachable. Targeting one is how the
+        /// first live run wedged itself against a wall for two minutes.
+        /// </summary>
+        public bool IsGuard => AI == -1;
+
+        public bool IsValidTarget => IsLiveMonster && !IsGuard;
+
+        public override string ToString() => $"{Kind}:{Name}#{ObjectID}@{Location.X},{Location.Y}" +
+                                             (Dead ? " (dead)" : "");
+    }
+
+    /// <summary>
+    /// Everything the bot believes about the world, rebuilt from packets.
+    ///
+    /// This holds OBSERVED facts only. Anything derived or guessed belongs somewhere else - when
+    /// step 3 adds model-driven decisions, mixing an inference back in here would let a wrong guess
+    /// feed itself on the next tick.
+    ///
+    /// Version increments on every mutation so a decision can record the world it was computed
+    /// from and be discarded when that world has moved on.
+    /// </summary>
+    public sealed class WorldModel
+    {
+        public uint SelfID;
+        public string Name = "";
+        public Point Location;
+        public MirDirection Direction;
+        public int MapIndex;
+        public MirClass Class;
+        public MirGender Gender;
+        public int Level;
+
+        public int Health;
+        public int Mana;
+        public int MaxHealth;
+        public int MaxMana;
+        public bool Dead;
+
+        public int BagWeight;
+        public int MaxBagWeight;
+
+        /// <summary>Storage is only reachable from a safe zone (PlayerObject.cs:7421).</summary>
+        public bool InSafeZone;
+
+        /// <summary>Our own stats, needed to test an item's RequiredType/RequiredAmount.</summary>
+        public Stats PlayerStats = new Stats();
+
+        public decimal Experience;
+        public decimal MaxExperience;
+
+        /// <summary>
+        /// StartInformation carries no MaxExperience, so it is 0 for the first seconds of every
+        /// session - indistinguishable from "max level" on the value alone. Only treat 0 as max
+        /// level once the server has actually told us a maximum.
+        /// </summary>
+        public bool MaxExperienceKnown;
+
+        public bool AtMaxLevel => MaxExperienceKnown && MaxExperience == 0;
+
+        public long Gold;
+        private int _goldCurrencyIndex = -1;
+
+        /// <summary>
+        /// When the server last told us combat time changed. S.CombatTime is empty - its arrival
+        /// IS the information. The server refuses a logout within 10s of this.
+        /// </summary>
+        public DateTime LastCombat = DateTime.MinValue;
+
+        public bool InCombat => DateTime.UtcNow < LastCombat.AddSeconds(10);
+
+        public void ApplyCombat()
+        {
+            LastCombat = DateTime.UtcNow;
+        }
+
+        public void ApplyExperienceGain(decimal amount)
+        {
+            Experience += amount;       // a delta, not an absolute
+            Touch();
+        }
+
+        public void ApplyMaxExperience(decimal max)
+        {
+            MaxExperience = max;
+            MaxExperienceKnown = true;
+            Touch();
+        }
+
+        public void ApplyLevelChanged(int level, decimal experience, decimal max)
+        {
+            Level = level;
+            Experience = experience;
+            MaxExperience = max;
+            MaxExperienceKnown = true;
+            Touch();
+        }
+
+        /// <summary>Resolve which currency is gold once; do not assume it is the first.</summary>
+        public void ApplyCurrencies(IEnumerable<ClientUserCurrency> currencies)
+        {
+            if (currencies == null) return;
+
+            foreach (ClientUserCurrency currency in currencies)
+            {
+                if (currency?.Info == null || currency.Info.Type != CurrencyType.Gold) continue;
+
+                _goldCurrencyIndex = currency.Info.Index;
+                Gold = currency.Amount;
+                Touch();
+                return;
+            }
+        }
+
+        public void ApplyCurrency(int currencyIndex, long amount)
+        {
+            if (currencyIndex != _goldCurrencyIndex) return;
+
+            Gold = amount;              // absolute, not a delta
+            Touch();
+        }
+
+        /// <summary>Learned skills, keyed by MagicInfo.Index.</summary>
+        private readonly Dictionary<int, ClientUserMagic> _magics = new Dictionary<int, ClientUserMagic>();
+
+        public int KnownMagicCount => _magics.Count;
+
+        public bool Knows(int magicInfoIndex) => _magics.ContainsKey(magicInfoIndex);
+
+        /// <summary>Skill level, or -1 when the skill is not known.</summary>
+        public int MagicLevel(int magicInfoIndex) =>
+            _magics.TryGetValue(magicInfoIndex, out ClientUserMagic magic) ? magic.Level : -1;
+
+        public void ApplyMagics(IEnumerable<ClientUserMagic> magics)
+        {
+            _magics.Clear();
+
+            if (magics == null) return;
+
+            foreach (ClientUserMagic magic in magics) ApplyMagic(magic);
+        }
+
+        /// <summary>
+        /// Upsert. S.NewMagic also arrives when the server merely clears ItemRequired on a
+        /// skill that is already known, so this must not assume the magic is new.
+        /// </summary>
+        public void ApplyMagic(ClientUserMagic magic)
+        {
+            if (magic == null) return;
+
+            _magics[magic.InfoIndex] = magic;
+            Touch();
+        }
+
+        public void ApplyMagicLevel(int magicInfoIndex, int level, long experience)
+        {
+            if (!_magics.TryGetValue(magicInfoIndex, out ClientUserMagic magic)) return;
+
+            magic.Level = level;
+            magic.Experience = experience;
+            Touch();
+        }
+
+        /// <summary>0-100. Returns 0 while the maximum is unknown, so weight gates stay open.</summary>
+        public int WeightPercent => MaxBagWeight > 0 ? BagWeight * 100 / MaxBagWeight : 0;
+
+        public long Version { get; private set; }
+
+        private readonly Dictionary<uint, WorldObject> _objects = new Dictionary<uint, WorldObject>();
+
+        public int HealthPercent => MaxHealth > 0 ? Health * 100 / MaxHealth : 100;
+        public int ManaPercent => MaxMana > 0 ? Mana * 100 / MaxMana : 100;
+
+        public IEnumerable<WorldObject> Objects => _objects.Values;
+        public int ObjectCount => _objects.Count;
+
+        private void Touch() => Version++;
+
+        /// <summary>Chebyshev distance - movement and melee range are 8-directional.</summary>
+        public static int Distance(Point a, Point b) =>
+            Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
+
+        public int DistanceTo(Point p) => Distance(Location, p);
+
+        public static MirDirection DirectionTo(Point from, Point to)
+        {
+            int dx = Math.Sign(to.X - from.X);
+            int dy = Math.Sign(to.Y - from.Y);
+
+            if (dx == 0 && dy < 0) return MirDirection.Up;
+            if (dx > 0 && dy < 0) return MirDirection.UpRight;
+            if (dx > 0 && dy == 0) return MirDirection.Right;
+            if (dx > 0 && dy > 0) return MirDirection.DownRight;
+            if (dx == 0 && dy > 0) return MirDirection.Down;
+            if (dx < 0 && dy > 0) return MirDirection.DownLeft;
+            if (dx < 0 && dy == 0) return MirDirection.Left;
+            if (dx < 0 && dy < 0) return MirDirection.UpLeft;
+
+            return MirDirection.Up;
+        }
+
+        public static Point Step(Point from, MirDirection direction)
+        {
+            switch (direction)
+            {
+                case MirDirection.Up: return new Point(from.X, from.Y - 1);
+                case MirDirection.UpRight: return new Point(from.X + 1, from.Y - 1);
+                case MirDirection.Right: return new Point(from.X + 1, from.Y);
+                case MirDirection.DownRight: return new Point(from.X + 1, from.Y + 1);
+                case MirDirection.Down: return new Point(from.X, from.Y + 1);
+                case MirDirection.DownLeft: return new Point(from.X - 1, from.Y + 1);
+                case MirDirection.Left: return new Point(from.X - 1, from.Y);
+                case MirDirection.UpLeft: return new Point(from.X - 1, from.Y - 1);
+                default: return from;
+            }
+        }
+
+        public static MirDirection Opposite(MirDirection direction) =>
+            (MirDirection)(((int)direction + 4) % 8);
+
+        #region Queries
+
+        public WorldObject NearestLiveMonster(int maxDistance, ICollection<uint> exclude = null)
+        {
+            WorldObject best = null;
+            int bestDistance = int.MaxValue;
+
+            foreach (WorldObject ob in _objects.Values)
+            {
+                if (!ob.IsValidTarget) continue;
+
+                if (exclude != null && exclude.Contains(ob.ObjectID)) continue;
+
+                int distance = DistanceTo(ob.Location);
+                if (distance > maxDistance || distance >= bestDistance) continue;
+
+                best = ob;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
+
+        public int LiveMonstersWithin(int maxDistance) =>
+            _objects.Values.Count(x => x.IsValidTarget && DistanceTo(x.Location) <= maxDistance);
+
+        #endregion
+
+        #region Packet application
+
+        public void ApplyStart(StartInformation start)
+        {
+            SelfID = start.ObjectID;
+            Name = start.Name;
+            Location = start.Location;
+            Direction = start.Direction;
+            MapIndex = start.MapIndex;
+            Class = start.Class;
+            Gender = start.Gender;
+            Level = start.Level;
+            InSafeZone = start.InSafeZone;
+            ApplyMagics(start.Magics);
+
+            Experience = start.Experience;
+            MaxExperience = 0;
+            MaxExperienceKnown = false;
+            Gold = 0;
+            _goldCurrencyIndex = -1;
+            LastCombat = DateTime.MinValue;
+            ApplyCurrencies(start.Currencies);
+            Health = start.CurrentHP;
+            Mana = start.CurrentMP;
+            Dead = false;
+
+            // MaxHealth is not in StartInformation - it arrives via DataObjectMaxHealthMana.
+            // Until then HealthPercent reports 100 rather than dividing by zero.
+            _objects.Clear();
+            Touch();
+        }
+
+        public void ApplyMapChanged(int mapIndex)
+        {
+            MapIndex = mapIndex;
+
+            // Objects belong to the map we left.
+            _objects.Clear();
+            Touch();
+        }
+
+        /// <summary>The server's authoritative correction. Always wins over dead reckoning.</summary>
+        public void ApplyUserLocation(Point location, MirDirection direction)
+        {
+            Location = location;
+            Direction = direction;
+            Touch();
+        }
+
+        private WorldObject GetOrAdd(uint objectID, ObjectKind kind)
+        {
+            if (!_objects.TryGetValue(objectID, out WorldObject ob))
+                _objects[objectID] = ob = new WorldObject { ObjectID = objectID, Kind = kind };
+
+            ob.Kind = kind;
+            ob.LastSeen = DateTime.Now;
+            return ob;
+        }
+
+        public void AddMonster(uint objectID, string name, int ai, Point location, MirDirection direction, bool dead)
+        {
+            if (objectID == SelfID) return;
+
+            WorldObject ob = GetOrAdd(objectID, ObjectKind.Monster);
+            ob.Name = name;
+            ob.AI = ai;
+            ob.Location = location;
+            ob.Direction = direction;
+            ob.Dead = dead;
+            Touch();
+        }
+
+        public void AddPlayer(uint objectID, string name, Point location, MirDirection direction)
+        {
+            if (objectID == SelfID) return;
+
+            WorldObject ob = GetOrAdd(objectID, ObjectKind.Player);
+            ob.Name = name;
+            ob.Location = location;
+            ob.Direction = direction;
+            Touch();
+        }
+
+        public void AddNPC(uint objectID, Point location, MirDirection direction)
+        {
+            WorldObject ob = GetOrAdd(objectID, ObjectKind.NPC);
+            ob.Location = location;
+            ob.Direction = direction;
+            Touch();
+        }
+
+        public void AddItem(uint objectID, string name, ItemInfo info, ClientUserItem instance, Point location)
+        {
+            WorldObject ob = GetOrAdd(objectID, ObjectKind.Item);
+            ob.Name = name;
+            ob.ItemInfo = info;
+            if (instance != null) ob.Item = instance;
+            ob.Location = location;
+            Touch();
+        }
+
+        public void ApplyWeight(int bagWeight)
+        {
+            BagWeight = bagWeight;
+            Touch();
+        }
+
+        public void ApplySafeZone(bool inSafeZone)
+        {
+            InSafeZone = inSafeZone;
+            Touch();
+        }
+
+        public void ApplyStats(Stats stats)
+        {
+            if (stats == null) return;
+
+            PlayerStats = stats;
+            ApplyMaxWeight(stats[Stat.BagWeight]);
+        }
+
+        public void ApplyMaxWeight(int maxBagWeight)
+        {
+            if (maxBagWeight <= 0) return;
+
+            MaxBagWeight = maxBagWeight;
+            Touch();
+        }
+
+        public void ApplyLocation(uint objectID, Point location)
+        {
+            if (objectID == SelfID)
+            {
+                Location = location;
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.Location = location;
+                ob.LastSeen = DateTime.Now;
+                Touch();
+            }
+        }
+
+        public void ApplyMove(uint objectID, Point location, MirDirection direction)
+        {
+            if (objectID == SelfID)
+            {
+                Location = location;
+                Direction = direction;
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.Location = location;
+                ob.Direction = direction;
+                ob.LastSeen = DateTime.Now;
+                Touch();
+            }
+        }
+
+        public void ApplyTurn(uint objectID, MirDirection direction, Point location)
+        {
+            if (objectID == SelfID)
+            {
+                Direction = direction;
+                Location = location;
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.Direction = direction;
+                ob.Location = location;
+                ob.LastSeen = DateTime.Now;
+                Touch();
+            }
+        }
+
+        public void ApplyHealthMana(uint objectID, int health, int mana, bool dead)
+        {
+            if (objectID == SelfID)
+            {
+                Health = health;
+                Mana = mana;
+                Dead = dead;
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.Health = health;
+                ob.Dead = dead;
+                Touch();
+            }
+        }
+
+        public void ApplyMaxHealthMana(uint objectID, int maxHealth, int maxMana)
+        {
+            if (objectID == SelfID)
+            {
+                MaxHealth = maxHealth;
+                MaxMana = maxMana;
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.MaxHealth = maxHealth;
+                Touch();
+            }
+        }
+
+        /// <summary>
+        /// Incremental damage/heal. This is the packet that actually tracks HP moment to moment -
+        /// DataObjectHealthMana arrives far less often. Dropping these leaves the bot's idea of its
+        /// own health minutes stale, which silently disables every HP threshold it has.
+        /// </summary>
+        public void ApplyHealthDelta(uint objectID, int change)
+        {
+            if (objectID == SelfID)
+            {
+                Health = Math.Max(0, MaxHealth > 0 ? Math.Min(MaxHealth, Health + change) : Health + change);
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.Health += change;
+                Touch();
+            }
+        }
+
+        public void ApplyManaDelta(uint objectID, int change)
+        {
+            if (objectID != SelfID) return;
+
+            Mana = Math.Max(0, MaxMana > 0 ? Math.Min(MaxMana, Mana + change) : Mana + change);
+            Touch();
+        }
+
+        public WorldObject NearestItem(int maxDistance, ICollection<uint> exclude = null)
+        {
+            WorldObject best = null;
+            int bestDistance = int.MaxValue;
+
+            foreach (WorldObject ob in _objects.Values)
+            {
+                if (ob.Kind != ObjectKind.Item) continue;
+                if (exclude != null && exclude.Contains(ob.ObjectID)) continue;
+
+                int distance = DistanceTo(ob.Location);
+                if (distance > maxDistance || distance >= bestDistance) continue;
+
+                best = ob;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
+
+        public void ApplyRemove(uint objectID)
+        {
+            if (_objects.Remove(objectID))
+                Touch();
+        }
+
+        public void MarkDead(uint objectID, bool dead)
+        {
+            if (objectID == SelfID)
+            {
+                Dead = dead;
+                Touch();
+                return;
+            }
+
+            if (_objects.TryGetValue(objectID, out WorldObject ob))
+            {
+                ob.Dead = dead;
+                Touch();
+            }
+        }
+
+        #endregion
+
+        public string Describe()
+        {
+            int monsters = _objects.Values.Count(x => x.IsValidTarget);
+            int players = _objects.Values.Count(x => x.Kind == ObjectKind.Player);
+
+            return $"{Name} L{Level} {Class} @ {Location.X},{Location.Y} map {MapIndex} | " +
+                   $"HP {Health}/{MaxHealth} ({HealthPercent}%) MP {Mana}/{MaxMana} | " +
+                   $"bag {BagWeight}/{MaxBagWeight} ({WeightPercent}%) | " +
+                   $"{monsters} live monsters, {players} players, {_objects.Count} objects | " +
+                   $"{KnownMagicCount} magics";
+        }
+    }
+}
