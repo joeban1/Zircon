@@ -126,6 +126,7 @@ namespace MirBot
         }
 
         private List<int> _pendingRepair;
+        private bool _pendingSpecial;
 
         public Action<bool> OnRepairResult;
 
@@ -134,7 +135,7 @@ namespace MirBot
             // Nothing else reports a completed repair, so apply the server's own formula locally.
             // Without it the bot re-requests the same repair next trip and the server answers
             // RepairFailRepaired, which aborts the WHOLE batch.
-            if (p.Success) Items.NoteRepaired(_pendingRepair);
+            if (p.Success) Items.NoteRepaired(_pendingRepair, _pendingSpecial);
 
             _pendingRepair = null;
             OnRepairResult?.Invoke(p.Success);
@@ -144,6 +145,15 @@ namespace MirBot
             Items.NoteDurability(p.GridType, p.Slot, p.CurrentDurability);
 
         public void Process(S.CombatTime p) => World.ApplyCombat();
+
+        /// <summary>
+        /// The server arming or spending an attack skill. Ignoring this - as the bot did until
+        /// now - means every Slaying proc is rolled and then wasted, because a plain attack does
+        /// not consume it and the server will not re-roll while it is already armed.
+        /// </summary>
+        public Action<MagicType, bool> OnMagicToggle;
+
+        public void Process(S.MagicToggle p) => OnMagicToggle?.Invoke(p.Magic, p.CanUse);
 
         /// <summary>Manual revive from the status page - never automatic.</summary>
         public void Revive() => Enqueue(new C.TownRevive());
@@ -168,7 +178,50 @@ namespace MirBot
 
         public void Process(S.SafeZoneChanged p) => World.ApplySafeZone(p.InSafeZone);
 
-        public void Process(S.HealthChanged p) => World.ApplyHealthDelta(p.ObjectID, p.Change);
+        /// <summary>Who last hit us, and when. See OnDamaged.</summary>
+        private uint _lastAttacker;
+        private DateTime _lastStruckAt = DateTime.MinValue;
+
+        private static readonly TimeSpan StrikeWindow = TimeSpan.FromMilliseconds(500);
+
+        /// <summary>Monster name and the damage it just did to us.</summary>
+        public Action<string, int> OnDamaged;
+
+        /// <summary>
+        /// S.ObjectStruck names an attacker but carries no number; S.HealthChanged carries the
+        /// number but not the attacker. Neither is enough alone, so the strike is remembered for a
+        /// moment and claimed by the health loss that follows it.
+        /// </summary>
+        public void Process(S.ObjectStruck p)
+        {
+            if (p.ObjectID != World.SelfID) return;
+
+            _lastAttacker = p.AttackerID;
+            _lastStruckAt = DateTime.UtcNow;
+        }
+
+        public void Process(S.HealthChanged p)
+        {
+            World.ApplyHealthDelta(p.ObjectID, p.Change);
+
+            if (p.ObjectID != World.SelfID || p.Change >= 0 || p.Miss) return;
+            if (_lastAttacker == 0 || DateTime.UtcNow - _lastStruckAt > StrikeWindow) return;
+
+            WorldObject attacker = World.Find(_lastAttacker);
+            _lastAttacker = 0;
+
+            if (attacker == null || attacker.Kind != ObjectKind.Monster) return;
+
+            OnDamaged?.Invoke(attacker.Name, -p.Change);
+        }
+
+        /// <summary>The last monster to hit us, for blaming a death on something.</summary>
+        public string LastAttackerName =>
+            World.Find(_lastAttacker)?.Name ?? _lastKnownAttackerName;
+
+        private string _lastKnownAttackerName;
+
+        public void NoteAttackerName(string name) => _lastKnownAttackerName = name;
 
         public void Process(S.ManaChanged p) => World.ApplyManaDelta(p.ObjectID, p.Change);
 
@@ -242,8 +295,22 @@ namespace MirBot
                     {
                         Direction = decision.Direction,
                         Action = MirAction.Attack,
-                        AttackMagic = MagicType.None
+                        AttackMagic = decision.Magic
                     });
+                    break;
+
+                case BotAction.MagicToggle:
+                    Enqueue(new C.MagicToggle { Magic = decision.Magic, CanUse = true });
+                    break;
+
+                case BotAction.Unlock:
+                    Enqueue(new C.ItemLock
+                    {
+                        GridType = GridType.Inventory,
+                        SlotIndex = decision.FromSlot,
+                        Locked = false
+                    });
+                    Items.NoteUnlocked(decision.FromSlot);
                     break;
 
                 case BotAction.Loot:
@@ -305,10 +372,11 @@ namespace MirBot
                                 Count = 1
                             })
                             .ToList(),
-                        Special = false,
+                        Special = decision.Special,
                         GuildFunds = false
                     });
                     _pendingRepair = decision.RepairSlots;
+                    _pendingSpecial = decision.Special;
                     break;
 
                 case BotAction.LearnBook:

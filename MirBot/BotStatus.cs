@@ -3,6 +3,9 @@ using System.Collections.Generic;
 
 namespace MirBot
 {
+    /// <summary>One entry in the status page's travel destination list.</summary>
+    public sealed record MapChoice(int Index, string Name);
+
     // Snapshot types.
     //
     // RULE: everything reachable from BotStatus is a value type, a string, or another record here.
@@ -22,7 +25,9 @@ namespace MirBot
         bool Broken,
         bool Worn);
 
-    public sealed record ItemStatus(int Slot, string Name, long Count, string Type);
+    /// <summary>Flags matter: a Locked or Bound item cannot simply be sold.</summary>
+    public sealed record ItemStatus(int Slot, string Name, long Count, string Type,
+        string Flags, bool CanSell);
 
     public sealed record HistoryStatus(
         string Action,

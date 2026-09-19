@@ -10,7 +10,8 @@ namespace MirBot
     {
         Idle, Equip, Heal, Flee, Attack, Loot, Approach, Roam,
         TownTeleport, AutoPath, AutoPathPoint, AutoPathCancel, WalkTo, Deposit, Withdraw,
-        NPCRepair, LearnBook, Logout, NPCCall, NPCButton, NPCSell, NPCBuy, NPCClose
+        NPCRepair, LearnBook, Logout, NPCCall, NPCButton, NPCSell, NPCBuy, NPCClose,
+        MagicToggle, Unlock
     }
 
     public sealed class Decision
@@ -33,12 +34,18 @@ namespace MirBot
         public int Distance = 1;
 
         public int ButtonID;
+
+        /// <summary>Attack: the skill to ride along on this swing. MagicToggle: the skill to enable.</summary>
+        public MagicType Magic = MagicType.None;
         public int BuyIndex;
         public long BuyAmount;
         public System.Drawing.Point Point;
 
         /// <summary>WalkTo: where we are heading.</summary>
         public System.Drawing.Point Destination;
+
+        /// <summary>NPCRepair: ask for a special repair, which does not cost maximum durability.</summary>
+        public bool Special;
 
         /// <summary>Deposit/Withdraw: source and destination slots.</summary>
         public int FromSlot;
@@ -69,6 +76,7 @@ namespace MirBot
 
         private readonly BotConfig _config;
         private readonly Random _random = new Random();
+        private readonly LootValueRule _lootValue;
 
         private DateTime _nextAction = DateTime.MinValue;
         private DateTime _nextPotion = DateTime.MinValue;
@@ -94,6 +102,18 @@ namespace MirBot
         private readonly Dictionary<uint, DateTime> _unreachable = new Dictionary<uint, DateTime>();
         private static readonly TimeSpan UnreachableFor = TimeSpan.FromSeconds(30);
 
+        // Whatever we are currently walking towards, and the closest we have ever got to it.
+        // _blockedMoves cannot detect the failure that matters most: oscillating in front of a wall
+        // with a gap in it, where every move SUCCEEDS (so the counter resets to zero every tick)
+        // while the bot alternates forwards and backwards and never arrives. One live run logged
+        // "Approach x405" against a chicken behind a wall on exactly this. Progress towards the
+        // target - not the success of individual steps - is the thing worth measuring.
+        private uint _pursuitID;
+        private int _pursuitBest;
+        private int _pursuitAttempts;
+
+        public int PursuitsAbandoned;
+
         // The monster we committed to. Without this, target choice is recomputed from scratch every
         // tick by nearest-distance alone, so two mobs at equal range make the bot alternate between
         // them and neither dies. Commitment is what makes it finish a fight.
@@ -111,6 +131,15 @@ namespace MirBot
         {
             _config = config;
             _roamDirection = (MirDirection)_random.Next(8);
+
+            _lootValue = new LootValueRule
+            {
+                PoorGold = config.LootPoorGold,
+                RichGold = config.LootRichGold,
+                PerWeightWhenPoor = config.LootGoldPerWeightPoor,
+                PerWeightWhenRich = config.LootGoldPerWeightRich,
+                HeavyMultiplier = config.LootHeavyMultiplier
+            };
         }
 
         public bool Ready => DateTime.Now >= _nextAction;
@@ -123,6 +152,15 @@ namespace MirBot
 
         /// <summary>Set by Program once the magic index is built.</summary>
         public MagicBooks Books;
+
+        /// <summary>Shared walkability grids. Null or empty means steer blind.</summary>
+        public MapLibrary Maps;
+
+        /// <summary>Attack-skill arming, fed by S.MagicToggle.</summary>
+        public readonly SkillSet Skills = new SkillSet();
+
+        /// <summary>Cross-map travel, when one is running.</summary>
+        public Journey Travel;
 
         /// <summary>Set by Program once the vendor resolves.</summary>
         public TownTrip Town;
@@ -140,11 +178,53 @@ namespace MirBot
             UpdateBlockage(world);
             ExpireUnreachable();
 
+            // 1b. Out of potions and dying. Fleeing on foot only works if something slower is
+            //     chasing us; a town scroll ends the fight outright. Deliberately gated on having
+            //     no potion left, so the bot drinks while it still can and only spends the scroll
+            //     when drinking is no longer an option.
+            // Out of potions, the bar is whichever is higher: the emergency level, or the level at
+            // which we would otherwise start running. Running from a fight we cannot win, with
+            // nothing to drink, only postpones the death - the scroll actually ends it.
+            int escapeAt = Math.Max(_config.EmergencyScrollAtPercent, _config.FleeAtPercent);
+
+            if (_config.EmergencyScrollAtPercent > 0 && world.MaxHealth > 0 &&
+                world.HealthPercent <= escapeAt &&
+                !world.InSafeZone &&
+                items.FindHealthPotionSlot() < 0 &&
+                (Town == null || Town.Phase != TownPhase.Teleporting))
+            {
+                int escape = items.FindTownTeleportSlot();
+
+                if (escape >= 0)
+                {
+                    Town?.Abort("escaped on a scroll");
+
+                    return new Decision
+                    {
+                        Action = BotAction.TownTeleport,
+                        Reason = $"no potions at {world.HealthPercent}% - scrolling out",
+                        Subject = "escaping",
+                        PotionSlot = escape
+                    };
+                }
+            }
+
             // A town trip NEVER outranks staying alive. Heal and flee are evaluated first, below;
             // the trip is consulted after them and may still be interrupted at any moment.
             bool inDanger = world.MaxHealth > 0 && world.HealthPercent <= _config.HealAtPercent;
 
-            if (Town != null && Town.Active && inDanger)
+            // Interrupting only helps if there is something better to do with the danger, and
+            // that means having a potion to drink - Heal runs a few lines below and would fire on
+            // the very next tick. With the bag empty, walking to town IS the answer to low health:
+            // aborting the trip then leaves the bot permanently unable to restock, because it can
+            // never climb back above the heal threshold to be allowed to travel.
+            //
+            // That deadlock was live. Both bots sat out of potions and out of scrolls, ignoring the
+            // Town trip button entirely, and the only trace was a trip status reading
+            // "interrupted at 30% HP" - set, and reset, every time the button was pressed.
+            bool canHeal = items.FindHealthPotionSlot() >= 0;
+
+            if (Town != null && Town.Active && inDanger && canHeal && !Town.Forced)
             {
                 // Under pressure mid-trip: abandon travel and let normal survival behaviour run.
                 // Auto-path movement is the server's, so it is told to stop too.
@@ -158,6 +238,23 @@ namespace MirBot
             // Bag full: head back to town rather than wander around unable to pick anything up.
             // Without a scroll there is nothing sensible to do about it yet - the bot has no
             // pathfinding, so walking home across a map is not an option. See the design doc.
+
+            // 0. Switch on any sustained attack toggle we have learnt but not enabled. Once per
+            //    session per skill; the server keeps them on from there.
+            MagicType pending = Skills.PendingToggle(world);
+
+            if (pending != MagicType.None)
+            {
+                Skills.ToggleSent(pending);
+
+                return new Decision
+                {
+                    Action = BotAction.MagicToggle,
+                    Reason = $"enabling {pending}",
+                    Subject = pending.ToString(),
+                    Magic = pending
+                };
+            }
 
             // 0a. Learn any book we can use. Done here rather than inside the town trip so that
             //     looted books are learnt too, and so it happens before the next DisposableSlots is
@@ -214,22 +311,43 @@ namespace MirBot
             // The flee direction is taken from NearestLiveMonster rather than SelectTarget, because
             // SelectTarget mutates _committedTarget and increments TargetSwitches - hoisting it here
             // would change normal combat behaviour as a side effect.
-            if (world.MaxHealth > 0 && world.HealthPercent <= _config.FleeAtPercent)
+            if (world.MaxHealth > 0 && world.HealthPercent <= _config.FleeAtPercent &&
+                !world.InSafeZone)
             {
                 WorldObject threat = world.NearestLiveMonster(_config.AggroRange, _unreachable.Keys);
 
-                MirDirection away = threat != null
-                    ? WorldModel.Opposite(WorldModel.DirectionTo(world.Location, threat.Location))
-                    : _roamDirection;
+                // Fleeing only ever buys time for something else: a potion to drink, or a
+                // scroll to escape on. With neither, it buys nothing - the monsters follow, the
+                // health never comes back, and because this branch sits above the town block the
+                // bot can never start the trip that would restock it.
+                //
+                // Gating this on "a trip is already running" was not enough, because flee stops the
+                // trip from ever STARTING. One wizard logged 145 Flee decisions and 21 of anything
+                // else, stuck at 16% health with an empty bag. With nothing to drink and nothing to
+                // escape on, walking to town is the only move that changes the situation.
+                bool nothingToFleeTo = items.FindHealthPotionSlot() < 0 &&
+                                       items.FindTownTeleportSlot() < 0;
 
-                return new Decision
+                // Fleeing needs something to flee FROM. Running in a random direction when nothing
+                // is chasing us is not caution, it is a deadlock: this branch sits above the town
+                // block, so a bot below the flee threshold never reaches the step that would buy it
+                // potions. One sat in a safe zone at 22% health for five minutes, "fleeing", with
+                // no monsters anywhere near it and no way to ever restock. The safe-zone test above
+                // is the same rule stated once more: nothing there can hurt us.
+                if (threat != null && !nothingToFleeTo)
                 {
-                    Action = BotAction.Flee,
-                    Reason = $"HP {world.HealthPercent}% <= {_config.FleeAtPercent}%",
-                    Subject = "low health",
-                    Direction = Unstick(away),
-                    Distance = RunDistance(world, 99)
-                };
+                    MirDirection away =
+                        WorldModel.Opposite(WorldModel.DirectionTo(world.Location, threat.Location));
+
+                    return new Decision
+                    {
+                        Action = BotAction.Flee,
+                        Reason = $"HP {world.HealthPercent}% <= {_config.FleeAtPercent}%",
+                        Subject = "low health",
+                        Direction = Unstick(away),
+                        Distance = RunDistance(world, 99)
+                    };
+                }
             }
 
             // 1b. Stopping. After Heal so it cannot suicide while settling, and BEFORE the town
@@ -278,8 +396,17 @@ namespace MirBot
                         int remaining = WorldModel.Distance(world.Location, trip.Destination);
 
                         trip.Action = BotAction.Approach;
-                        trip.Direction = Unstick(WorldModel.DirectionTo(world.Location, trip.Destination));
-                        trip.Distance = RunDistance(world, remaining);
+
+                        // No route at all. Stand still rather than issue a move with no direction,
+                        // and let TownTrip's own progress watchdog abort the trip - it is the only
+                        // code that knows how to unwind one.
+                        if (!TrySteer(trip, world, trip.Destination, 0, remaining))
+                            return new Decision
+                            {
+                                Action = BotAction.Idle,
+                                Reason = $"no route to {trip.Destination.X},{trip.Destination.Y}",
+                                Subject = trip.Subject
+                            };
                     }
 
                     return trip;
@@ -291,6 +418,34 @@ namespace MirBot
                     return null;
             }
 
+            // 2b. Cross-map travel. Below the town trip, because arriving somewhere new with a
+            //     full bag and no potions is how a journey ends in a corpse; above fighting,
+            //     because a bot that stops to kill everything never gets anywhere.
+            if (Travel != null && Travel.Active)
+            {
+                Decision leg = Travel.Next(world);
+
+                if (leg != null)
+                {
+                    int remaining = WorldModel.Distance(world.Location, leg.Destination);
+
+                    leg.Action = BotAction.Approach;
+
+                    if (!TrySteer(leg, world, leg.Destination, 0, remaining))
+                    {
+                        Travel.Abort($"no route to the exit at {leg.Destination.X},{leg.Destination.Y}");
+                        return new Decision
+                        {
+                            Action = BotAction.Idle,
+                            Reason = Travel.Status,
+                            Subject = "travel failed"
+                        };
+                    }
+
+                    return leg;
+                }
+            }
+
             WorldObject target = SelectTarget(world);
 
             if (target != null)
@@ -299,43 +454,62 @@ namespace MirBot
 
                 // 3. Attack anything adjacent.
                 if (distance <= 1)
+                {
+                    MagicType magic = Skills.ChooseAttackMagic(world, target, distance);
+
                     return new Decision
                     {
                         Action = BotAction.Attack,
-                        Reason = target.Name,
+                        Reason = magic == MagicType.None ? target.Name : $"{target.Name} ({magic})",
                         Subject = target.Name,
                         TargetID = target.ObjectID,
-                        Direction = WorldModel.DirectionTo(world.Location, target.Location)
+                        Direction = WorldModel.DirectionTo(world.Location, target.Location),
+                        Magic = magic
                     };
+                }
 
                 // 4a. Nothing adjacent to fight - grab loot first if any is close.
                 Decision loot = TryLoot(world);
                 if (loot != null) return loot;
 
-                // 4b. Close the gap - unless we have been failing to.
-                if (_blockedMoves >= 6)
-                {
-                    _unreachable[target.ObjectID] = DateTime.Now;
-                    _committedTarget = 0;
-                    _blockedMoves = 0;
-
-                    return new Decision
-                    {
-                        Action = BotAction.Roam,
-                        Reason = $"gave up on {target.Name} (unreachable)",
-                        Direction = NextRoamDirection(world, true)
-                    };
-                }
-
-                return new Decision
+                // 4b. Close the gap - unless we have been failing to, either because the way is
+                //     blocked outright or because we are moving without ever getting nearer.
+                Decision approach = new Decision
                 {
                     Action = BotAction.Approach,
                     Reason = $"{target.Name} at {distance}",
                     Subject = target.Name,
-                    TargetID = target.ObjectID,
-                    Direction = Unstick(WorldModel.DirectionTo(world.Location, target.Location)),
-                    Distance = RunDistance(world, distance)
+                    TargetID = target.ObjectID
                 };
+
+                // Three ways a chase is over: the way is blocked, we are moving without ever
+                // getting closer, or the map itself says there is no route to stand beside it.
+                bool blocked = _blockedMoves >= 6;
+                bool futile = NoProgressTowards(target.ObjectID, distance);
+                bool noRoute = !blocked && !futile &&
+                               !TrySteer(approach, world, target.Location, 1, distance);
+
+                if (blocked || futile || noRoute)
+                {
+                    _unreachable[target.ObjectID] = DateTime.Now;
+                    _committedTarget = 0;
+                    _blockedMoves = 0;
+                    ForgetPursuit();
+
+                    string why = blocked ? "unreachable"
+                        : futile ? $"no progress in {_config.PursuitPatience} moves"
+                        : "no route";
+
+                    return new Decision
+                    {
+                        Action = BotAction.Roam,
+                        Reason = $"gave up on {target.Name} ({why})",
+                        Subject = "roaming",
+                        Direction = NextRoamDirection(world, true)
+                    };
+                }
+
+                return approach;
             }
 
             // 5. Nothing to fight - loot, then wander.
@@ -371,6 +545,109 @@ namespace MirBot
             {
                 _blockedMoves = 0;
             }
+        }
+
+        /// <summary>
+        /// Are we walking towards something without ever getting closer to it?
+        ///
+        /// Called once per approach decision, with the distance to whatever we are chasing. Any
+        /// improvement on the best distance so far resets the patience, so a long but productive
+        /// chase is never cut short; a target we simply cannot make ground on is abandoned after
+        /// PursuitPatience attempts and parked as unreachable like any other.
+        ///
+        /// This is the backstop for local steering getting trapped by geometry. It stays useful
+        /// even with real pathfinding, for the cases a path cannot express: a monster kiting us, or
+        /// a drop sitting on a cell nothing can stand on.
+        /// </summary>
+        private bool NoProgressTowards(uint objectID, int distance)
+        {
+            if (objectID != _pursuitID)
+            {
+                _pursuitID = objectID;
+                _pursuitBest = distance;
+                _pursuitAttempts = 0;
+                return false;
+            }
+
+            if (distance < _pursuitBest)
+            {
+                _pursuitBest = distance;
+                _pursuitAttempts = 0;
+                return false;
+            }
+
+            if (++_pursuitAttempts < Math.Max(1, _config.PursuitPatience)) return false;
+
+            PursuitsAbandoned++;
+            return true;
+        }
+
+        private void ForgetPursuit()
+        {
+            _pursuitID = 0;
+            _pursuitAttempts = 0;
+        }
+
+        /// <summary>
+        /// Point a decision at its destination, and say whether getting there is possible at all.
+        ///
+        /// With a map loaded this is A*: the first step of a real route, and false when no route
+        /// exists - which is the answer blind steering could never give. The caller treats false as
+        /// final and parks the target as unreachable rather than grinding away at it.
+        ///
+        /// Without a map it falls back to the old behaviour, aiming straight at the destination and
+        /// sidestepping when blocked, and always returns true because it genuinely cannot tell.
+        /// </summary>
+        private bool TrySteer(Decision decision, WorldModel world, Point destination, int goalRange,
+            int straightDistance)
+        {
+            MapGrid grid = Maps?.For(world.MapIndex);
+
+            if (grid != null)
+            {
+                // Only route around other creatures once something has actually stopped us. Doing
+                // it always makes a monster standing in a doorway look like a wall, and the extra
+                // set costs a full sweep of the object list on every decision.
+                HashSet<Point> avoid = _blockedMoves > 0
+                    ? world.OccupiedCells(decision.TargetID)
+                    : null;
+
+                List<Point> path = PathFinder.Find(grid, world.Location, destination, goalRange, avoid);
+
+                if (path == null) return false;
+
+                // Already there - let the caller's own arrival handling deal with it.
+                if (path.Count == 0)
+                {
+                    decision.Direction = WorldModel.DirectionTo(world.Location, destination);
+                    decision.Distance = 1;
+                    return true;
+                }
+
+                decision.Direction = WorldModel.DirectionTo(world.Location, path[0]);
+                decision.Distance = PathStride(world, path, decision.Direction);
+                return true;
+            }
+
+            decision.Direction = Unstick(WorldModel.DirectionTo(world.Location, destination));
+            decision.Distance = RunDistance(world, straightDistance);
+            return true;
+        }
+
+        /// <summary>
+        /// One step or two? Running covers two tiles in one move, but only in a straight line, so it
+        /// is only safe when the path's next two steps continue in the same direction.
+        /// </summary>
+        private int PathStride(WorldModel world, List<Point> path, MirDirection direction)
+        {
+            if (!_config.AllowRunning) return 1;
+            if (_blockedMoves > 0) return 1;
+            if (path.Count < 2) return 1;
+
+            // An overweight character cannot run; asking anyway gets every move refused.
+            if (world.MaxBagWeight > 0 && world.WeightPercent >= 100) return 1;
+
+            return path[1] == Functions.Move(world.Location, direction, 2) ? 2 : 1;
         }
 
         private void ExpireUnreachable()
@@ -467,8 +744,15 @@ namespace MirBot
                 WorldObject candidate = world.NearestItem(_config.LootRange, skip);
                 if (candidate == null) return null;
 
+                // Judged against THIS item's weight: how many we should hold depends on how
+                // heavy one is, so a tier four potion earns a smaller stack than a tier one.
+                int unit = Math.Max(1, candidate.ItemInfo?.Weight ?? 1);
+
                 if (_items.WorthLooting(candidate.ItemInfo, candidate.Item, world.Class, world.Gender,
-                        heavy, full, _config.HealthPotionReserve, _config.ManaPotionReserve))
+                        heavy, full,
+                        _config.HealthPotionTarget(world.MaxBagWeight, unit),
+                        _config.ManaPotionTarget(world.MaxBagWeight, unit),
+                        world.Gold, _lootValue))
                     return candidate;
 
                 skip.Add(candidate.ObjectID);
@@ -541,22 +825,25 @@ namespace MirBot
             if (distance == 0)
                 return new Decision { Action = BotAction.Loot, Reason = item.Name, Subject = item.Name };
 
-            if (_blockedMoves >= 6)
-            {
-                _unreachable[item.ObjectID] = DateTime.Now;
-                _blockedMoves = 0;
-                return null;
-            }
-
-            return new Decision
+            Decision walk = new Decision
             {
                 Action = BotAction.Approach,
                 Reason = $"loot {item.Name} at {distance}",
                 Subject = $"loot {item.Name}",
-                TargetID = item.ObjectID,
-                Direction = Unstick(WorldModel.DirectionTo(world.Location, item.Location)),
-                Distance = 1
+                TargetID = item.ObjectID
             };
+
+            // goalRange 0: PickUp works from where we stand, so we have to reach the tile itself.
+            if (_blockedMoves >= 6 || NoProgressTowards(item.ObjectID, distance) ||
+                !TrySteer(walk, world, item.Location, 0, distance))
+            {
+                _unreachable[item.ObjectID] = DateTime.Now;
+                _blockedMoves = 0;
+                ForgetPursuit();
+                return null;
+            }
+
+            return walk;
         }
 
         /// <summary>Record that an action was issued, and pace the next one accordingly.</summary>
@@ -582,6 +869,13 @@ namespace MirBot
                     break;
                 case BotAction.LearnBook:
                     _nextAction = DateTime.Now + ItemUseDelay + Margin;
+                    break;
+                case BotAction.Unlock:
+                    _nextAction = DateTime.Now + TurnTime + Margin;
+                    break;
+                case BotAction.MagicToggle:
+                    // The client's own anti-spam on these is one second.
+                    _nextAction = DateTime.Now + TimeSpan.FromSeconds(1);
                     break;
                 case BotAction.Logout:
                     // Its own pace: the default 420ms would be ~48 logout packets in twenty

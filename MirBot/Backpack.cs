@@ -357,7 +357,7 @@ namespace MirBot
         /// BATCH and silently kills the repair of every other item too.
         /// Normal repair burns max durability: Max -= (Max - Cur) / Globals.DuraLossRate (15).
         /// </summary>
-        public void NoteRepaired(IEnumerable<int> equipmentSlots)
+        public void NoteRepaired(IEnumerable<int> equipmentSlots, bool special = false)
         {
             if (equipmentSlots == null) return;
 
@@ -365,9 +365,16 @@ namespace MirBot
             {
                 if (!_equipment.TryGetValue(slot, out ClientUserItem item)) continue;
 
-                item.MaxDurability = Math.Max(0,
-                    item.MaxDurability - (item.MaxDurability - item.CurrentDurability) / 15);
+                // A special repair costs no maximum durability, which is the whole point of it.
+                // Applying the ordinary formula here would shrink our local copy while the server
+                // left the item alone, and every later repair decision would work off that.
+                if (!special)
+                    item.MaxDurability = Math.Max(0,
+                        item.MaxDurability - (item.MaxDurability - item.CurrentDurability) / 15);
+
                 item.CurrentDurability = item.MaxDurability;
+
+                if (special) item.NextSpecialRepair = Time.Now + item.SpecialRepairCoolDown;
             }
         }
 
@@ -463,13 +470,19 @@ namespace MirBot
         /// definition; there the score is a floor and a good roll on a poor base can be passed over.
         /// </summary>
         public bool WorthLooting(ItemInfo info, ClientUserItem instance, MirClass mirClass,
-            MirGender gender, bool heavy, bool full, int healthReserve, int manaReserve)
+            MirGender gender, bool heavy, bool full, int healthReserve, int manaReserve,
+            long gold, LootValueRule value)
         {
             if (info == null) return !heavy;
 
             // A town scroll is the only way home, so it is worth its weight even at capacity.
             bool isConsumable = info.ItemType == ItemType.Consumable;
             if (isConsumable && info.Shape == TownTeleportShape) return true;
+
+            // Gold and anything else weightless is free to carry - the bag never notices it, so
+            // there is nothing to weigh the value against and no reason ever to refuse it. Gold in
+            // particular drops as an ordinary ground item, and is the whole point of the exercise.
+            if (WeightOf(info, instance) <= 0) return true;
 
             // Over capacity, take nothing else at all. Exempting consumables from this - as an
             // earlier version did - let the bag climb past 110% on looted potions alone, and being
@@ -480,8 +493,16 @@ namespace MirBot
             {
                 // Potions are the difference between fighting safely and dying, but they are not
                 // weightless: past a reserve they are just cargo.
-                int held = CountOf(info);
-                int reserve = info.Stats[Stat.Health] > 0 ? healthReserve : manaReserve;
+                //
+                // Counted by ROLE, across every tier. Counting this exact ItemInfo - as this did
+                // originally - means "Healing Potion" and "Healing Potion (II)" each get their own
+                // reserve, so a bot with ten of each keeps looting both. A level 10 wizard hoarded
+                // seventeen and spent its life at 105% weight, unable to run, while the restock
+                // step (which counts them together) saw no shortage at all.
+                bool healing = info.Stats[Stat.Health] > 0;
+
+                int held = healing ? CountHealthPotions() : CountManaPotions();
+                int reserve = healing ? healthReserve : manaReserve;
 
                 return held < reserve;
             }
@@ -490,26 +511,67 @@ namespace MirBot
                 ? RequiredGender.Female
                 : RequiredGender.Male;
 
-            if (!info.RequiredGender.HasFlag(genderFlag)) return !heavy;
+            // Gear for the other gender can never be worn, but it still sells.
+            if (!info.RequiredGender.HasFlag(genderFlag))
+                return WorthSelling(info, instance, heavy, gold, value);
 
-            EquipmentSlot? slot = SlotFor(info.ItemType);
+            // Books are never cargo: a book is a skill we want now, one to bank until we are high
+            // enough, or a sale. That judgement is made in the bag, so always pick one up.
+            if (info.ItemType == ItemType.Book) return !heavy;
 
-            if (slot != null)
+            if (SlotFor(info.ItemType) != null)
             {
-                int index = (int)slot.Value;
-
-                if (!_equipment.TryGetValue(index, out ClientUserItem worn))
-                    return true;
-
                 int candidate = instance != null
                     ? Score(instance, mirClass)
                     : ScoreInfo(info, mirClass);
 
-                return candidate > Score(worn, mirClass);
+                // An upgrade is taken whatever it is worth. Anything else is judged as cargo:
+                // gear we cannot use is still the most valuable thing most monsters drop.
+                if (BeatsWeakestSlot(info.ItemType, candidate, mirClass)) return true;
             }
 
-            // Everything else (ore, meat, junk) only while there is room to spare.
-            return !heavy;
+            // Everything else - ore, meat, gear we already beat - has to pay for its weight.
+            return WorthSelling(info, instance, heavy, gold, value);
+        }
+
+        /// <summary>Weight this drop would actually add, which for a stack means the whole stack.</summary>
+        private static int WeightOf(ItemInfo info, ClientUserItem instance)
+        {
+            if (instance?.Info != null) return instance.Weight;
+
+            return info?.Weight ?? 0;
+        }
+
+        /// <summary>
+        /// Worth carrying purely to sell it?
+        ///
+        /// Before this existed the bot took non-equipment drops whenever the bag was not yet heavy
+        /// and refused them once it was - it had no idea what anything was worth, so a gemstone and
+        /// a rotten carcass were the same decision. Now the sale value the vendor would actually
+        /// pay is weighed against the space it costs, on the sliding bar in LootValueRule.
+        ///
+        /// When only the definition is known (S.DataObjectItem carries no instance) the value is
+        /// estimated from the base price, which is a floor: a good roll is worth more than this.
+        /// </summary>
+        private static bool WorthSelling(ItemInfo info, ClientUserItem instance, bool heavy,
+            long gold, LootValueRule value)
+        {
+            // No rule configured - fall back to the old behaviour rather than looting nothing.
+            if (value == null) return !heavy;
+
+            long price;
+
+            if (instance?.Info != null)
+                price = instance.Price(Math.Max(1L, instance.Count));
+            else
+                price = (long)(info.Price * info.SellRate);
+
+            // Quest items and the like are flagged Worthless and sell for nothing.
+            if (price <= 0) return false;
+
+            int weight = Math.Max(1, WeightOf(info, instance));
+
+            return price / weight >= value.MinimumPerWeight(gold, heavy);
         }
 
         public static int ScoreInfo(ItemInfo info, MirClass mirClass)
@@ -557,6 +619,21 @@ namespace MirBot
             return (int)Math.Min(int.MaxValue, total);
         }
 
+        /// <summary>Mana potions carried, across every tier - the mirror of CountHealthPotions.</summary>
+        public int CountManaPotions()
+        {
+            long total = 0;
+
+            foreach (ClientUserItem item in _inventory.Values)
+                if (item?.Info != null &&
+                    item.Info.ItemType == ItemType.Consumable &&
+                    item.Info.Shape != TownTeleportShape &&
+                    item.Info.Stats[Stat.Health] <= 0 &&
+                    item.Info.Stats[Stat.Mana] > 0) total += item.Count;
+
+            return (int)Math.Min(int.MaxValue, total);
+        }
+
         public int CountTownScrolls()
         {
             long total = 0;
@@ -589,9 +666,179 @@ namespace MirBot
         /// item's type to be in the page's Types list, and it aborts the entire sale on the first
         /// failure rather than skipping that one item - so the filtering has to happen here.
         /// </summary>
+        /// <summary>
+        /// Is this a piece of something bigger?
+        ///
+        /// A part carries a generic ItemInfo; the item it builds towards is ItemIndex on the
+        /// instance's AddedStats, exactly as the client resolves it for drawing. The bot sold an
+        /// Iron Shield part because nothing here knew that.
+        /// </summary>
+        /// <summary>
+        /// Worn slots eligible for a SPECIAL repair right now.
+        ///
+        /// Special repair restores durability without touching the maximum. Ordinary repair sets
+        /// MaxDurability -= (Max - Current) / DuraLossRate first, so every normal repair
+        /// permanently shrinks the item - repeat it enough and good gear becomes worthless.
+        /// Special costs twice as much and has a per-item cooldown, which the client can see as
+        /// NextSpecialRepair, so items still cooling down are left out rather than discovered by
+        /// having the whole batch rejected.
+        /// </summary>
+        public List<int> SpecialRepairSlots(IEnumerable<ItemType> accepted)
+        {
+            List<int> slots = new List<int>();
+
+            // Repairable already applies every gate the server does - durability, CanRepair, the
+            // allowed item types and this page's own Types list.
+            List<ItemType> types = accepted?.ToList();
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in _equipment.OrderBy(x => x.Key))
+            {
+                ClientUserItem item = pair.Value;
+
+                if (!Repairable(item, types)) continue;
+
+                // Still cooling down from its last special repair. One such item rejects the WHOLE
+                // batch server-side, so they are filtered here rather than discovered.
+                if (item.NextSpecialRepair > Time.Now) continue;
+
+                slots.Add(pair.Key);
+            }
+
+            return slots;
+        }
+
+        /// <summary>
+        /// How much better would this shop item be than the slot it would replace?
+        ///
+        /// Returns the score gain, or 0 when it is not an upgrade at all. Only the definition is
+        /// known for something on a shelf - a shop item has no roll yet - so this is the same floor
+        /// used when judging a drop we can only see from a distance.
+        /// </summary>
+        public int UpgradeGain(ItemInfo info, MirClass mirClass, MirGender gender, int level,
+            Stats stats)
+        {
+            if (info == null) return 0;
+            if (!CanEquipInfo(info, mirClass, gender)) return 0;
+            if (!MeetsRequirement(info, level, stats)) return 0;
+
+            int candidate = ScoreInfo(info, mirClass);
+            if (candidate <= 0) return 0;
+
+            int weakest = int.MaxValue;
+            bool any = false;
+
+            foreach (EquipmentSlot option in SlotsFor(info.ItemType))
+            {
+                any = true;
+
+                // An empty slot is measured against nothing, so anything wearable is a gain.
+                if (!_equipment.TryGetValue((int)option, out ClientUserItem worn)) return candidate;
+
+                int current = Score(worn, mirClass);
+                if (current < weakest) weakest = current;
+            }
+
+            if (!any || weakest == int.MaxValue) return 0;
+
+            return candidate > weakest ? candidate - weakest : 0;
+        }
+
+        /// <summary>The worn score this item type would have to beat, for sizing an upgrade.</summary>
+        public int WeakestWornScore(ItemType type, MirClass mirClass)
+        {
+            int weakest = int.MaxValue;
+
+            foreach (EquipmentSlot option in SlotsFor(type))
+            {
+                if (!_equipment.TryGetValue((int)option, out ClientUserItem worn)) return 0;
+
+                int current = Score(worn, mirClass);
+                if (current < weakest) weakest = current;
+            }
+
+            return weakest == int.MaxValue ? 0 : weakest;
+        }
+
+        /// <summary>Class and gender check against a definition rather than an instance.</summary>
+        public static bool CanEquipInfo(ItemInfo info, MirClass mirClass, MirGender gender)
+        {
+            if (info == null) return false;
+            if (SlotFor(info.ItemType) == null) return false;
+
+            RequiredGender genderFlag = gender == MirGender.Female
+                ? RequiredGender.Female
+                : RequiredGender.Male;
+
+            if (!info.RequiredGender.HasFlag(genderFlag)) return false;
+
+            return CanClassUseInfo(info, mirClass);
+        }
+
+        /// <summary>
+        /// Is there a torch burning?
+        ///
+        /// Torches carry durability on this server and are consumed as they burn, so an empty slot
+        /// is the normal end state rather than an error. A torch at zero is treated as no torch:
+        /// it is about to go out and is worth replacing on this trip rather than the next one.
+        /// </summary>
+        public bool HasTorchEquipped
+        {
+            get
+            {
+                if (!_equipment.TryGetValue((int)EquipmentSlot.Torch, out ClientUserItem torch))
+                    return false;
+
+                if (torch?.Info == null) return false;
+
+                return torch.Info.Durability == 0 || torch.CurrentDurability > 0;
+            }
+        }
+
+        /// <summary>A torch already in the bag, waiting to be equipped.</summary>
+        public bool CarryingTorch
+        {
+            get
+            {
+                foreach (ClientUserItem item in _inventory.Values)
+                    if (item?.Info != null && item.Info.ItemType == ItemType.Torch) return true;
+
+                return false;
+            }
+        }
+
+        public static bool IsItemPart(ClientUserItem item) =>
+            item?.Info != null && item.Info.ItemEffect == ItemEffect.ItemPart;
+
+        /// <summary>The item a part builds towards, or null when it cannot be resolved.</summary>
+        public static ItemInfo PartTarget(ClientUserItem item)
+        {
+            if (!IsItemPart(item)) return null;
+
+            int index = item.AddedStats?[Stat.ItemIndex] ?? 0;
+            if (index <= 0) return null;
+
+            return Globals.ItemInfoList?.Binding?.FirstOrDefault(x => x.Index == index);
+        }
+
+        /// <summary>"Iron Shield (part 1/5)" rather than the useless "[Part]".</summary>
+        public static string Describe(ClientUserItem item)
+        {
+            if (item?.Info == null) return "nothing";
+
+            ItemInfo target = PartTarget(item);
+
+            if (target == null) return item.Info.ItemName;
+
+            return $"{target.ItemName} (part {item.Count}/{target.PartCount})";
+        }
+
         public static bool Sellable(ClientUserItem item, IEnumerable<ItemType> accepted)
         {
             if (item?.Info == null) return false;
+
+            // Belt and braces: even if a part reached a sell batch some other way, refuse it here.
+            if (IsItemPart(item)) return false;
+
             if (!item.Info.CanSell) return false;
             if ((item.Flags & UserItemFlags.Locked) == UserItemFlags.Locked) return false;
             if ((item.Flags & UserItemFlags.Marriage) == UserItemFlags.Marriage) return false;
@@ -605,16 +852,166 @@ namespace MirBot
             return false;
         }
 
+        /// <summary>
+        /// Slots holding something we would sell if it were not locked.
+        ///
+        /// Locking is a player convenience - it stops an item being sold by accident - and the
+        /// server unlocks on request with no cost and no checks beyond the slot being real. A bot
+        /// that respects the flag but can never clear it just accumulates: sixteen tier one potions
+        /// sat locked and unsellable in a bag that had no room for loot.
+        /// </summary>
+        public List<int> LockedSlots(IEnumerable<int> amongSlots)
+        {
+            List<int> locked = new List<int>();
+
+            if (amongSlots == null) return locked;
+
+            foreach (int slot in amongSlots)
+            {
+                ClientUserItem item = InSlot(slot);
+
+                if (item?.Info == null) continue;
+                if ((item.Flags & UserItemFlags.Locked) != UserItemFlags.Locked) continue;
+
+                locked.Add(slot);
+            }
+
+            return locked;
+        }
+
+        /// <summary>Apply an unlock locally; the server echoes S.ItemLock to confirm.</summary>
+        public void NoteUnlocked(int slot)
+        {
+            ClientUserItem item = InSlot(slot);
+
+            if (item == null) return;
+
+            item.Flags &= ~UserItemFlags.Locked;
+        }
+
+        /// <summary>
+        /// Every slot we intend to dispose of, locked or not. DisposableSlots filters locked items
+        /// out via Sellable, so this is the wider list used to decide what to unlock first.
+        /// </summary>
+        public List<int> DisposableIncludingLocked(MirClass mirClass, MirGender gender, int level,
+            Stats stats, int healthReserve, int manaReserve, int scrollReserve,
+            MagicBooks books, WorldModel world)
+        {
+            List<int> all = DisposableSlots(mirClass, gender, level, stats,
+                healthReserve, manaReserve, scrollReserve, books, world);
+
+            // DisposableSlots already walks everything; locked items reach it and are kept only
+            // because Sellable refuses them later. Re-scan for those.
+            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory)
+            {
+                ClientUserItem item = pair.Value;
+
+                if (item?.Info == null) continue;
+                if (all.Contains(pair.Key)) continue;
+                if ((item.Flags & UserItemFlags.Locked) != UserItemFlags.Locked) continue;
+
+                // Only consumables past their reserve - never gear we might still want.
+                if (item.Info.ItemType != ItemType.Consumable) continue;
+
+                bool healing = item.Info.Stats[Stat.Health] > 0;
+                bool scroll = item.Info.Shape == TownTeleportShape;
+
+                int unit = Math.Max(1, item.Info.Weight);
+                int reserve = scroll ? scrollReserve
+                    : (healing ? healthReserve : manaReserve) / unit;
+
+                int held = scroll ? CountTownScrolls()
+                    : healing ? CountHealthPotions() : CountManaPotions();
+
+                if (held > Math.Max(1, reserve)) all.Add(pair.Key);
+            }
+
+            return all;
+        }
+
         public ClientUserItem InSlot(int slot) =>
             _inventory.TryGetValue(slot, out ClientUserItem item) ? item : null;
+
+        /// <summary>
+        /// Which consumable stacks to keep, deciding across ALL tiers at once and keeping the best.
+        ///
+        /// The reserve used to be tracked per ItemInfo, so every tier got its own full allowance:
+        /// a bot holding nineteen tier four potions and three tier one still counted the tier ones
+        /// as "under reserve" and never sold them. They were not locked out by the Locked flag at
+        /// all - that was a red herring - they simply never appeared in the disposal list.
+        ///
+        /// Now the allowance is a single budget for healing, one for mana and one for scrolls. The
+        /// strongest potion is kept first, and whatever the budget will not stretch to is surplus,
+        /// which is exactly the weak tier we want to be rid of.
+        /// </summary>
+        private HashSet<int> PlanConsumableKeeps(int healthReserve, int manaReserve,
+            int scrollReserve)
+        {
+            HashSet<int> keep = new HashSet<int>();
+
+            List<KeyValuePair<int, ClientUserItem>> scrolls =
+                new List<KeyValuePair<int, ClientUserItem>>();
+            List<KeyValuePair<int, ClientUserItem>> health =
+                new List<KeyValuePair<int, ClientUserItem>>();
+            List<KeyValuePair<int, ClientUserItem>> mana =
+                new List<KeyValuePair<int, ClientUserItem>>();
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory)
+            {
+                ClientUserItem item = pair.Value;
+
+                if (item?.Info == null || item.Info.ItemType != ItemType.Consumable) continue;
+
+                if (item.Info.Shape == TownTeleportShape) scrolls.Add(pair);
+                else if (item.Info.Stats[Stat.Health] > 0) health.Add(pair);
+                else if (item.Info.Stats[Stat.Mana] > 0) mana.Add(pair);
+                else keep.Add(pair.Key);      // food and oddities: not ours to judge here
+            }
+
+            // Strongest first, so the budget is spent on the potions worth carrying.
+            health.Sort((a, b) => b.Value.Info.Stats[Stat.Health]
+                                   .CompareTo(a.Value.Info.Stats[Stat.Health]));
+            mana.Sort((a, b) => b.Value.Info.Stats[Stat.Mana]
+                                 .CompareTo(a.Value.Info.Stats[Stat.Mana]));
+
+            Fill(keep, scrolls, scrollReserve, 1);
+
+            // Reserves arrive sized for a weight-one potion. Scale by what the BEST tier we hold
+            // weighs, so the budget stays a share of the bag rather than a share per tier.
+            Fill(keep, health, healthReserve, health.Count == 0
+                ? 1 : Math.Max(1, health[0].Value.Info.Weight));
+
+            Fill(keep, mana, manaReserve, mana.Count == 0
+                ? 1 : Math.Max(1, mana[0].Value.Info.Weight));
+
+            return keep;
+        }
+
+        /// <summary>Keep whole stacks in the given order until the budget is spent.</summary>
+        private static void Fill(HashSet<int> keep,
+            List<KeyValuePair<int, ClientUserItem>> stacks, int reserve, int unitWeight)
+        {
+            int target = Math.Max(1, reserve / Math.Max(1, unitWeight));
+            int held = 0;
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in stacks)
+            {
+                if (held >= target) return;      // everything after this is surplus
+
+                keep.Add(pair.Key);
+                held += (int)pair.Value.Count;
+            }
+        }
 
         public List<int> DisposableSlots(MirClass mirClass, MirGender gender, int level,
             Stats stats, int healthReserve, int manaReserve, int scrollReserve,
             MagicBooks books, WorldModel world)
         {
             List<int> slots = new List<int>();
-            Dictionary<ItemInfo, int> kept = new Dictionary<ItemInfo, int>();
             HashSet<ItemInfo> keptBooks = new HashSet<ItemInfo>();
+
+            HashSet<int> keepConsumables = PlanConsumableKeeps(healthReserve, manaReserve,
+                scrollReserve);
 
             foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
             {
@@ -622,21 +1019,7 @@ namespace MirBot
 
                 if (item.Info.ItemType == ItemType.Consumable)
                 {
-                    // Every consumable has a reserve now, scrolls included: below it we buy, above
-                    // it we sell. Keeping scrolls unconditionally meant a stack could only ever grow.
-                    int reserve = item.Info.Shape == TownTeleportShape
-                        ? scrollReserve
-                        : item.Info.Stats[Stat.Health] > 0 ? healthReserve : manaReserve;
-
-                    kept.TryGetValue(item.Info, out int already);
-
-                    if (already < reserve)
-                    {
-                        kept[item.Info] = already + (int)item.Count;
-                        continue;
-                    }
-
-                    slots.Add(pair.Key);
+                    if (!keepConsumables.Contains(pair.Key)) slots.Add(pair.Key);
                     continue;
                 }
 
@@ -657,6 +1040,12 @@ namespace MirBot
                     slots.Add(pair.Key);   // Junk / WrongClass / AlreadyKnown / duplicate
                     continue;
                 }
+
+                // An item part is never junk. Its own ItemInfo is a generic placeholder - the
+                // real item is named by AddedStats[Stat.ItemIndex] - so it looks like a nameless
+                // trinket to every rule here and used to be sold. Parts accumulate towards
+                // Info.PartCount and are how the good gear is assembled, so they are always kept.
+                if (IsItemPart(item)) continue;
 
                 // Keep anything the bank should hold for later.
                 if (WorthStoring(item, mirClass, gender, level, stats, books, world)) continue;
@@ -716,6 +1105,36 @@ namespace MirBot
                     if (single != null) yield return single.Value;
                     break;
             }
+        }
+
+        /// <summary>
+        /// Would this beat something we are wearing, across every slot the type can occupy?
+        ///
+        /// Rings and bracelets have a left and a right slot, so asking only about the left one - as
+        /// the loot check originally did - walks the bot past a real upgrade whenever the left slot
+        /// happens to be good. A Horned Ring on the ground was refused because an identical Horned
+        /// Ring was worn on the left, while the right slot held a Taoist ring worth nothing to a
+        /// warrior. The bar is therefore the WEAKEST slot the item could displace, matching what
+        /// PendingEquips would actually do with it once carried.
+        /// </summary>
+        private bool BeatsWeakestSlot(ItemType type, int candidate, MirClass mirClass)
+        {
+            int weakest = int.MaxValue;
+
+            foreach (EquipmentSlot option in SlotsFor(type))
+            {
+                // An empty slot is always worth filling, whatever it scores.
+                if (!_equipment.TryGetValue((int)option, out ClientUserItem worn))
+                    return true;
+
+                int current = Score(worn, mirClass);
+                if (current < weakest) weakest = current;
+            }
+
+            // No slot at all - not equipment as far as we are concerned.
+            if (weakest == int.MaxValue) return false;
+
+            return candidate > weakest;
         }
 
         /// <summary>
@@ -818,7 +1237,8 @@ namespace MirBot
         /// <summary>
         /// Items worth equipping: empty slots first, then straight upgrades. A candidate only
         /// replaces a worn item when it scores strictly higher for this class, so the bot can never
-        /// downgrade itself. Bracelets and rings only fill the left slot - pairing is not worth it.
+        /// downgrade itself. Rings and bracelets are paired: an empty side is preferred, otherwise
+        /// the weaker side is displaced.
         ///
         /// The server validates every move, so a request it refuses simply does nothing.
         /// </summary>

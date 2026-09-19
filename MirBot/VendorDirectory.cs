@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Linq;
 using Library;
 using Library.SystemModels;
@@ -45,9 +46,38 @@ namespace MirBot
                 ? NPC.Region.PointRegion[0]
                 : System.Drawing.Point.Empty;
 
+        /// <summary>What this page actually stocks, by item type, with the goods-index split.</summary>
+        public string DescribeStock()
+        {
+            if (Page?.Goods == null || Page.Goods.Count == 0) return "";
+
+            Dictionary<string, int> matched = new Dictionary<string, int>();
+            int wrongIndex = 0;
+
+            foreach (NPCGood good in Page.Goods)
+            {
+                if (good.Item == null) continue;
+
+                if (NPC != null && good.GoodsIndex != NPC.GoodsIndex) { wrongIndex++; continue; }
+
+                string key = good.Item.ItemType.ToString();
+                matched.TryGetValue(key, out int n);
+                matched[key] = n + 1;
+            }
+
+            string sells = matched.Count == 0
+                ? ""
+                : ", sells " + string.Join("/", matched.Select(x => $"{x.Key} x{x.Value}"));
+
+            if (wrongIndex > 0) sells += $", {wrongIndex} on another goods index";
+
+            return sells;
+        }
+
         public override string ToString() =>
             $"{NPC?.NPCName} on {MapName} at {Point.X},{Point.Y} " +
             $"[buys {(Buys.Count == 0 ? "nothing" : string.Join("/", Buys))}" +
+            DescribeStock() +
             $"{(SellsTownScroll ? ", sells scrolls" : "")}" +
             $"{(SellsHealthPotion ? ", sells potions" : "")}" +
             $"{(Repairs.Count == 0 ? "" : ", repairs " + string.Join("/", Repairs))}" +
@@ -196,16 +226,124 @@ namespace MirBot
         }
 
         /// <summary>A vendor that restocks both if possible, so the trip needs fewer stops.</summary>
-        public VendorEntry BestRestockerFor(bool needScrolls, bool needPotions, int currentMapIndex)
+        /// <summary>
+        /// Who to visit to restock. Up to two stops, because scrolls and potions are independent
+        /// needs and one shop rarely covers both.
+        ///
+        /// This used to return a SINGLE vendor for both needs, ordered by "is it on this map"
+        /// before "how many of the needs does it cover". So on a map with a potion seller and a
+        /// scroll seller, the potion seller won on a tie and the scrolls were simply never bought -
+        /// every stop of the trip reported "0/3 scrolls held" and the bot left town with none,
+        /// which then blocked the book purchase as well.
+        ///
+        /// One stop is still preferred when a single shop genuinely sells both.
+        /// </summary>
+        public List<VendorEntry> BestRestockersFor(bool needScrolls, bool needPotions,
+            int currentMapIndex, IEnumerable<VendorEntry> already = null, Point from = default,
+            bool sameMapOnly = false)
         {
-            if (!needScrolls && !needPotions) return null;
+            List<VendorEntry> chosen = new List<VendorEntry>();
+
+            if (!needScrolls && !needPotions) return chosen;
+
+            if (needScrolls && needPotions)
+            {
+                VendorEntry both = Nearest(
+                    x => x.SellsTownScroll && x.SellsHealthPotion, currentMapIndex, already, from,
+                    sameMapOnly);
+
+                // Collapsing two stops into one is only a saving if the one stop is HERE.
+                //
+                // Without this test the shortcut ran first and returned unconditionally, so the
+                // single NPC on the whole server who sells scrolls and potions together - Lavar,
+                // on Infernal Island - was chosen over the potion seller and scroll seller standing
+                // twenty tiles away in the bot's own town. Infernal Island has no route from Bichon
+                // at all, so the trip ended at "on another map - no path" every time, for both
+                // characters, whenever they happened to need both things at once.
+                if (both != null && both.MapIndex == currentMapIndex)
+                {
+                    chosen.Add(both);
+                    return chosen;
+                }
+            }
+
+            if (needScrolls)
+            {
+                VendorEntry scrolls = Nearest(x => x.SellsTownScroll, currentMapIndex, already,
+                    from, sameMapOnly);
+                if (scrolls != null) chosen.Add(scrolls);
+            }
+
+            if (needPotions)
+            {
+                VendorEntry potions = Nearest(x => x.SellsHealthPotion, currentMapIndex, already,
+                    from, sameMapOnly);
+                if (potions != null && !chosen.Contains(potions)) chosen.Add(potions);
+            }
+
+            return chosen;
+        }
+
+        /// <summary>
+        /// Pick a vendor, preferring one we are already going to see.
+        ///
+        /// Every need used to be resolved in isolation, so a trip could route to a distant NPC for
+        /// a torch while an NPC already on the itinerary sold torches too - Bichon's Lennard sells
+        /// both town scrolls and torches, and the bot still set off for Lavar on the far side of
+        /// town. Reusing a stop we are making anyway is almost always better than a new one, and
+        /// among new ones the closer is better.
+        /// </summary>
+        private VendorEntry Nearest(Func<VendorEntry, bool> match, int currentMapIndex,
+            IEnumerable<VendorEntry> already = null, Point from = default, bool sameMapOnly = false)
+        {
+            HashSet<NPCInfo> queued = new HashSet<NPCInfo>();
+
+            if (already != null)
+                foreach (VendorEntry entry in already)
+                    if (entry?.NPC != null) queued.Add(entry.NPC);
 
             return _entries
-                .Where(x => (needScrolls && x.SellsTownScroll) || (needPotions && x.SellsHealthPotion))
-                .OrderByDescending(x => x.MapIndex == currentMapIndex)
-                .ThenByDescending(x => (needScrolls && x.SellsTownScroll ? 1 : 0) +
-                                       (needPotions && x.SellsHealthPotion ? 1 : 0))
+                .Where(match)
+                .Where(x => !sameMapOnly || x.MapIndex == currentMapIndex)
+                .OrderByDescending(x => queued.Contains(x.NPC))
+                .ThenByDescending(x => x.MapIndex == currentMapIndex)
+                .ThenBy(x => from == default || x.MapIndex != currentMapIndex
+                    ? int.MaxValue
+                    : Math.Max(Math.Abs(x.Point.X - from.X), Math.Abs(x.Point.Y - from.Y)))
                 .FirstOrDefault();
+        }
+
+        /// <summary>
+        /// Every page of the same NPC that sells any of these types.
+        ///
+        /// An NPC can split its stock across dialogue options - Bichon's Amy has one page for
+        /// bracelets and another for necklaces - and each page is a separate entry with its own
+        /// button path. Visiting only the page we happened to pick means half the stock is never
+        /// looked at.
+        /// </summary>
+        public List<VendorEntry> PagesOf(VendorEntry entry, IEnumerable<ItemType> types)
+        {
+            List<VendorEntry> pages = new List<VendorEntry>();
+
+            if (entry?.NPC == null) return pages;
+
+            List<ItemType> wanted = types?.ToList();
+
+            foreach (VendorEntry other in _entries)
+            {
+                if (other.NPC != entry.NPC) continue;
+                if (other.Page?.Goods == null || other.Page.Goods.Count == 0) continue;
+
+                if (wanted != null && !other.Page.Goods.Any(g =>
+                        g.Item != null &&
+                        g.GoodsIndex == other.NPC.GoodsIndex &&
+                        wanted.Contains(g.Item.ItemType)))
+                    continue;
+
+                pages.Add(other);
+            }
+
+            return pages;
         }
 
         /// <summary>Whoever repairs the most of what is damaged. Mirrors BestBuyerFor.</summary>
@@ -230,6 +368,85 @@ namespace MirBot
 
                 best = entry;
                 bestScore = score;
+            }
+
+            return best;
+        }
+
+        /// <summary>
+        /// The shop most likely to sell us an upgrade: whoever stocks the most of the equipment
+        /// types we are interested in. Scored the same way as the best buyer, with a bonus for
+        /// being on this map so a shopping trip does not become a cross-map expedition.
+        /// </summary>
+        public VendorEntry BestGearSellerFor(IEnumerable<ItemType> wanted, int currentMapIndex,
+            IEnumerable<VendorEntry> already = null, Point from = default, int maxDistance = 0)
+        {
+            List<ItemType> types = wanted?.ToList() ?? new List<ItemType>();
+            if (types.Count == 0) return null;
+
+            HashSet<NPCInfo> queued = new HashSet<NPCInfo>();
+
+            if (already != null)
+                foreach (VendorEntry entry in already)
+                    if (entry?.NPC != null) queued.Add(entry.NPC);
+
+            // Ranked in order of what actually costs us, not added together. Adding a stock
+            // COUNT to a tile COUNT compares different units, and stock always won: a general
+            // store with two hundred items outscored a shop ten tiles away by sheer inventory, so
+            // the bot walked ninety tiles across Bichon to Lavar while Lennard stood next door.
+            //
+            // Distance is bucketed rather than exact, so a much richer shop a few tiles further on
+            // can still win - but nothing beats being close.
+            const int Bucket = 25;
+
+            VendorEntry best = null;
+            (int queuedRank, int mapRank, int band, int stock) bestKey =
+                (int.MaxValue, int.MaxValue, int.MaxValue, int.MinValue);
+
+            foreach (VendorEntry entry in _entries)
+            {
+                if (entry.Page?.Goods == null || entry.Page.Goods.Count == 0) continue;
+
+                int stocked = 0;
+
+                foreach (NPCGood good in entry.Page.Goods)
+                {
+                    if (good.Item == null) continue;
+                    if (good.GoodsIndex != entry.NPC.GoodsIndex) continue;
+                    if (types.Contains(good.Item.ItemType)) stocked++;
+                }
+
+                if (stocked == 0) continue;
+
+                bool sameMap = entry.MapIndex == currentMapIndex;
+
+                int distance = sameMap && from != default
+                    ? Math.Max(Math.Abs(entry.Point.X - from.X), Math.Abs(entry.Point.Y - from.Y))
+                    : int.MaxValue;
+
+                // Too far to be worth a browse, unless we are going there anyway.
+                if (maxDistance > 0 && distance > maxDistance && !queued.Contains(entry.NPC))
+                    continue;
+
+                var key = (
+                    queuedRank: queued.Contains(entry.NPC) ? 0 : 1,
+                    mapRank: sameMap ? 0 : 1,
+                    band: distance == int.MaxValue ? int.MaxValue : distance / Bucket,
+                    stock: stocked);
+
+                if (key.queuedRank > bestKey.queuedRank) continue;
+                if (key.queuedRank == bestKey.queuedRank)
+                {
+                    if (key.mapRank > bestKey.mapRank) continue;
+                    if (key.mapRank == bestKey.mapRank)
+                    {
+                        if (key.band > bestKey.band) continue;
+                        if (key.band == bestKey.band && key.stock <= bestKey.stock) continue;
+                    }
+                }
+
+                best = entry;
+                bestKey = key;
             }
 
             return best;

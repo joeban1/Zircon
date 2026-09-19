@@ -49,18 +49,93 @@ namespace MirBot
         public int TownAtWeightPercent = 90; // above this, town-teleport out if a scroll is carried
         // Reserves work both ways: below them the bot buys, above them it sells.
         public int HealthPotionReserve = 10; // always carry this many healing potions
+        // Out of potions and below this much health: scroll out rather than die. 0 disables.
+        public int EmergencyScrollAtPercent = 20;
+        // Share of the bag set aside for potions. The flat reserves above become floors:
+        // a level 40 warrior with a big bag should not carry a level 1 character's ten.
+        public int HealthPotionWeightPercent = 25;
+        public int ManaPotionWeightPercent = 10;
+        // Buy the biggest potion that heals at least this share of the health pool, when
+        // one is sold and affordable. Below it, a potion is mostly bag weight.
+        public int PotionHealPercentTarget = 25;
         public int ManaPotionReserve = 15;   // same for mana potions
         public int TownScrollReserve = 3;    // always carry this many town teleport scrolls
+        public bool KeepTorchLit = true;     // replace the torch when the slot is empty
+        // Clear the Locked flag on surplus consumables so they can actually be sold.
+        public bool UnlockToSell = true;
         // No vendor is named: VendorDirectory derives who buys what from System.db.
         public int ScrollIfFurtherThan = 25;  // use a town scroll rather than walk beyond this
         public int ReturnWithin = 6;          // close enough to the old hunting spot
         public int DetourSteps = 4;           // steps to commit to when walking around an obstacle
+        // The client's Map folder. With it the bot pathfinds; without it it steers blind.
+        public string MapPath = "";
+        // Where the learned memory banks live. Relative paths are beside the executable.
+        public string MemoryPath = "memory";
+        public int ExperienceSampleMinutes = 15;  // window for a map's experience-per-hour
+        // Maps worth trying first, in order, before falling back to a random reachable one.
+        // Comma separated map descriptions, e.g. "Deserted Mine Lv 1,Ant Cave North".
+        public string PreferredMaps = "";
+        // Experience rates are recorded per band of levels rather than per exact level, so a
+        // measurement survives levelling up. 1 reverts to exact-level records.
+        public int LevelBandSize = 5;
+        // Look for somewhere better to hunt when a town trip finishes.
+        public bool AutoTravel = false;
+        public int PursuitPatience = 25;      // approach attempts allowed without getting closer
+        // Cargo looting: how much a drop must be worth per unit of weight to be taken. The
+        // bar slides between the two gold marks - poor characters take more, rich ones less.
+        public long LootPoorGold = 5000;
+        public long LootRichGold = 200000;
+        public int LootGoldPerWeightPoor = 5;
+        public int LootGoldPerWeightRich = 80;
+        public int LootHeavyMultiplier = 4;   // bar multiplier once the bag is heavy
         public int StorageSize = 80;          // account storage slots; the server caps this anyway
-        public int RepairAtDurability = 3;    // repair equipped gear at or below this displayed value
+        public int RepairAtDurability = 1;    // repair equipped gear at or below this displayed value
+        // Special repair costs twice as much but does NOT eat the item's maximum durability,
+        // which ordinary repair does permanently. Worth it for gear we intend to keep.
+        public bool PreferSpecialRepair = true;
+        // Buy weapons, armour and accessories from shops when they beat what we are wearing.
+        public bool BuyGear = true;
+        // Never spend below this much gold: repairs and potions come first.
+        public long GoldReserve = 5000;
+        // Ignore an upgrade worth less than this percent more than the slot it replaces.
+        public int MinimumUpgradePercent = 10;
+        // Do not walk further than this to browse a shop. Gear is optional; the walk is not.
+        public int MaxShoppingDistance = 60;
         public bool RepairEnabled = true;
 
         /// <summary>Start this bot when the host launches.</summary>
         public bool AutoStart = true;
+
+        /// <summary>
+        /// How many healing potions to carry, given the bag we actually have.
+        ///
+        /// A flat ten is a level 1 number. A warrior with a 136 weight bag and eighty thousand gold
+        /// should be carrying a stack that lasts a hunting session, and one with a 70 weight bag
+        /// should not be carrying the same number as the warrior.
+        /// </summary>
+        public int HealthPotionTarget(int maxBagWeight, int potionWeight = 1) =>
+            Target(maxBagWeight, HealthPotionWeightPercent, HealthPotionReserve, potionWeight);
+
+        public int ManaPotionTarget(int maxBagWeight, int potionWeight = 1) =>
+            Target(maxBagWeight, ManaPotionWeightPercent, ManaPotionReserve, potionWeight);
+
+        /// <summary>
+        /// The budget is a share of the BAG, so it has to be divided by what one potion weighs.
+        ///
+        /// Treating the weight budget as a count - on an assumption that potions weigh one apiece,
+        /// which I asserted without checking - meant a warrior with a 147 weight bag bought 36
+        /// potions of whatever tier it could afford. At tier four that is most of the bag: it came
+        /// home from the shops at 115 of 147 with no room left to hunt.
+        /// </summary>
+        private static int Target(int maxBagWeight, int percent, int floor, int itemWeight)
+        {
+            if (maxBagWeight <= 0 || percent <= 0) return floor;
+
+            int weightBudget = maxBagWeight * percent / 100;
+            int count = weightBudget / System.Math.Max(1, itemWeight);
+
+            return System.Math.Max(floor, count);
+        }
         public bool BuyBooks = true;
         public bool LearnBooks = true;
         public bool BankUnlearntBooks = true;
@@ -141,13 +216,36 @@ namespace MirBot
                     case "heavyweightpercent": config.HeavyWeightPercent = int.Parse(value); break;
                     case "townatweightpercent": config.TownAtWeightPercent = int.Parse(value); break;
                     case "healthpotionreserve": config.HealthPotionReserve = int.Parse(value); break;
+                    case "emergencyscrollatpercent": config.EmergencyScrollAtPercent = int.Parse(value); break;
+                    case "healthpotionweightpercent": config.HealthPotionWeightPercent = int.Parse(value); break;
+                    case "manapotionweightpercent": config.ManaPotionWeightPercent = int.Parse(value); break;
+                    case "potionhealpercenttarget": config.PotionHealPercentTarget = int.Parse(value); break;
                     case "manapotionreserve": config.ManaPotionReserve = int.Parse(value); break;
                     case "townscrollreserve": config.TownScrollReserve = int.Parse(value); break;
+                    case "keeptorchlit": config.KeepTorchLit = bool.Parse(value); break;
+                    case "unlocktosell": config.UnlockToSell = bool.Parse(value); break;
                     case "scrolliffurtherthan": config.ScrollIfFurtherThan = int.Parse(value); break;
                     case "returnwithin": config.ReturnWithin = int.Parse(value); break;
                     case "detoursteps": config.DetourSteps = int.Parse(value); break;
+                    case "mappath": config.MapPath = value; break;
+                    case "memorypath": config.MemoryPath = value; break;
+                    case "experiencesampleminutes": config.ExperienceSampleMinutes = int.Parse(value); break;
+                    case "preferredmaps": config.PreferredMaps = value; break;
+                    case "levelbandsize": config.LevelBandSize = int.Parse(value); break;
+                    case "autotravel": config.AutoTravel = bool.Parse(value); break;
+                    case "pursuitpatience": config.PursuitPatience = int.Parse(value); break;
+                    case "lootpoorgold": config.LootPoorGold = long.Parse(value); break;
+                    case "lootrichgold": config.LootRichGold = long.Parse(value); break;
+                    case "lootgoldperweightpoor": config.LootGoldPerWeightPoor = int.Parse(value); break;
+                    case "lootgoldperweightrich": config.LootGoldPerWeightRich = int.Parse(value); break;
+                    case "lootheavymultiplier": config.LootHeavyMultiplier = int.Parse(value); break;
                     case "storagesize": config.StorageSize = int.Parse(value); break;
                     case "repairatdurability": config.RepairAtDurability = int.Parse(value); break;
+                    case "preferspecialrepair": config.PreferSpecialRepair = bool.Parse(value); break;
+                    case "buygear": config.BuyGear = bool.Parse(value); break;
+                    case "goldreserve": config.GoldReserve = long.Parse(value); break;
+                    case "minimumupgradepercent": config.MinimumUpgradePercent = int.Parse(value); break;
+                    case "maxshoppingdistance": config.MaxShoppingDistance = int.Parse(value); break;
                     case "repairenabled": config.RepairEnabled = bool.Parse(value); break;
                     case "autostart": config.AutoStart = bool.Parse(value); break;
                     case "buybooks": config.BuyBooks = bool.Parse(value); break;

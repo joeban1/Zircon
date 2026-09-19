@@ -64,7 +64,28 @@ namespace MirBot
         public string Name = "";
         public Point Location;
         public MirDirection Direction;
-        public int MapIndex;
+        private int _mapIndex;
+        private string _mapName = "";
+
+        /// <summary>
+        /// Setting the index resolves the name once. The lookup is a scan of MapInfoList, so it is
+        /// done on the map change rather than every time something wants to print where we are.
+        /// </summary>
+        public int MapIndex
+        {
+            get => _mapIndex;
+            set
+            {
+                if (_mapIndex == value) return;
+
+                _mapIndex = value;
+                _mapName = Globals.MapInfoList?.Binding?
+                    .FirstOrDefault(x => x.Index == value)?.Description ?? $"map {value}";
+            }
+        }
+
+        /// <summary>The current map's description, for logs and the learned memory banks.</summary>
+        public string MapName => _mapName;
         public MirClass Class;
         public MirGender Gender;
         public int Level;
@@ -94,6 +115,9 @@ namespace MirBot
         /// </summary>
         public bool MaxExperienceKnown;
 
+        /// <summary>Every point of experience gained this session, never reset by a level-up.</summary>
+        public decimal TotalExperienceGained;
+
         public bool AtMaxLevel => MaxExperienceKnown && MaxExperience == 0;
 
         public long Gold;
@@ -115,6 +139,11 @@ namespace MirBot
         public void ApplyExperienceGain(decimal amount)
         {
             Experience += amount;       // a delta, not an absolute
+
+            // Separate running total. Experience itself is overwritten by LevelChanged, so it
+            // cannot be differenced across a level-up - and a sampling window that happens to
+            // contain one is exactly the window worth measuring.
+            if (amount > 0) TotalExperienceGained += amount;
             Touch();
         }
 
@@ -165,6 +194,41 @@ namespace MirBot
 
         public bool Knows(int magicInfoIndex) => _magics.ContainsKey(magicInfoIndex);
 
+        /// <summary>
+        /// Do we know this skill and is our level high enough to use it?
+        ///
+        /// NeedLevel1 is the level at which the skill becomes castable, which is a different gate
+        /// from the level requirement on the book that teaches it - see WhyNotBook in TownTrip.
+        /// </summary>
+        public bool CanUseMagic(MagicType magic)
+        {
+            if (magic == MagicType.None) return false;
+
+            foreach (ClientUserMagic known in _magics.Values)
+            {
+                if (known.Info == null || known.Info.Magic != magic) continue;
+
+                return Level >= known.Info.NeedLevel1;
+            }
+
+            return false;
+        }
+
+        /// <summary>Is any object standing on this cell, other than the one named?</summary>
+        public bool SomethingAt(Point location, uint except)
+        {
+            foreach (WorldObject ob in _objects.Values)
+            {
+                if (ob.ObjectID == except || ob.ObjectID == SelfID) continue;
+                if (ob.Kind == ObjectKind.Item) continue;
+                if (ob.Location != location) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
         /// <summary>Skill level, or -1 when the skill is not known.</summary>
         public int MagicLevel(int magicInfoIndex) =>
             _magics.TryGetValue(magicInfoIndex, out ClientUserMagic magic) ? magic.Level : -1;
@@ -210,6 +274,30 @@ namespace MirBot
         public int ManaPercent => MaxMana > 0 ? Mana * 100 / MaxMana : 100;
 
         public IEnumerable<WorldObject> Objects => _objects.Values;
+
+        /// <summary>
+        /// Cells currently held by something solid, for pathing around them.
+        ///
+        /// Returns a fresh set rather than exposing the object dictionary: a caller holding
+        /// that would break the moment the next packet added an object.
+        /// </summary>
+        public HashSet<Point> OccupiedCells(uint except)
+        {
+            HashSet<Point> cells = new HashSet<Point>();
+
+            foreach (WorldObject ob in _objects.Values)
+            {
+                if (ob.ObjectID == except || ob.ObjectID == SelfID) continue;
+
+                // Items lie on the floor and are walked over, not around.
+                if (ob.Kind == ObjectKind.Item) continue;
+                if (ob.Kind == ObjectKind.Monster && ob.Dead) continue;
+
+                cells.Add(ob.Location);
+            }
+
+            return cells;
+        }
         public int ObjectCount => _objects.Count;
 
         private void Touch() => Version++;
@@ -257,6 +345,10 @@ namespace MirBot
             (MirDirection)(((int)direction + 4) % 8);
 
         #region Queries
+
+        /// <summary>The object with this id, or null.</summary>
+        public WorldObject Find(uint objectID) =>
+            _objects.TryGetValue(objectID, out WorldObject ob) ? ob : null;
 
         public WorldObject NearestLiveMonster(int maxDistance, ICollection<uint> exclude = null)
         {

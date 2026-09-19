@@ -14,3 +14,7 @@ licenses.licx
 /Exports/*
 /artifacts
 /docs/changes
+
+# MirBot: real bot configs hold credentials. Only the example is tracked.
+MirBot/bot.ini
+MirBot/bot-*.ini

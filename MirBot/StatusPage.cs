@@ -64,12 +64,49 @@ namespace MirBot
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const pct = (a,b) => b > 0 ? Math.min(100, Math.round(a/b*100)) : 0;
 
-async function send(id, action) {
+async function send(id, action, query) {
   try {
-    await fetch(`/api/bots/${encodeURIComponent(id)}/${action}`,
+    await fetch(`/api/bots/${encodeURIComponent(id)}/${action}` + (query ? "?" + query : ""),
                 { method:"POST", headers:{ "X-MirBot":"1" } });
   } catch (e) { /* the poll will show the result */ }
   refresh();
+}
+
+// Destinations are fetched once: the map graph is built at startup and never changes.
+let mapList = null;
+const chosenMap = {};
+
+async function loadMaps() {
+  if (mapList) return mapList;
+  try {
+    const r = await fetch("/api/maps", { cache:"no-store" });
+    mapList = await r.json();
+  } catch (e) { mapList = []; }
+  return mapList;
+}
+
+// Re-filling the <select> every second would fight the user's own selection, so each one is
+// populated once and then left alone.
+async function fillMaps() {
+  const maps = await loadMaps();
+
+  for (const sel of document.querySelectorAll("select[id^='map-']")) {
+    if (sel.dataset.filled) continue;
+    sel.dataset.filled = "1";
+    sel.innerHTML = maps.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+
+    // Restore what was chosen before the card was rebuilt.
+    const id = sel.id.substring(4);
+    if (chosenMap[id]) sel.value = chosenMap[id];
+
+    sel.addEventListener("change", () => { chosenMap[id] = sel.value; });
+  }
+}
+
+function goMap(id) {
+  const sel = document.getElementById("map-" + id);
+  if (!sel || !sel.value) return;
+  send(id, "travel", "map=" + encodeURIComponent(sel.value));
 }
 
 function bar(cls, value, max) {
@@ -113,6 +150,9 @@ function render(h) {
           <button onclick="send('${esc(b.id)}','start')">Start</button>
           <button onclick="send('${esc(b.id)}','stop')">Stop</button>
           <button onclick="send('${esc(b.id)}','towntrip')">Town trip</button>
+          <button onclick="send('${esc(b.id)}','travel')">Travel</button>
+          <select id="map-${esc(b.id)}"></select>
+          <button onclick="goMap('${esc(b.id)}')">Go</button>
           <button onclick="send('${esc(b.id)}','revive')">Revive</button>
         </span>
       </div>
@@ -154,9 +194,16 @@ function render(h) {
 }
 
 async function refresh() {
+  // The whole card is rebuilt from innerHTML each poll, which destroys and recreates every
+  // <select> - so an open dropdown closed itself about once a second and was unusable. While
+  // one has focus the refresh is skipped entirely; the numbers can wait a moment.
+  const a = document.activeElement;
+  if (a && (a.tagName === "SELECT" || a.dataset?.holdRefresh)) return;
+
   try {
     const r = await fetch("/api/status", { cache:"no-store" });
     render(await r.json());
+    fillMaps();
   } catch (e) {
     document.getElementById("foot").textContent = "host unreachable — " + e;
   }

@@ -15,6 +15,9 @@ namespace MirBot
             string directory = AppContext.BaseDirectory;
             string logPath = null;
             bool console = false;
+            bool checkMaps = false;
+            string checkTravel = null;
+            string checkVendors = null;
             int seconds = 0;   // 0 = run until Ctrl+C; bounded runs are for testing
 
             for (int i = 0; i < args.Length; i++)
@@ -22,6 +25,11 @@ namespace MirBot
                 if (args[i] == "--dir" && i + 1 < args.Length) directory = args[i + 1];
                 if (args[i] == "--log" && i + 1 < args.Length) logPath = args[i + 1];
                 if (args[i] == "--console") console = true;
+                if (args[i] == "--check-maps") { checkMaps = true; console = true; }
+                if (args[i] == "--check-travel" && i + 1 < args.Length)
+                { checkTravel = args[i + 1]; console = true; }
+                if (args[i] == "--vendors")
+                { checkVendors = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
                 if (args[i] == "--seconds" && i + 1 < args.Length &&
                     int.TryParse(args[i + 1], out int parsed)) seconds = parsed;
             }
@@ -40,6 +48,15 @@ namespace MirBot
 
                 host.Load(directory);
                 if (!host.Prepare()) return 2;
+
+                // Diagnostic: is MapPath right, and do the grids parse? Worth its own mode because
+                // a wrong path is silent at runtime - the bot just steers blind again.
+                if (checkMaps) return host.CheckMaps() ? 0 : 3;
+
+                // Diagnostic: can we actually route there from the starting town?
+                if (checkTravel != null) return host.CheckTravel(checkTravel) ? 0 : 4;
+
+                if (checkVendors != null) { host.DumpVendors(checkVendors); return 0; }
 
                 Console.CancelKeyPress += (s, e) =>
                 {

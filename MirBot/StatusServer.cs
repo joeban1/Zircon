@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -32,7 +33,8 @@ namespace MirBot
 
         private readonly HttpListener _listener = new HttpListener();
         private readonly Func<HostStatus> _read;
-        private readonly Func<string, BotCommandKind, bool> _command;
+        private readonly Func<string, BotCommandKind, string, bool> _command;
+        private readonly Func<List<MapChoice>> _maps;
         private readonly Func<string, int, string[]> _log;
         private readonly BotLog _hostLog;
         private readonly int _port;
@@ -42,13 +44,15 @@ namespace MirBot
 
         public StatusServer(int port, BotLog hostLog,
             Func<HostStatus> read,
-            Func<string, BotCommandKind, bool> command,
+            Func<string, BotCommandKind, string, bool> command,
+            Func<List<MapChoice>> maps,
             Func<string, int, string[]> log)
         {
             _port = port;
             _hostLog = hostLog;
             _read = read;
             _command = command;
+            _maps = maps;
             _log = log;
 
             _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
@@ -118,6 +122,13 @@ namespace MirBot
                 return;
             }
 
+            if (path == "/api/maps" && !post)
+            {
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(_maps(), Json));
+                return;
+            }
+
             if (path == "/api/status" && !post)
             {
                 Send(context, 200, "application/json; charset=utf-8",
@@ -159,10 +170,16 @@ namespace MirBot
                     case "stop": kind = BotCommandKind.Stop; break;
                     case "towntrip": kind = BotCommandKind.ForceTownTrip; break;
                     case "revive": kind = BotCommandKind.Revive; break;
+                    case "travel": kind = BotCommandKind.Travel; break;
                     default: TryFail(context, 404, "unknown action"); return;
                 }
 
-                bool ok = _command(id, kind);
+                // Travel takes a destination: ?map=Ant%20Cave%20North, or a map index.
+                string argument = kind == BotCommandKind.Travel
+                    ? context.Request.QueryString["map"]
+                    : null;
+
+                bool ok = _command(id, kind, argument);
 
                 Send(context, ok ? 202 : 404, "application/json; charset=utf-8",
                     JsonSerializer.Serialize(new { ok, id, action }, Json));

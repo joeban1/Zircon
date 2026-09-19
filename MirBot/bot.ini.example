@@ -1,0 +1,54 @@
+[Network]
+ServerAddress=192.168.1.108
+ServerPort=7000
+TimeOutSeconds=20
+
+[Account]
+# Must look like an email (server checks with a regex) and the password must be
+# non-whitespace within the server's length limits.
+EMailAddress=
+Password=
+
+# Leave empty to play the first character on the account. If the account has no
+# characters at all, the bot creates one with this name (or an auto-generated one).
+CharacterName=
+
+# Only set true when deliberately registering a bot account. The server auto-activates
+# accounts created from the server machine's own IP; from any other IP it tries to send
+# an activation email instead, and login will fail with AccountNotActivated.
+CreateAccountIfMissing=false
+NewCharacterClass=Warrior
+
+[Version]
+# The server compares SHA256 of the file at its own VersionPath against what we send.
+# If the bot can see that file, point at it and the hash stays correct across rebuilds.
+VersionPath=C:\ZirconBuild\Debug\Client\Zircon.dll
+
+# Fallback when the file is not reachable. WARNING: this goes stale every time the
+# client is rebuilt - the server will then reject the bot with WrongVersion.
+ClientHashHex=A50246FF747BF8C889FE43C7E324C452C0A5669C7C96B7E8B75AEADB26647898
+
+[Bot]
+Language=English
+
+# The client's Map folder. The bot reads the .map files to build a walkability grid and
+# pathfinds with A*; without this it falls back to steering straight at things and
+# sidestepping when blocked, which cannot get around a wall with a gap in it.
+# Check it with:  MirBot.exe --check-maps
+MapPath=C:\ZirconBuild\Debug\Client\Map
+
+# Approach attempts allowed without ever getting closer before a target is written off.
+# Backstop for a chase that pathfinding cannot express - a monster kiting us, or a drop
+# on a cell nothing can stand on.
+PursuitPatience=25
+
+# Cargo looting. Anything that is not a consumable, a book or an upgrade has to pay for
+# the bag space it takes, because bag weight is what forces the walk back to town. Value
+# is judged in gold per unit of weight, against a bar that slides with how much gold the
+# character already has: skint, it takes nearly anything that sells; rich, only the good
+# stuff. The bar is multiplied once the bag is heavy so potions and upgrades still fit.
+LootPoorGold=5000
+LootRichGold=200000
+LootGoldPerWeightPoor=5
+LootGoldPerWeightRich=80
+LootHeavyMultiplier=4
