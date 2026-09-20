@@ -194,6 +194,9 @@ namespace MirBot
 
         public bool Knows(int magicInfoIndex) => _magics.ContainsKey(magicInfoIndex);
 
+        /// <summary>Every learned skill. Read-only use on the bot thread only.</summary>
+        public IEnumerable<ClientUserMagic> Magics => _magics.Values;
+
         /// <summary>
         /// Do we know this skill and is our level high enough to use it?
         ///

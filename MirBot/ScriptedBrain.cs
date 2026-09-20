@@ -11,7 +11,7 @@ namespace MirBot
         Idle, Equip, Heal, Flee, Attack, Loot, Approach, Roam,
         TownTeleport, AutoPath, AutoPathPoint, AutoPathCancel, WalkTo, Deposit, Withdraw,
         NPCRepair, LearnBook, Logout, NPCCall, NPCButton, NPCSell, NPCBuy, NPCClose,
-        MagicToggle, Unlock
+        MagicToggle, Unlock, Cast
     }
 
     public sealed class Decision
@@ -71,6 +71,7 @@ namespace MirBot
         private static readonly TimeSpan MoveTime = TimeSpan.FromMilliseconds(600);
         private static readonly TimeSpan TurnTime = TimeSpan.FromMilliseconds(300);
         private static readonly TimeSpan AttackDelay = TimeSpan.FromMilliseconds(1500);
+        private static readonly TimeSpan CastTime = TimeSpan.FromMilliseconds(600);
         private static readonly TimeSpan ItemUseDelay = TimeSpan.FromMilliseconds(1000);
         private static readonly TimeSpan Margin = TimeSpan.FromMilliseconds(120);
 
@@ -80,6 +81,11 @@ namespace MirBot
 
         private DateTime _nextAction = DateTime.MinValue;
         private DateTime _nextPotion = DateTime.MinValue;
+
+        /// <summary>Emergency scrolls are one per emergency - see the escape branch.</summary>
+        private DateTime _nextEscape = DateTime.MinValue;
+
+        private static readonly TimeSpan EscapeCooldown = TimeSpan.FromSeconds(45);
         private MirDirection _roamDirection;
         private int _roamStepsLeft;
         private Point _lastLocation;
@@ -122,6 +128,36 @@ namespace MirBot
         public uint CommittedTarget => _committedTarget;
         public int TargetSwitches;
 
+        // The fight we are currently in, and whether it is actually going anywhere.
+        //
+        // _pursuitBest measures whether we are getting CLOSER; nothing measured whether the target
+        // was getting WEAKER. A bot was seen surrounded with a monster standing on its own cell:
+        // it had committed to that target, every swing went at the cell in front of it, and the
+        // thing underneath took no damage. Distance was 0, so the approach watchdog never ran and
+        // the attack watchdog did not exist - it stood there swinging at nothing until it was
+        // forced back to town by hand.
+        //
+        // The server broadcasts S.HealthChanged for monsters as well as for us
+        // (MapObject.ProcessHPMP), so the target's health is genuinely observable and "is this
+        // fight working" is a question we can answer rather than guess at.
+        private uint _fightID;
+        private int _fightHealth;
+        private int _fightSwings;
+
+        public int FightsAbandoned;
+
+        /// <summary>Learned per-monster danger, shared by every bot. Null disables avoidance.</summary>
+        public MonsterMemory Danger;
+
+        /// <summary>Cells the server refuses although the map file says otherwise.</summary>
+        public NavCorrections Nav;
+
+        /// <summary>The cell the last move was aimed at, for judging whether it worked.</summary>
+        private Point _lastMoveTarget;
+        private bool _lastMoveWasSingleStep;
+
+        public int LearnedBlockedCells;
+
         public int BlockedMoves => _blockedMoves;
         public int UnreachableTargets => _unreachable.Count;
 
@@ -131,6 +167,8 @@ namespace MirBot
         {
             _config = config;
             _roamDirection = (MirDirection)_random.Next(8);
+
+            Spells = new SpellBook(config);
 
             _lootValue = new LootValueRule
             {
@@ -158,6 +196,9 @@ namespace MirBot
 
         /// <summary>Attack-skill arming, fed by S.MagicToggle.</summary>
         public readonly SkillSet Skills = new SkillSet();
+
+        /// <summary>Cast spells, fed by S.MagicCooldown. Built in the constructor.</summary>
+        public SpellBook Spells;
 
         /// <summary>Cross-map travel, when one is running.</summary>
         public Journey Travel;
@@ -195,8 +236,19 @@ namespace MirBot
             {
                 int escape = items.FindTownTeleportSlot();
 
-                if (escape >= 0)
+                if (escape >= 0 && DateTime.Now >= _nextEscape)
                 {
+                    // One scroll per emergency. A town scroll goes to the BIND POINT, so if the
+                    // bind point is itself outside a safe zone - which Banya Village's is - the bot
+                    // lands still below the threshold, still with nothing to drink, still not safe,
+                    // and the same branch fires again on the very next tick. Three scrolls went in
+                    // fifteen seconds that way, the last two teleporting from the bind point to the
+                    // bind point.
+                    //
+                    // After the first one the answer is no longer "leave", it is "walk to a vendor",
+                    // and holding off is what lets the town trip below get a turn.
+                    _nextEscape = DateTime.Now + EscapeCooldown;
+
                     Town?.Abort("escaped on a scroll");
 
                     return new Decision
@@ -298,6 +350,36 @@ namespace MirBot
                         Reason = $"HP {world.HealthPercent}% <= {_config.HealAtPercent}%",
                         Subject = "potion",
                         PotionSlot = slot
+                    };
+            }
+
+            // 1a. Drink mana, if there is anything to spend it on.
+            //
+            //     This is what makes casting more than a single burst per login. Mana potions were
+            //     already bought, carried and reserved - CountManaPotions, ManaPotionReserve,
+            //     ManaPotionTarget all existed - and nothing in the brain ever drank one, so a
+            //     wizard spent its pool in the first few minutes and meleed for the rest of the
+            //     session. Observed directly: one logged in at 30/167, cast five times, and sat at
+            //     25/167 for as long as it was watched, because mana does not regenerate while
+            //     hunting.
+            //
+            //     Below the heal threshold this is skipped: item use is gated on one global timer,
+            //     so a mana potion drunk at 20% health is a health potion not drunk.
+            if (_config.DrinkManaAtPercent > 0 && world.MaxMana > 0 &&
+                world.ManaPercent <= _config.DrinkManaAtPercent &&
+                world.HealthPercent > _config.HealAtPercent &&
+                DateTime.Now >= _nextPotion &&
+                Spells.HasCastable(world))
+            {
+                int manaSlot = items.FindManaPotionSlot();
+
+                if (manaSlot >= 0)
+                    return new Decision
+                    {
+                        Action = BotAction.Heal,
+                        Reason = $"MP {world.ManaPercent}% <= {_config.DrinkManaAtPercent}%",
+                        Subject = "mana potion",
+                        PotionSlot = manaSlot
                     };
             }
 
@@ -427,6 +509,12 @@ namespace MirBot
 
                 if (leg != null)
                 {
+                    // Only a WalkTo needs steering. A teleport leg is a conversation - NPCCall and
+                    // NPCButton - and rewriting those to Approach, as this used to do
+                    // unconditionally, would send the bot walking towards an empty Destination
+                    // instead of talking to the NPC standing next to it.
+                    if (leg.Action != BotAction.WalkTo) return leg;
+
                     int remaining = WorldModel.Distance(world.Location, leg.Destination);
 
                     leg.Action = BotAction.Approach;
@@ -452,9 +540,71 @@ namespace MirBot
             {
                 int distance = world.DistanceTo(target.Location);
 
-                // 3. Attack anything adjacent.
+                // 3a. Cast, if we know something worth casting and can pay for it.
+                //
+                //    Above the melee branch and above closing the distance, both deliberately. A
+                //    wizard that walks into contact to punch things has thrown away the entire
+                //    reason it is a wizard, and a spell that reaches ten tiles should be thrown
+                //    from ten tiles rather than after a walk.
+                ClientUserMagic spell = Spells.Choose(world, target, distance);
+
+                if (spell != null)
+                {
+                    return new Decision
+                    {
+                        Action = BotAction.Cast,
+                        Reason = $"{spell.Info.Name} on {target.Name} at {distance}",
+                        Subject = spell.Info.Name,
+                        TargetID = target.ObjectID,
+                        Direction = WorldModel.DirectionTo(world.Location, target.Location),
+                        Point = target.Location,
+                        Magic = spell.Info.Magic
+                    };
+                }
+
+                // 3b. In contact. Either standing beside it, or - Mir allows this - standing on
+                //     the same tile, because a player and a monster can step onto one cell in the
+                //     same tick.
                 if (distance <= 1)
                 {
+                    // Is this fight going anywhere? The target losing health is the only proof
+                    // that it is, and the server broadcasts S.HealthChanged for monsters as well
+                    // as for us, so it is genuinely observable rather than something to infer.
+                    //
+                    // Asked BEFORE the same-cell step-off, and that ordering is the whole point.
+                    // Monsters follow: step off, it steps onto us again, step off again. Resetting
+                    // the watchdog on each step-off - which is what the first version of this did -
+                    // turns the cure into its own infinite loop. A step-off is a turn that did no
+                    // damage, and it is counted as one.
+                    if (NoDamageTo(target))
+                    {
+                        Blacklist(target.ObjectID, GiveUpFor);
+
+                        return new Decision
+                        {
+                            Action = BotAction.Roam,
+                            Reason = $"{target.Name} took no damage in {_config.AttackPatience} turns",
+                            Subject = "giving up",
+                            Direction = NextRoamDirection(world, true),
+                            Distance = 1
+                        };
+                    }
+
+                    // Underneath us. An attack is aimed at the cell in FRONT, so a monster
+                    // sharing our cell can never be hit from where we stand. One step makes it
+                    // adjacent and the fight starts working. Casting is unaffected - a spell names
+                    // its target by ObjectID - and sits above this, so a caster keeps hurting it
+                    // on the way past.
+                    if (distance == 0)
+                        return new Decision
+                        {
+                            Action = BotAction.Roam,
+                            Reason = $"{target.Name} is underneath us - stepping off",
+                            Subject = "stepping off",
+                            Direction = NextRoamDirection(world, true),
+                            Distance = 1
+                        };
+
                     MagicType magic = Skills.ChooseAttackMagic(world, target, distance);
 
                     return new Decision
@@ -537,6 +687,7 @@ namespace MirBot
             if (world.Location == _lastLocation)
             {
                 _blockedMoves++;
+                LearnRefusal(world);
 
                 // A detour that is not moving us either is no better than the original direction.
                 if (_detourStepsLeft > 0) CancelDetour();
@@ -544,7 +695,33 @@ namespace MirBot
             else
             {
                 _blockedMoves = 0;
+
+                // Standing on it is proof it is passable. A gate that has since opened un-learns
+                // itself here, which is the whole reason a door is worth learning about at all.
+                if (Nav != null && _config.LearnBlockedCells)
+                    Nav.Cleared(world.MapIndex, world.Location);
             }
+        }
+
+        /// <summary>
+        /// The server silently refused a move. Remember the cell, once we are sure enough.
+        ///
+        /// Only single steps are used as evidence: a run covers two cells and a refusal does not
+        /// say which of them was the problem, so counting it would teach us the wrong tile. And a
+        /// cell with something visibly standing on it is not evidence either - that is a monster
+        /// in a doorway, which moves, and blacklisting the doorway because of it would be a far
+        /// worse bug than the one this is here to fix.
+        /// </summary>
+        private void LearnRefusal(WorldModel world)
+        {
+            if (Nav == null || !_config.LearnBlockedCells) return;
+            if (!_lastMoveWasSingleStep) return;
+            if (_lastMoveTarget == Point.Empty) return;
+            if (world.SomethingAt(_lastMoveTarget, 0)) return;
+
+            if (Nav.Refused(world.MapIndex, world.MapName, _lastMoveTarget,
+                    _config.BlockedCellEvidence))
+                LearnedBlockedCells++;
         }
 
         /// <summary>
@@ -588,6 +765,76 @@ namespace MirBot
             _pursuitAttempts = 0;
         }
 
+        private TimeSpan GiveUpFor =>
+            TimeSpan.FromSeconds(Math.Max(1, _config.AttackGiveUpSeconds));
+
+        /// <summary>
+        /// Write a target off and forget everything we were doing about it.
+        ///
+        /// The park list expires on a fixed UnreachableFor, so a longer sentence is served by
+        /// backdating the entry - the same list, one expiry rule, no second timer to keep in step.
+        /// </summary>
+        private void Blacklist(uint objectID, TimeSpan forHowLong)
+        {
+            _unreachable[objectID] = DateTime.Now + forHowLong - UnreachableFor;
+            _committedTarget = 0;
+            _blockedMoves = 0;
+            ForgetPursuit();
+            ForgetFight();
+            FightsAbandoned++;
+        }
+
+        private void ForgetFight()
+        {
+            _fightID = 0;
+            _fightSwings = 0;
+        }
+
+        /// <summary>
+        /// Have we swung at this thing repeatedly without its health ever going down?
+        ///
+        /// Called once per adjacent-attack decision. Any drop at all resets the patience, so a
+        /// long fight against something with a lot of health is never cut short; only a fight
+        /// where NOTHING is landing runs the counter up. A string of genuine misses can trip it
+        /// too, and switching target after eight consecutive whiffs is the right move anyway.
+        /// </summary>
+        private bool NoDamageTo(WorldObject target)
+        {
+            if (target.ObjectID != _fightID)
+            {
+                _fightID = target.ObjectID;
+                _fightHealth = target.Health;
+                _fightSwings = 0;
+                return false;
+            }
+
+            if (target.Health < _fightHealth)
+            {
+                _fightHealth = target.Health;
+                _fightSwings = 0;
+                return false;
+            }
+
+            return ++_fightSwings >= Math.Max(1, _config.AttackPatience);
+        }
+
+        /// <summary>
+        /// Would picking a fight with this be a mistake, given what it has done to us before?
+        ///
+        /// This is the per-monster half of the danger model. The numbers were already being
+        /// collected - worst hit, average hit, kills - and then used only to judge whole MAPS,
+        /// which is far too blunt: one nasty thing wandering through a good hunting ground should
+        /// be walked around, not cause the ground to be abandoned.
+        ///
+        /// Only applied when CHOOSING a fight. Something already adjacent and hitting us is dealt
+        /// with by healing and fleeing, which sit above this; refusing to hit back at that point
+        /// would be the worst of both.
+        /// </summary>
+        private bool TooDangerous(WorldModel world, WorldObject monster) =>
+            Danger != null && monster != null &&
+            Danger.TooDangerousToFight(monster.Name, world.Health,
+                _config.DangerHitsToDeath, _config.DangerMinimumHits);
+
         /// <summary>
         /// Point a decision at its destination, and say whether getting there is possible at all.
         ///
@@ -611,6 +858,21 @@ namespace MirBot
                 HashSet<Point> avoid = _blockedMoves > 0
                     ? world.OccupiedCells(decision.TargetID)
                     : null;
+
+                // Learned cells are avoided ALWAYS, not only after a refusal. The point of having
+                // learned them is that the route never goes through one again; waiting to be
+                // refused first would be re-learning the same lesson on every approach.
+                HashSet<Point> learned = Nav?.BlockedOn(world.MapIndex);
+
+                if (learned != null && learned.Count > 0)
+                {
+                    if (avoid == null) avoid = learned;
+                    else
+                    {
+                        avoid = new HashSet<Point>(avoid);
+                        avoid.UnionWith(learned);
+                    }
+                }
 
                 List<Point> path = PathFinder.Find(grid, world.Location, destination, goalRange, avoid);
 
@@ -774,21 +1036,61 @@ namespace MirBot
                                  !_unreachable.ContainsKey(current.ObjectID) &&
                                  world.DistanceTo(current.Location) <= _config.AggroRange + 2;
 
+                // Commitment survives a monster becoming frightening mid-fight. Walking away from
+                // something that is already on us just means being hit in the back; the health
+                // thresholds above decide when to actually disengage.
                 if (stillGood) return current;
 
                 _committedTarget = 0;
+                ForgetFight();
             }
 
-            WorldObject next = world.NearestLiveMonster(_config.AggroRange, _unreachable.Keys);
+            WorldObject next = NearestWorthFighting(world);
 
             if (next != null)
             {
-                if (_committedTarget != 0 && next.ObjectID != _committedTarget) TargetSwitches++;
+                if (_committedTarget != 0 && next.ObjectID != _committedTarget)
+                {
+                    TargetSwitches++;
+                    ForgetFight();
+                }
+
                 _committedTarget = next.ObjectID;
             }
 
             return next;
         }
+
+        /// <summary>
+        /// The nearest monster we are willing to START a fight with, skipping anything the danger
+        /// memory says would take us apart at the health we currently have.
+        ///
+        /// Walking past one is deliberate and not the same as fleeing: we simply do not initiate.
+        /// If it comes to us anyway, the ordinary heal/flee rules take over.
+        /// </summary>
+        private WorldObject NearestWorthFighting(WorldModel world)
+        {
+            if (Danger == null || _config.DangerHitsToDeath <= 0)
+                return world.NearestLiveMonster(_config.AggroRange, _unreachable.Keys);
+
+            HashSet<uint> skip = new HashSet<uint>(_unreachable.Keys);
+
+            while (true)
+            {
+                WorldObject candidate = world.NearestLiveMonster(_config.AggroRange, skip);
+                if (candidate == null) return null;
+
+                if (!TooDangerous(world, candidate)) return candidate;
+
+                // Not parked in _unreachable: the judgement depends on our CURRENT health, so it
+                // has to be re-made every tick rather than latched. After a few potions the same
+                // monster becomes a fair fight again.
+                AvoidedDangerous++;
+                skip.Add(candidate.ObjectID);
+            }
+        }
+
+        public int AvoidedDangerous;
 
         /// <summary>
         /// Run (2 tiles) rather than walk (1) when there is ground to cover and nothing is currently
@@ -855,6 +1157,11 @@ namespace MirBot
                            decision.Action == BotAction.Flee ||
                            decision.Action == BotAction.Roam;
 
+            _lastMoveWasSingleStep = _lastWasMove && decision.Distance == 1;
+            _lastMoveTarget = _lastWasMove
+                ? Functions.Move(world.Location, decision.Direction, decision.Distance)
+                : Point.Empty;
+
             switch (decision.Action)
             {
                 case BotAction.TownTeleport:
@@ -876,6 +1183,14 @@ namespace MirBot
                 case BotAction.MagicToggle:
                     // The client's own anti-spam on these is one second.
                     _nextAction = DateTime.Now + TimeSpan.FromSeconds(1);
+                    break;
+
+                case BotAction.Cast:
+                    // Globals.CastTime, the ACTION gate. The longer between-spells gate
+                    // (Globals.MagicDelay) is SpellBook's own, because it applies to casting and
+                    // not to moving or drinking.
+                    Spells.Issued();
+                    _nextAction = DateTime.Now + CastTime + Margin;
                     break;
                 case BotAction.Logout:
                     // Its own pace: the default 420ms would be ~48 logout packets in twenty

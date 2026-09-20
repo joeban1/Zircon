@@ -201,6 +201,19 @@ namespace MirBot
         {
             if (item?.Info == null) return false;
 
+            // Item parts belong in the bank.
+            //
+            // They were falling through every rule and staying in the bag for ever: never sold
+            // (DisposableSlots and Sellable both refuse them, deliberately - a part's own ItemInfo
+            // is a nameless placeholder and it used to be sold for scrap), never equipped, and
+            // never stored either, because SlotFor(ItemType.ItemPart) is null so CanEquip below
+            // says no and WorthStoring returned false. Two of them sat in a warrior's bag through
+            // a dozen town trips.
+            //
+            // They are worth keeping - parts accumulate towards Info.PartCount and are how the
+            // good gear is assembled - so the bank is where they go rather than the bag.
+            if (IsItemPart(item)) return true;
+
             // Books first: CanEquip reads ItemInfo.RequiredClass, which books normally leave at
             // All, so it would wave every class's books through. MagicBooks does the real test.
             if (item.Info.ItemType == ItemType.Book)
@@ -214,6 +227,64 @@ namespace MirBot
             if (MeetsRequirement(item.Info, level, stats)) return false;
 
             return SlotFor(item.Info.ItemType) != null;
+        }
+
+        /// <summary>One banked item that is worth pulling back out, and why.</summary>
+        public readonly struct Reclaim
+        {
+            public readonly int Slot;
+            public readonly ClientUserItem Item;
+            public readonly string Why;
+
+            public Reclaim(int slot, ClientUserItem item, string why)
+            {
+                Slot = slot;
+                Item = item;
+                Why = why;
+            }
+        }
+
+        /// <summary>
+        /// What in storage has become worth having since it was put there.
+        ///
+        /// Storage exists because of levelling: WorthStoring banks exactly the things this
+        /// character cannot use YET, so the question at every town trip is which of them it can use
+        /// now. That question was being asked, but only half of it - anything equippable and
+        /// level-met was pulled out, whether or not it beat what the character had since found.
+        /// A helmet banked at level 1 and reclaimed at level 20 is bag weight that gets carried to
+        /// a vendor and sold, having displaced something worth looting on the way.
+        ///
+        /// So the bar is the same one the loot rule uses: it has to beat the WEAKEST slot it could
+        /// displace. Books are judged by MagicBooks instead, because a book is not scored against
+        /// anything - either the character can learn it now or it stays banked.
+        /// </summary>
+        public List<Reclaim> StorageReclaims(MirClass mirClass, MirGender gender, int level,
+            Stats stats, MagicBooks books, WorldModel world)
+        {
+            List<Reclaim> found = new List<Reclaim>();
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in _storage.OrderBy(x => x.Key))
+            {
+                ClientUserItem item = pair.Value;
+                if (item?.Info == null) continue;
+
+                if (item.Info.ItemType == ItemType.Book)
+                {
+                    if (books?.Judge(item, mirClass, level, stats, world) == BookVerdict.Wanted)
+                        found.Add(new Reclaim(pair.Key, item, "learnable now"));
+
+                    continue;
+                }
+
+                if (!CanEquip(item, mirClass, gender)) continue;
+                if (!MeetsRequirement(item.Info, level, stats)) continue;
+
+                if (!BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass)) continue;
+
+                found.Add(new Reclaim(pair.Key, item, "beats what we are wearing"));
+            }
+
+            return found;
         }
 
         /// <summary>How many of this exact item are already banked - for "one of each" rules.</summary>
@@ -339,6 +410,78 @@ namespace MirBot
                 .Distinct();
 
         /// <summary>Equipment slots this page will actually repair.</summary>
+        /// <summary>
+        /// Trim a repair request to what the purse will actually cover, and say what it costs.
+        ///
+        /// The server prices the WHOLE request and refuses all of it if the total exceeds our gold
+        /// (PlayerObject.NPCRepair): it sums RepairCost over every link and returns without
+        /// repairing anything. So asking to repair five items with the money for one does not get
+        /// one repaired - it gets none, silently. A level 15 wizard with two broken items, three
+        /// worn ones and 22 gold sat in exactly that state, unable to fix the weapon that was the
+        /// reason it could not earn.
+        ///
+        /// The cost is computable here rather than guessed: ClientUserItem.RepairCost is the same
+        /// arithmetic the server runs, over fields the bot already holds.
+        ///
+        /// Priority is BROKEN FIRST, then cheapest. That is lexicographic, not "as many items as
+        /// possible" - one expensive broken item will displace several cheap worn ones, and that is
+        /// deliberate. A broken item contributes no stats whatsoever, while a worn one still works;
+        /// restoring the zero is worth more than tidying several near-misses.
+        /// </summary>
+        public List<int> AffordableRepairSlots(IEnumerable<int> slots, long gold, bool special,
+            out long spend, out int skipped)
+        {
+            spend = 0;
+            skipped = 0;
+
+            List<(int Slot, long Cost, bool Broken)> priced =
+                new List<(int, long, bool)>();
+
+            foreach (int slot in slots ?? Enumerable.Empty<int>())
+            {
+                // A slot whose item or definition is missing would throw inside RepairCost, which
+                // dereferences Info and AddedStats without checking.
+                if (!_equipment.TryGetValue(slot, out ClientUserItem item)) continue;
+                if (item?.Info == null || item.AddedStats == null) continue;
+
+                long cost = item.RepairCost(special);
+                if (cost <= 0) continue;
+
+                priced.Add((slot, cost, IsBroken(item)));
+            }
+
+            // Broken before worn; cheapest first inside each group.
+            priced.Sort((a, b) => a.Broken != b.Broken
+                ? (a.Broken ? -1 : 1)
+                : a.Cost.CompareTo(b.Cost));
+
+            List<int> chosen = new List<int>();
+            long running = 0;      // long: a batch of good gear can exceed an int comfortably
+
+            foreach ((int slot, long cost, bool _) in priced)
+            {
+                if (running + cost > gold) { skipped++; continue; }
+
+                running += cost;
+                chosen.Add(slot);
+            }
+
+            spend = running;
+            chosen.Sort();
+            return chosen;
+        }
+
+        /// <summary>What one repair would cost, for reporting. 0 when the slot is not repairable.</summary>
+        public long RepairCostOf(int slot, bool special) =>
+            _equipment.TryGetValue(slot, out ClientUserItem item) &&
+            item?.Info != null && item.AddedStats != null
+                ? item.RepairCost(special)
+                : 0;
+
+        /// <summary>The worn name in a slot, for diagnostics.</summary>
+        public string WornName(int slot) =>
+            _equipment.TryGetValue(slot, out ClientUserItem item) ? item?.Info?.ItemName ?? "?" : "?";
+
         public List<int> DamagedEquipmentSlots(int atOrBelowDisplayed, IEnumerable<ItemType> accepted)
         {
             List<ItemType> list = accepted?.ToList();
@@ -410,6 +553,26 @@ namespace MirBot
         {
             foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
                 if (pair.Key >= 0 && IsHealthPotion(pair.Value) && pair.Value.Count > 0)
+                    return pair.Key;
+
+            return -1;
+        }
+
+        /// <summary>
+        /// Same test on the other pool. A mana potion restores mana and not health - the ordering
+        /// matters, because some consumables restore both and those are health potions as far as
+        /// the bot is concerned.
+        /// </summary>
+        public static bool IsManaPotion(ClientUserItem item) =>
+            item?.Info != null &&
+            item.Info.ItemType == ItemType.Consumable &&
+            item.Info.Stats[Stat.Health] <= 0 &&
+            item.Info.Stats[Stat.Mana] > 0;
+
+        public int FindManaPotionSlot()
+        {
+            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
+                if (pair.Key >= 0 && IsManaPotion(pair.Value) && pair.Value.Count > 0)
                     return pair.Key;
 
             return -1;
@@ -517,7 +680,14 @@ namespace MirBot
 
             // Books are never cargo: a book is a skill we want now, one to bank until we are high
             // enough, or a sale. That judgement is made in the bag, so always pick one up.
-            if (info.ItemType == ItemType.Book) return !heavy;
+            //
+            // The code used to say !heavy, which contradicted the comment directly above it and
+            // meant the bot stopped taking books at seventy percent weight - on Deserted Mine,
+            // where skill books are the whole reason to be there. A book is light and is either a
+            // skill, a banked skill, or the best-paying sale a monster drops; none of those stop
+            // being true because the bag is filling. Capacity is still respected: the `full` test
+            // above has already refused everything at a hundred percent.
+            if (info.ItemType == ItemType.Book) return true;
 
             if (SlotFor(info.ItemType) != null)
             {

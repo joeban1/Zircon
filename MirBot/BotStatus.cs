@@ -67,6 +67,7 @@ namespace MirBot
         string Gold,
 
         int MapIndex,
+        string MapName,
         int X,
         int Y,
         bool InSafeZone,
@@ -85,6 +86,15 @@ namespace MirBot
         int DroppedPackets,
         int KnownMagics,
 
+        // The overnight counters. Each one is a behaviour that used to be invisible until
+        // somebody read a log file: casts landing, fights given up on, monsters walked past,
+        // map cells learned the hard way.
+        int Casts,
+        int FightsAbandoned,
+        int DangerAvoided,
+        int LearnedBlockedCells,
+        string BankStatus,
+
         IReadOnlyList<EquipmentStatus> Equipment,
         IReadOnlyList<ItemStatus> Inventory,
         IReadOnlyList<HistoryStatus> History)
@@ -95,10 +105,11 @@ namespace MirBot
             "", "", 0, false,
             0, 0, 0, 0, 0, 0,
             "0", "0", null, false, "0",
-            0, 0, 0, false,
+            0, "", 0, 0, false,
             0, 0, 0,
             "", "",
             0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, "",
             Array.Empty<EquipmentStatus>(),
             Array.Empty<ItemStatus>(),
             Array.Empty<HistoryStatus>());

@@ -5,7 +5,7 @@ using System.Linq;
 
 namespace MirBot
 {
-    public enum JourneyPhase { Idle, Walking, Crossing, Arrived, Failed }
+    public enum JourneyPhase { Idle, Walking, Crossing, Talking, Arrived, Failed }
 
     /// <summary>
     /// Walking to another map, one leg at a time.
@@ -35,12 +35,26 @@ namespace MirBot
         private int _crossAttempts;
         private int _legStartMap = -1;
 
+        // A teleport leg is a conversation rather than a step, so it needs its own little state:
+        // the buttons still to press, and a deadline, because an NPC that never answers would
+        // otherwise hold the journey open forever.
+        private readonly Queue<int> _buttonPath = new Queue<int>();
+        private DateTime _talkDeadline = DateTime.MinValue;
+        private bool _called;
+
+        /// <summary>How close we have to be to talk, and how much gold to keep back. Set by the
+        /// owner from config; the journey itself has no opinion about either.</summary>
+        public int TalkRange = 5;
+        public long Gold;
+        public long GoldFloor;
+
         public JourneyPhase Phase { get; private set; } = JourneyPhase.Idle;
         public string Status { get; private set; } = "";
         public int DestinationMapIndex { get; private set; } = -1;
         public string DestinationName { get; private set; } = "";
 
-        public bool Active => Phase == JourneyPhase.Walking || Phase == JourneyPhase.Crossing;
+        public bool Active => Phase == JourneyPhase.Walking || Phase == JourneyPhase.Crossing ||
+                              Phase == JourneyPhase.Talking;
 
         public Journey(WorldGraph graph)
         {
@@ -65,7 +79,10 @@ namespace MirBot
                 return true;
             }
 
-            List<MapExit> route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class, world.Level);
+            Gold = world.Gold;
+
+            List<MapExit> route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class,
+                world.Level, Gold, GoldFloor);
 
             if (route == null || route.Count == 0)
             {
@@ -104,6 +121,9 @@ namespace MirBot
             _lastProgress = DateTime.MinValue;
             _crossAttempts = 0;
             _legStartMap = -1;
+            _buttonPath.Clear();
+            _talkDeadline = DateTime.MinValue;
+            _called = false;
             Phase = JourneyPhase.Idle;
             Status = "";
             DestinationMapIndex = -1;
@@ -125,9 +145,16 @@ namespace MirBot
             _lastProgress = DateTime.UtcNow;
             _crossAttempts = 0;
             _legStartMap = world.MapIndex;
+            _buttonPath.Clear();
+            _talkDeadline = DateTime.MinValue;
+            _called = false;
 
             Phase = JourneyPhase.Walking;
-            Status = $"leg {_leg + 1}/{_route.Count}: {world.MapName} to {exit.ToMapName}";
+            Status = $"leg {_leg + 1}/{_route.Count}: {world.MapName} to {exit.ToMapName}" +
+                     (exit.IsTeleport
+                         ? $" via {exit.Teleport.NPC?.NPCName}" +
+                           (exit.Cost > 0 ? $" for {exit.Cost:N0} gold" : " (free)")
+                         : "");
         }
 
         private static Point Nearest(IReadOnlyList<Point> cells, Point from)
@@ -202,6 +229,13 @@ namespace MirBot
                 return null;
             }
 
+            // A teleport leg is talked through rather than walked onto. Anywhere within talking
+            // range is close enough - an NPC's reported tile is not always the first point of its
+            // region, the same mismatch that once left the town trip standing beside a vendor
+            // unable to recognise him.
+            if (_route[_leg].IsTeleport && distance <= Math.Max(1, TalkRange))
+                return Teleport(world);
+
             // Standing on the trigger and still here: the server refused, or this cell is not
             // really the movement. Try another cell of the same exit before giving up on it.
             if (distance == 0)
@@ -224,6 +258,103 @@ namespace MirBot
 
             Phase = JourneyPhase.Walking;
             return Walk(world);
+        }
+
+        /// <summary>
+        /// Pay the NPC and be moved.
+        ///
+        /// The dialogue is not explored at runtime: TeleportDirectory read the whole button path
+        /// out of System.db when the host started, along with what it costs, so this is only the
+        /// playing back of a route already known to end in a Teleport action. Gold is re-checked
+        /// here as well as during planning, because the fare was affordable when the route was
+        /// chosen and a repair bill since then may have changed that.
+        /// </summary>
+        private Decision Teleport(WorldModel world)
+        {
+            MapExit exit = _route[_leg];
+            TeleportRoute route = exit.Teleport;
+
+            if (world.Gold - route.Cost < GoldFloor)
+            {
+                Abort($"{route.NPC?.NPCName} wants {route.Cost:N0} gold and we only have " +
+                      $"{world.Gold:N0}, keeping {GoldFloor:N0} back");
+                return null;
+            }
+
+            Phase = JourneyPhase.Talking;
+
+            if (_talkDeadline == DateTime.MinValue)
+                _talkDeadline = DateTime.UtcNow.AddSeconds(25);
+
+            if (DateTime.UtcNow > _talkDeadline)
+            {
+                Abort($"{route.NPC?.NPCName} did not teleport us");
+                return new Decision { Action = BotAction.NPCClose, Reason = "teleport timed out" };
+            }
+
+            if (!_called)
+            {
+                WorldObject npc = NearestNPC(world, route.NPCPoint);
+
+                if (npc == null)
+                {
+                    // In range of where the database says it stands, but nothing is there. Walking
+                    // closer is the only move left, and the deadline above bounds it.
+                    return Walk(world);
+                }
+
+                _called = true;
+                foreach (int button in route.ButtonPath) _buttonPath.Enqueue(button);
+
+                return new Decision
+                {
+                    Action = BotAction.NPCCall,
+                    Reason = route.NPC?.NPCName ?? "teleporter",
+                    Subject = $"travelling to {DestinationName}",
+                    TargetID = npc.ObjectID
+                };
+            }
+
+            if (_buttonPath.Count > 0)
+            {
+                int button = _buttonPath.Dequeue();
+
+                return new Decision
+                {
+                    Action = BotAction.NPCButton,
+                    Reason = $"button {button}",
+                    Subject = $"travelling to {DestinationName}",
+                    ButtonID = button
+                };
+            }
+
+            // Buttons all sent. The map change is what ends this leg, and Next sees it at the top.
+            return null;
+        }
+
+        /// <summary>
+        /// S.ObjectNPC carries no name, so an NPC is identified by where it is standing - matched
+        /// by proximity rather than equality, for the reason noted above.
+        /// </summary>
+        private WorldObject NearestNPC(WorldModel world, Point spot)
+        {
+            if (spot == Point.Empty) return null;
+
+            WorldObject best = null;
+            int bestDistance = int.MaxValue;
+
+            foreach (WorldObject ob in world.Objects)
+            {
+                if (ob.Kind != ObjectKind.NPC) continue;
+
+                int distance = WorldModel.Distance(ob.Location, spot);
+                if (distance > Math.Max(1, TalkRange) || distance >= bestDistance) continue;
+
+                best = ob;
+                bestDistance = distance;
+            }
+
+            return best;
         }
 
         private Decision Walk(WorldModel world) => new Decision

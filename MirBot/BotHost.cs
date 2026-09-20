@@ -28,10 +28,13 @@ namespace MirBot
         public BotLog Log { get; }
         public MagicBooks Books { get; } = new MagicBooks();
         public VendorDirectory Vendors { get; } = new VendorDirectory();
+        public TeleportDirectory Teleports { get; } = new TeleportDirectory();
+        public MapProfile Profiles { get; } = new MapProfile();
         public MonsterIndex Monsters { get; } = new MonsterIndex();
         public MapLibrary Maps { get; private set; }
         public HuntingMemory Hunting { get; private set; }
         public MonsterMemory Danger { get; private set; }
+        public NavCorrections Nav { get; private set; }
         public WorldGraph World { get; } = new WorldGraph();
 
         /// <summary>
@@ -60,6 +63,9 @@ namespace MirBot
 
         public int ConnectSpacingSeconds { get; set; } = 10;
         public int StartStaggerSeconds { get; set; } = 15;
+
+        /// <summary>Holds the staggered-autostart timers alive until they fire - see Run.</summary>
+        private readonly List<Timer> _startTimers = new List<Timer>();
         public int MaxBackoffSeconds { get; set; } = 420;   // > the server's 5-minute IP ban
         public int StatusPort { get; set; } = 8642;
 
@@ -182,6 +188,65 @@ namespace MirBot
                       (string.IsNullOrWhiteSpace(mapFilter) ? "." : $" matching '{mapFilter}'."));
         }
 
+        /// <summary>
+        /// Print the teleport network, optionally for one map.
+        ///
+        /// Same reasoning as DumpVendors, and the same lesson: three rounds of reasoning about the
+        /// vendor SELECTION code found no bug, and dumping the vendor DATA found two in two
+        /// attempts. Whether paying an NPC is even an option is a question about the data.
+        /// </summary>
+        public void DumpTeleports(string mapFilter)
+        {
+            int shown = 0;
+
+            foreach (TeleportRoute route in Teleports.Routes
+                .OrderBy(x => x.FromMapName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Cost))
+            {
+                if (!string.IsNullOrWhiteSpace(mapFilter) &&
+                    route.FromMapName.IndexOf(mapFilter, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    route.ToMapName.IndexOf(mapFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                Log.Write("  " + route);
+                shown++;
+            }
+
+            Log.Write($"{shown} teleport route(s)" +
+                      (string.IsNullOrWhiteSpace(mapFilter) ? "." : $" matching '{mapFilter}'.") +
+                      " " + Teleports.Describe());
+        }
+
+        /// <summary>
+        /// Print what the database says lives on each map.
+        ///
+        /// The reason this is a diagnostic before it is a feature: this server leaves a lot of
+        /// metadata at its defaults, and the item work already found RequiredLevel unreliable
+        /// enough that items had to be sorted by primary stat instead. Monster levels may be the
+        /// same. Printing level and experience side by side makes that checkable - if the two do
+        /// not move together, the levels are decorative and the filter has to use experience.
+        /// </summary>
+        public void DumpMapProfiles(string filter)
+        {
+            int shown = 0;
+
+            foreach (MapProfileEntry entry in Profiles.Entries
+                .OrderBy(x => x.MedianLevel)
+                .ThenBy(x => x.MapName, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(filter) &&
+                    entry.MapName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                Log.Write("  " + entry);
+                shown++;
+            }
+
+            Log.Write($"{shown} map(s)" +
+                      (string.IsNullOrWhiteSpace(filter) ? "." : $" matching '{filter}'.") +
+                      " " + Profiles.Describe());
+        }
+
         /// <summary>How long to let bots log out cleanly on shutdown before forcing it.
         /// A bot under sustained attack can never leave combat, so this has a ceiling.</summary>
         public int LogoutGraceSeconds { get; set; } = 40;
@@ -263,6 +328,8 @@ namespace MirBot
 
             Books.Build();
             Vendors.Build(Books);
+            Teleports.Build();
+            Profiles.Build();
             Vendors.SetTownMaps(first.TownMaps.Split(','));
             Monsters.Build();
             BotConnection.Monsters = Monsters;
@@ -277,16 +344,24 @@ namespace MirBot
 
             Hunting = new HuntingMemory(Path.Combine(memory, "hunting.json"), first.LevelBandSize);
             Danger = new MonsterMemory(Path.Combine(memory, "monsters.json"));
+            Nav = new NavCorrections(Path.Combine(memory, "navdata.json"));
 
             // Needs the grids: a map region is a bitmap whose width is the map's own.
             World.Build(Maps);
 
+
+            // Teleport NPCs become extra edges in the same graph, so one search weighs a paid hop
+            // against the walk rather than the two being planned separately.
+            if (first.UseTeleportNPCs) World.AddTeleports(Teleports);
+            Log.Write("Teleports: " + Teleports.Describe() +
+                      (first.UseTeleportNPCs ? "." : " - disabled by config."));
+            Log.Write("Maps: " + Profiles.Describe() + ".");
             ClientHash = first.ResolveClientHash();
 
             Log.Write($"Database {GameDatabase.Version}: {Books.Count} skills, " +
                       $"{Monsters.Count} monsters, {Vendors.Count} trading pages.");
 
-            Log.Write($"Memory: {Hunting.Describe()}, {Danger.Describe()}.");
+            Log.Write($"Memory: {Hunting.Describe()}, {Danger.Describe()}, {Nav.Describe()}.");
             Log.Write(World.Describe() + ".");
             Log.Write("Vendors: " + Vendors.DescribeTownMaps() + ".");
 
@@ -360,8 +435,15 @@ namespace MirBot
                 else
                 {
                     BotInstance captured = instance;
-                    new Timer(_ => captured.TryEnqueue(BotCommandKind.Start), null,
-                        TimeSpan.FromSeconds(delay), Timeout.InfiniteTimeSpan);
+
+                    // The timer is KEPT. A System.Threading.Timer that nothing references is
+                    // eligible for collection before it ever fires, so this used to be a race
+                    // against the garbage collector: with two bots the delays were short enough
+                    // that it always won, and at four bots Mirbot3's thirty-second timer was
+                    // collected and it simply never started - no error, no connect attempt, just a
+                    // bot sitting Offline for ever while the others came up around it.
+                    _startTimers.Add(new Timer(_ => captured.TryEnqueue(BotCommandKind.Start), null,
+                        TimeSpan.FromSeconds(delay), Timeout.InfiniteTimeSpan));
                 }
             }
 
@@ -375,12 +457,14 @@ namespace MirBot
                 Log.FlushIfDue();
                 Hunting.FlushIfDue();
                 Danger.FlushIfDue();
+                Nav.FlushIfDue();
                 Thread.Sleep(500);
             }
 
             // Anything learned since the last timed write would otherwise be lost.
             Hunting.Flush();
             Danger.Flush();
+            Nav.Flush();
 
             // Ask every bot to log out properly FIRST. Going straight to RequestShutdown tears the
             // socket down without a C.Logout, so characters linger in the world until the server
@@ -408,6 +492,9 @@ namespace MirBot
 
             foreach (BotInstance instance in _instances) instance.RequestShutdown();
             foreach (BotInstance instance in _instances) instance.Join(TimeSpan.FromSeconds(15));
+
+            foreach (Timer timer in _startTimers) timer.Dispose();
+            _startTimers.Clear();
 
             _status?.Dispose();
             Log.Write("Host stopped.");

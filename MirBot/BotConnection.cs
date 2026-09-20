@@ -42,6 +42,9 @@ namespace MirBot
         /// <summary>True when the failure is worth another attempt rather than terminal.</summary>
         public bool Retryable { get; private set; }
 
+        /// <summary>How long the server said to wait before trying again, when it said so.</summary>
+        public TimeSpan RetryAfter { get; private set; }
+
         public int PingCount;
         public int UnhandledCount;
 
@@ -217,9 +220,32 @@ namespace MirBot
 
         public void Process(G.PingResponse p) { }
 
+        /// <summary>
+        /// The server hung up on us.
+        ///
+        /// Most reasons are transient and the right answer is to come back: a restart, a timeout,
+        /// a crash, another login of the same account holding the slot for a few seconds. Those
+        /// are the ones that end an overnight run at two in the morning, and until now every one
+        /// of them left the instance Offline with nothing to bring it back.
+        ///
+        /// Banned and WrongVersion are not transient. Reconnecting into a ban is how a five-minute
+        /// packet ban becomes a permanent one, and a version mismatch will not fix itself.
+        /// </summary>
         public void Process(G.Disconnect p)
         {
-            RequestStop($"Server disconnected us: {p.Reason}");
+            switch (p.Reason)
+            {
+                case DisconnectReason.Banned:
+                case DisconnectReason.WrongVersion:
+                    break;
+
+                default:
+                    Retryable = _config.ReconnectOnDisconnect;
+                    break;
+            }
+
+            RequestStop($"Server disconnected us: {p.Reason}" +
+                        (Retryable ? " - will reconnect" : " - not retrying"));
         }
 
         #endregion
@@ -342,7 +368,28 @@ namespace MirBot
         {
             if (p.Result != StartGameResult.Success)
             {
-                RequestStop($"StartGame failed: {p.Result}" +
+                // Delayed is the server's relog cooldown (SEnvir.cs:4025, Config.RelogDelay) and
+                // carries how long is left in Duration. It is transient by definition and is hit on
+                // every restart that follows a recent logout - which is every restart during a
+                // development session.
+                //
+                // This has to be said out loud because the previous behaviour recovered from it by
+                // accident: a non-retryable failure left the state Offline with _wantRunning set,
+                // and Offline reconnects on the very next tick, so the bot hammered its way back in
+                // within a second or two. Closing that loop - which had to be closed, it is how a
+                // wrong password became an IP ban - turned this into a bot that sat Faulted all
+                // night. UnableToSpawn is the same kind of thing: the spawn point was momentarily
+                // occupied, and it will not be a moment later.
+                Retryable = p.Result == StartGameResult.Delayed ||
+                            p.Result == StartGameResult.UnableToSpawn;
+
+                if (Retryable && p.Duration > TimeSpan.Zero) RetryAfter = p.Duration;
+
+                string wait = p.Duration > TimeSpan.Zero
+                    ? $", {p.Duration.TotalSeconds:N0}s to wait"
+                    : "";
+
+                RequestStop($"StartGame failed: {p.Result}{wait}" +
                             (string.IsNullOrEmpty(p.Message) ? "" : $" ({p.Message})"));
                 return;
             }

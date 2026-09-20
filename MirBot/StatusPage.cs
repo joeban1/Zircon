@@ -174,13 +174,17 @@ function render(h) {
              ${bar("xp", b.experiencePercent ?? 0, 100)}</div>
         <div><div class="k">Gold</div><div class="v">${Number(b.gold).toLocaleString()}</div></div>
         <div><div class="k">Location</div>
-             <div class="v">map ${b.mapIndex} · ${b.x},${b.y}${b.inSafeZone ? " · safe" : ""}</div></div>
+             <div class="v">${esc(b.mapName) || ("map " + b.mapIndex)} · ${b.x},${b.y}${b.inSafeZone ? " · safe" : ""}</div>
+             <div class="detail">map ${b.mapIndex}</div></div>
         <div><div class="k">Bag</div><div class="v">${b.bagWeight}/${b.maxBagWeight} (${b.bagPercent}%)</div></div>
         <div><div class="k">Town trip</div><div class="v">${esc(b.tripPhase) || "—"}</div>
              <div class="detail">${esc(b.tripStatus)}</div></div>
         <div><div class="k">Counters</div>
              <div class="v">${b.decisions} dec · ${b.resyncs} resync · ${b.detours} detour
-             ${b.droppedPackets ? ` · <span class="broken">${b.droppedPackets} dropped</span>` : ""}</div></div>
+             ${b.droppedPackets ? ` · <span class="broken">${b.droppedPackets} dropped</span>` : ""}</div>
+             <div class="detail">${b.casts} cast · ${b.fightsAbandoned} given up ·
+             ${b.dangerAvoided} avoided · ${b.learnedBlockedCells} cells learned</div></div>
+        <div><div class="k">Bank</div><div class="v">${esc(b.bankStatus) || "—"}</div></div>
       </div>
 
       <div class="cols">

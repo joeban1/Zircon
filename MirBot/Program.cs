@@ -18,6 +18,8 @@ namespace MirBot
             bool checkMaps = false;
             string checkTravel = null;
             string checkVendors = null;
+            string checkTeleports = null;
+            string checkProfiles = null;
             int seconds = 0;   // 0 = run until Ctrl+C; bounded runs are for testing
 
             for (int i = 0; i < args.Length; i++)
@@ -30,6 +32,10 @@ namespace MirBot
                 { checkTravel = args[i + 1]; console = true; }
                 if (args[i] == "--vendors")
                 { checkVendors = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
+                if (args[i] == "--teleports")
+                { checkTeleports = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
+                if (args[i] == "--maps")
+                { checkProfiles = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
                 if (args[i] == "--seconds" && i + 1 < args.Length &&
                     int.TryParse(args[i + 1], out int parsed)) seconds = parsed;
             }
@@ -57,6 +63,10 @@ namespace MirBot
                 if (checkTravel != null) return host.CheckTravel(checkTravel) ? 0 : 4;
 
                 if (checkVendors != null) { host.DumpVendors(checkVendors); return 0; }
+
+                if (checkTeleports != null) { host.DumpTeleports(checkTeleports); return 0; }
+
+                if (checkProfiles != null) { host.DumpMapProfiles(checkProfiles); return 0; }
 
                 Console.CancelKeyPress += (s, e) =>
                 {

@@ -52,3 +52,124 @@ LootRichGold=200000
 LootGoldPerWeightPoor=5
 LootGoldPerWeightRich=80
 LootHeavyMultiplier=4
+
+# --- Combat watchdog --------------------------------------------------------------
+# Swings allowed against one monster without its health ever going down before the bot
+# concludes the fight is going nowhere and finds something else to hit. Mir lets a
+# player and a monster stand on the SAME tile, and an attack is aimed at the cell in
+# front - so a monster underneath the character can never be hit from where it stands.
+# The bot now steps off first; this is the backstop for everything else of that shape,
+# including a long run of genuine misses.
+AttackPatience=8
+AttackGiveUpSeconds=45
+
+# --- Per-monster danger -----------------------------------------------------------
+# Refuse to START a fight with a monster the memory says could kill us in this many
+# hits or fewer, measured against CURRENT health rather than maximum - so something
+# survivable at full health becomes something to walk past at forty percent. Anything
+# already attacking us is still fought back; this only governs picking a fight.
+# 0 disables it. The evidence bar stops one unlucky crit blacklisting a whole species.
+DangerHitsToDeath=3
+DangerMinimumHits=3
+
+# --- Casting ----------------------------------------------------------------------
+# Cast learned attack spells instead of only swinging. A wizard that buys and reads
+# Fire Ball and then punches things has thrown away the reason it is a wizard.
+# The mana floor is never available to attack spells: spending to zero leaves a caster
+# with no escape and nothing to do but melee, which it is very bad at.
+# CastRange is capped by the server's own Globals.MagicRange of 10.
+CastSpells=true
+CastRange=9
+
+# Never cast below this share of the mana pool. 0 on purpose: nothing the bot casts is
+# defensive - its escape is a town scroll, which is an item - so a reserve protects
+# nothing, and mana does NOT come back while hunting, so any floor above zero simply
+# stops a wizard casting for the rest of the night once it is reached.
+SpellManaFloorPercent=0
+
+# Drink a mana potion at or below this share of the pool, if the character has spells
+# to spend it on. This is what makes casting more than one burst per login: mana
+# potions were already bought, carried and reserved, and nothing ever drank one.
+DrinkManaAtPercent=40
+
+# --- Teleport NPCs ----------------------------------------------------------------
+# Use NPCs that move the character to another map, as extra edges in the travel graph.
+# See what exists with:  MirBot.exe --teleports
+# On this server there are only three, all free, and none of them a travel network -
+# but the Bichon Town one is the only way to reach Assassin's Hideout at all.
+# The gold floor is what must SURVIVE the fare, not what is left after it: arriving
+# somewhere far from home unable to buy potions or a way back is worse than the walk.
+UseTeleportNPCs=true
+TeleportGoldFloor=20000
+
+# --- Overnight resilience ---------------------------------------------------------
+# Revive automatically this many seconds after dying; 0 leaves it to the status page
+# button. Whatever killed us is still standing on the corpse, hence the pause.
+ReviveAfterSeconds=25
+# Reconnect after the SERVER drops us - a restart, a timeout, a crash. Bans and version
+# mismatches are never retried whatever this says.
+ReconnectOnDisconnect=true
+
+# --- Learned walkability ----------------------------------------------------------
+# Remember cells the server refused to let us walk into, and route around them next
+# time. Worth far less to us than to a bot that cannot read the map files - ours parses
+# the same grid the server does - but doors and gates are decided at the time rather
+# than by the tile flag, and those are what this catches. Walking onto a cell erases
+# whatever was recorded against it, so a gate that opens un-learns itself.
+LearnBlockedCells=true
+BlockedCellEvidence=3
+
+# --- Restocking -------------------------------------------------------------------
+# Go to town when healing potions fall this far below their target, as a share of it.
+# Bag weight used to be the only thing that sent the bot shopping, which quietly
+# assumes the bag fills faster than the potions empty. For a caster it does not: a
+# wizard drinks through a stack while looting almost nothing, and ends up at 20%
+# health with a half-full bag, no potions and no reason to go anywhere. With
+# auto-revive on, that is a death loop that lasts all night.
+RestockAtPotionPercent=25
+
+# --- Choosing where to hunt -------------------------------------------------------
+# Pick at random from this many of the best-scoring maps rather than always the top
+# one. From the Mir 2 agents: it stops one early sample deciding where the bot lives
+# for the rest of its career. A freak 171,656 exp/hour window on Bichon Town once
+# outranked everything for five hours and pulled a warrior out of the only other map
+# it ever tried.
+HuntingChoices=3
+
+# Keep exploring until this many maps have a usable measurement at the current class
+# and level band, then start exploiting. The Mir 2 agents instead roll a flat 1-in-20,
+# which suits hundreds of agents sharing one memory; we reconsider only when a town
+# trip ends - four decision points in five hours - so a flat roll that rare means one
+# exploration a day. Coverage self-tunes.
+ExploreUntilMapsKnown=4
+
+# Once coverage is met, still explore this often, so a better map found later is not
+# locked out forever.
+ExploreChancePercent=15
+
+# Do not explore a map whose TYPICAL (median) monster is more than this far above us.
+# Checked against System.db, because the learned danger model only knows maps that have
+# already hurt us and is silent about anywhere new - which is exactly when it is asked.
+# See:  MirBot.exe --maps
+ExploreLevelsAbove=3
+
+# Ranking uses the MEAN rate discounted by deaths, not the best rate ever recorded.
+# A part-finished measurement window is banked when the bot leaves a map or levels up,
+# provided it ran at least this long, instead of being thrown away. A warrior once hunted
+# Deserted Mine for 13m21s and lost all of it for being 99 seconds short of the window.
+MinimumSampleMinutes=4
+
+# --- Travelling and gold ----------------------------------------------------------
+# Gold required per map transition before setting off. A bot that lands three maps from
+# home with an empty purse cannot buy potions, cannot buy a way back, and dies there.
+TravelGoldPerHop=3000
+
+# Below this much gold, hunt only on the maps named in TownMaps. Poverty is the one state
+# where wandering is actively harmful: the bot cannot buy its way out of any problem it
+# meets. The restriction is logged when it applies, so it can never become a silent
+# "too poor to leave, too poor at home to ever leave" trap.
+#
+# Deliberately well above "can afford one potion". The bar is being able to absorb the
+# ordinary costs of being away from home - a repair bill, a full restock and a way back -
+# not merely surviving the next ten minutes. A single broken ring cost 611 gold.
+PoorGold=20000

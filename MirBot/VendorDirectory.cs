@@ -91,6 +91,75 @@ namespace MirBot
         public int Count => _entries.Count;
         public IEnumerable<VendorEntry> Entries => _entries;
 
+        private readonly HashSet<int> _townMaps = new HashSet<int>();
+
+        public IReadOnlyCollection<int> TownMaps => _townMaps;
+
+        /// <summary>
+        /// Restrict every shopping decision to these maps.
+        ///
+        /// This is a whitelist rather than a set of rules about distance or reachability, because
+        /// the rules kept being defeated one at a time. The bot sent both characters to Lavar on
+        /// Infernal Island - a long, expensive, high level trip with no route from Bichon - purely
+        /// because he is the only NPC on the server who sells scrolls and potions from one page,
+        /// and a "one stop is better than two" shortcut ran before any proximity test.
+        ///
+        /// Shopping happens in towns. Naming them is honest about what we actually want, and it
+        /// cannot be short-circuited by the next clever optimisation.
+        /// </summary>
+        public void SetTownMaps(IEnumerable<string> mapNames)
+        {
+            _townMaps.Clear();
+
+            if (mapNames == null) return;
+
+            foreach (string name in mapNames)
+            {
+                string wanted = name?.Trim();
+                if (string.IsNullOrEmpty(wanted)) continue;
+
+                foreach (MapInfo info in Globals.MapInfoList?.Binding ?? Enumerable.Empty<MapInfo>())
+                    if (string.Equals(info.Description, wanted, StringComparison.OrdinalIgnoreCase))
+                        _townMaps.Add(info.Index);
+            }
+        }
+
+        /// <summary>
+        /// The only entries any shopping decision may consider. Everything that picks a vendor goes
+        /// through here, so a new selection rule cannot accidentally reach outside the towns.
+        /// </summary>
+        private IEnumerable<VendorEntry> Shoppable =>
+            _townMaps.Count == 0 ? _entries : _entries.Where(x => _townMaps.Contains(x.MapIndex));
+
+        /// <summary>
+        /// The pages a trip planned for ONE map may consider.
+        ///
+        /// Every selector below used to merely PREFER the current map - a +100 score, or a tie
+        /// break - and fall back to another shoppable town when the current one had no match. That
+        /// was right while a trip was planned where it would be walked. It is wrong now that a trip
+        /// can be planned for the map it is standing on and then executed somewhere else, because a
+        /// single off-map stop is enough to strand the whole itinerary: the bot walks to where the
+        /// vendor would be, finds nobody, and aborts with "arrived but could not see the vendor".
+        ///
+        /// onlyMap of -1 keeps the old preference behaviour for callers that genuinely want it.
+        /// </summary>
+        private IEnumerable<VendorEntry> ShoppableOn(int onlyMap) =>
+            onlyMap < 0 ? Shoppable : Shoppable.Where(x => x.MapIndex == onlyMap);
+
+        public string DescribeTownMaps()
+        {
+            if (_townMaps.Count == 0) return "shopping anywhere (TownMaps is empty)";
+
+            List<string> names = new List<string>();
+
+            foreach (int index in _townMaps)
+                names.Add(Globals.MapInfoList?.Binding?.FirstOrDefault(x => x.Index == index)?
+                              .Description ?? index.ToString());
+
+            return "shopping only in " + string.Join(", ", names) +
+                   $" ({Shoppable.Count()} of {_entries.Count} pages)";
+        }
+
         /// <summary>Walk every NPC's dialogue tree and record what each reachable page trades.</summary>
         public void Build(MagicBooks books)
         {
@@ -198,7 +267,8 @@ namespace MirBot
         /// The best page for unloading this bag: whichever buys the most of what we are carrying.
         /// Same map wins ties, since the bot can only walk within a map.
         /// </summary>
-        public VendorEntry BestBuyerFor(IEnumerable<ItemType> carrying, int currentMapIndex)
+        public VendorEntry BestBuyerFor(IEnumerable<ItemType> carrying, int currentMapIndex,
+            int onlyMap = -1)
         {
             List<ItemType> wanted = carrying?.ToList() ?? new List<ItemType>();
             if (wanted.Count == 0) return null;
@@ -206,7 +276,7 @@ namespace MirBot
             VendorEntry best = null;
             int bestScore = 0;
 
-            foreach (VendorEntry entry in _entries)
+            foreach (VendorEntry entry in ShoppableOn(onlyMap))
             {
                 if (entry.Buys.Count == 0) continue;
 
@@ -238,6 +308,21 @@ namespace MirBot
         ///
         /// One stop is still preferred when a single shop genuinely sells both.
         /// </summary>
+        /// <summary>
+        /// Everything already on the itinerary, including what this call has just chosen. Nearest
+        /// prefers an NPC that is already a stop, so telling it about the potion seller is what
+        /// lets one shop cover both needs without a second walk.
+        /// </summary>
+        private static IEnumerable<VendorEntry> Combine(IEnumerable<VendorEntry> already,
+            IEnumerable<VendorEntry> chosen)
+        {
+            if (already == null) return chosen;
+
+            List<VendorEntry> all = new List<VendorEntry>(already);
+            all.AddRange(chosen);
+            return all;
+        }
+
         public List<VendorEntry> BestRestockersFor(bool needScrolls, bool needPotions,
             int currentMapIndex, IEnumerable<VendorEntry> already = null, Point from = default,
             bool sameMapOnly = false)
@@ -267,18 +352,27 @@ namespace MirBot
                 }
             }
 
-            if (needScrolls)
-            {
-                VendorEntry scrolls = Nearest(x => x.SellsTownScroll, currentMapIndex, already,
-                    from, sameMapOnly);
-                if (scrolls != null) chosen.Add(scrolls);
-            }
-
+            // Potions first, and the ORDER of these two blocks is the whole point.
+            //
+            // The itinerary is walked in order and the purse is spent as it goes, so whichever stop
+            // comes first gets first call on the money. A wizard with 2,503 gold went to the scroll
+            // seller, spent 1,500 of it, arrived at the potion seller with 1,003, left town with no
+            // healing potions at all, and died ninety seconds later.
+            //
+            // A scroll is an escape. A potion is what stops you needing one. When there is not
+            // enough for both, the thing that keeps the character alive has to win.
             if (needPotions)
             {
                 VendorEntry potions = Nearest(x => x.SellsHealthPotion, currentMapIndex, already,
                     from, sameMapOnly);
-                if (potions != null && !chosen.Contains(potions)) chosen.Add(potions);
+                if (potions != null) chosen.Add(potions);
+            }
+
+            if (needScrolls)
+            {
+                VendorEntry scrolls = Nearest(x => x.SellsTownScroll, currentMapIndex,
+                    Combine(already, chosen), from, sameMapOnly);
+                if (scrolls != null && !chosen.Contains(scrolls)) chosen.Add(scrolls);
             }
 
             return chosen;
@@ -302,7 +396,7 @@ namespace MirBot
                 foreach (VendorEntry entry in already)
                     if (entry?.NPC != null) queued.Add(entry.NPC);
 
-            return _entries
+            return Shoppable
                 .Where(match)
                 .Where(x => !sameMapOnly || x.MapIndex == currentMapIndex)
                 .OrderByDescending(x => queued.Contains(x.NPC))
@@ -329,7 +423,7 @@ namespace MirBot
 
             List<ItemType> wanted = types?.ToList();
 
-            foreach (VendorEntry other in _entries)
+            foreach (VendorEntry other in Shoppable)
             {
                 if (other.NPC != entry.NPC) continue;
                 if (other.Page?.Goods == null || other.Page.Goods.Count == 0) continue;
@@ -348,7 +442,8 @@ namespace MirBot
 
         /// <summary>Whoever repairs the most of what is damaged. Mirrors BestBuyerFor.</summary>
         /// <summary>Whoever stocks the most of the skill books we want.</summary>
-        public VendorEntry BestBookSellerFor(IEnumerable<int> wantedMagicIndexes, int currentMapIndex)
+        public VendorEntry BestBookSellerFor(IEnumerable<int> wantedMagicIndexes, int currentMapIndex,
+            int onlyMap = -1)
         {
             List<int> wanted = wantedMagicIndexes?.ToList() ?? new List<int>();
             if (wanted.Count == 0) return null;
@@ -356,7 +451,7 @@ namespace MirBot
             VendorEntry best = null;
             int bestScore = 0;
 
-            foreach (VendorEntry entry in _entries)
+            foreach (VendorEntry entry in ShoppableOn(onlyMap))
             {
                 if (entry.SellsBooksFor.Count == 0) continue;
 
@@ -379,7 +474,8 @@ namespace MirBot
         /// being on this map so a shopping trip does not become a cross-map expedition.
         /// </summary>
         public VendorEntry BestGearSellerFor(IEnumerable<ItemType> wanted, int currentMapIndex,
-            IEnumerable<VendorEntry> already = null, Point from = default, int maxDistance = 0)
+            IEnumerable<VendorEntry> already = null, Point from = default, int maxDistance = 0,
+            int onlyMap = -1)
         {
             List<ItemType> types = wanted?.ToList() ?? new List<ItemType>();
             if (types.Count == 0) return null;
@@ -403,7 +499,7 @@ namespace MirBot
             (int queuedRank, int mapRank, int band, int stock) bestKey =
                 (int.MaxValue, int.MaxValue, int.MaxValue, int.MinValue);
 
-            foreach (VendorEntry entry in _entries)
+            foreach (VendorEntry entry in ShoppableOn(onlyMap))
             {
                 if (entry.Page?.Goods == null || entry.Page.Goods.Count == 0) continue;
 
@@ -452,7 +548,8 @@ namespace MirBot
             return best;
         }
 
-        public VendorEntry BestRepairerFor(IEnumerable<ItemType> damaged, int currentMapIndex)
+        public VendorEntry BestRepairerFor(IEnumerable<ItemType> damaged, int currentMapIndex,
+            int onlyMap = -1)
         {
             List<ItemType> wanted = damaged?.ToList() ?? new List<ItemType>();
             if (wanted.Count == 0) return null;
@@ -460,7 +557,7 @@ namespace MirBot
             VendorEntry best = null;
             int bestScore = 0;
 
-            foreach (VendorEntry entry in _entries)
+            foreach (VendorEntry entry in ShoppableOn(onlyMap))
             {
                 if (entry.Repairs.Count == 0) continue;
 
@@ -479,7 +576,7 @@ namespace MirBot
 
         public VendorEntry BestScrollSellerFor(int currentMapIndex)
         {
-            return _entries
+            return Shoppable
                 .Where(x => x.SellsTownScroll)
                 .OrderByDescending(x => x.MapIndex == currentMapIndex)
                 .FirstOrDefault();

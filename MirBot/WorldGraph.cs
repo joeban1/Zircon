@@ -24,6 +24,35 @@ namespace MirBot
         public bool NeedsItem;
         public bool NeedsInstance;
 
+        /// <summary>
+        /// Non-null when this is not a cell to walk onto but an NPC to talk to. The route is
+        /// otherwise identical: a way of getting from one map to another, with requirements.
+        /// </summary>
+        public TeleportRoute Teleport;
+
+        public bool IsTeleport => Teleport != null;
+        public long Cost => Teleport?.Cost ?? 0;
+
+        /// <summary>
+        /// Can this character use this exit, with this much gold in hand?
+        ///
+        /// Gold is part of the question because a paid exit we cannot pay for is not an exit, and
+        /// finding that out by walking to the NPC and being refused wastes the whole leg. The floor
+        /// is what has to SURVIVE the fare: a bot that lands somewhere far from home having spent
+        /// its last coin cannot buy potions and cannot buy a way back, which is worse than the walk
+        /// it was trying to avoid.
+        /// </summary>
+        public bool Allows(MirClass mirClass, int level, long gold, long goldFloor)
+        {
+            if (Teleport != null)
+            {
+                if (!Teleport.Allows(mirClass, level)) return false;
+                if (gold - Teleport.Cost < goldFloor) return false;
+            }
+
+            return Allows(mirClass, level);
+        }
+
         public bool Allows(MirClass mirClass, int level)
         {
             if (NeedsItem || NeedsInstance) return false;
@@ -125,6 +154,60 @@ namespace MirBot
             }
         }
 
+        /// <summary>
+        /// Add the teleport NPCs as extra edges, so one search covers both ways of crossing a map
+        /// boundary and the cheaper one wins on its merits.
+        ///
+        /// Worth saying plainly what this bought on THIS server, because the answer was not what
+        /// was expected: dumping the data found three teleport NPCs in total, all free, and none of
+        /// them a travel network. Two are Hexa Holy Stones deep inside Banya Temple that return the
+        /// character to the temple hall, and one sits in Bichon Town and leads to Assassin's
+        /// Hideout. So this does not turn cross-country travel into a taxi ride - there is no taxi
+        /// on this server. What it does do is give the bot the dungeon exits a player would use,
+        /// and the gold accounting is already right for whenever content adds a paid one.
+        /// </summary>
+        public void AddTeleports(TeleportDirectory teleports)
+        {
+            if (teleports == null) return;
+
+            foreach (TeleportRoute route in teleports.Routes)
+            {
+                if (route.NPC?.Region?.Map == null) continue;
+
+                Point spot = route.NPCPoint;
+                if (spot == Point.Empty) continue;
+
+                // The destination's own gates apply exactly as they do to a walked exit. Leaving
+                // them off looked harmless and was not: a level 18 WARRIOR was cheerfully routed
+                // into Assassin's Hideout, walked ninety tiles across Bichon to the teleporter,
+                // called it, and stood there while nothing happened - because the map is gated to
+                // Assassins and the server simply declined. A gate the planner does not know about
+                // is a journey the bot cannot be talked out of.
+                MapInfo destination = route.Destination;
+
+                MapExit exit = new MapExit
+                {
+                    FromMapIndex = route.FromMapIndex,
+                    ToMapIndex = route.ToMapIndex,
+                    ToMapName = route.ToMapName,
+                    Cells = new[] { spot },
+                    Teleport = route,
+                    MinimumLevel = destination?.MinimumLevel ?? 0,
+                    MaximumLevel = destination?.MaximumLevel ?? 0,
+                    RequiredClass = destination?.RequiredClass ?? RequiredClass.None
+                };
+
+                if (!_exits.TryGetValue(exit.FromMapIndex, out List<MapExit> list))
+                    _exits[exit.FromMapIndex] = list = new List<MapExit>();
+
+                list.Add(exit);
+                ExitCount++;
+                TeleportCount++;
+            }
+        }
+
+        public int TeleportCount { get; private set; }
+
         private static List<Point> Points(MapRegion region, MapGrid grid)
         {
             // CreatePoints caches into PointList; it needs the map width to decode a bit region.
@@ -165,7 +248,8 @@ namespace MirBot
         /// anything needing an item or an instance - are excluded here rather than discovered by
         /// walking into them.
         /// </summary>
-        public List<MapExit> Route(int fromMapIndex, int toMapIndex, MirClass mirClass, int level)
+        public List<MapExit> Route(int fromMapIndex, int toMapIndex, MirClass mirClass, int level,
+            long gold = long.MaxValue, long goldFloor = 0)
         {
             if (fromMapIndex == toMapIndex) return new List<MapExit>();
 
@@ -182,7 +266,7 @@ namespace MirBot
                 foreach (MapExit exit in ExitsFrom(map))
                 {
                     if (seen.Contains(exit.ToMapIndex)) continue;
-                    if (!exit.Allows(mirClass, level)) continue;
+                    if (!exit.Allows(mirClass, level, gold, goldFloor)) continue;
 
                     seen.Add(exit.ToMapIndex);
                     cameBy[exit.ToMapIndex] = exit;
@@ -213,8 +297,45 @@ namespace MirBot
             return route;
         }
 
+        /// <summary>
+        /// How many map transitions each reachable map is away, in one breadth-first pass.
+        ///
+        /// Reachable answers "can I get there" and that was enough while travel was free. It is not
+        /// enough to answer "can I AFFORD to get there": a journey's real cost scales with the
+        /// number of maps crossed, because every hop is another map to walk back over if it goes
+        /// wrong, and arriving somewhere distant with an empty purse is how a bot dies far from a
+        /// vendor. Routing each candidate separately would be a BFS per map; this is one.
+        /// </summary>
+        public Dictionary<int, int> HopCounts(int fromMapIndex, MirClass mirClass, int level,
+            long gold = long.MaxValue, long goldFloor = 0)
+        {
+            Dictionary<int, int> hops = new Dictionary<int, int> { [fromMapIndex] = 0 };
+            Queue<int> queue = new Queue<int>();
+
+            queue.Enqueue(fromMapIndex);
+
+            while (queue.Count > 0)
+            {
+                int map = queue.Dequeue();
+                int next = hops[map] + 1;
+
+                foreach (MapExit exit in ExitsFrom(map))
+                {
+                    if (hops.ContainsKey(exit.ToMapIndex)) continue;
+                    if (!exit.Allows(mirClass, level, gold, goldFloor)) continue;
+
+                    hops[exit.ToMapIndex] = next;
+                    queue.Enqueue(exit.ToMapIndex);
+                }
+            }
+
+            hops.Remove(fromMapIndex);
+            return hops;
+        }
+
         /// <summary>Every map reachable from here, for reporting and for choosing where to hunt.</summary>
-        public List<int> Reachable(int fromMapIndex, MirClass mirClass, int level)
+        public List<int> Reachable(int fromMapIndex, MirClass mirClass, int level,
+            long gold = long.MaxValue, long goldFloor = 0)
         {
             List<int> found = new List<int>();
             Queue<int> queue = new Queue<int>();
@@ -227,7 +348,7 @@ namespace MirBot
                 foreach (MapExit exit in ExitsFrom(queue.Dequeue()))
                 {
                     if (seen.Contains(exit.ToMapIndex)) continue;
-                    if (!exit.Allows(mirClass, level)) continue;
+                    if (!exit.Allows(mirClass, level, gold, goldFloor)) continue;
 
                     seen.Add(exit.ToMapIndex);
                     found.Add(exit.ToMapIndex);
@@ -239,6 +360,7 @@ namespace MirBot
         }
 
         public string Describe() =>
-            $"world graph: {ExitCount} exits across {MapCount} maps ({SkippedCount} unusable)";
+            $"world graph: {ExitCount} exits across {MapCount} maps " +
+            $"({TeleportCount} via NPC, {SkippedCount} unusable)";
     }
 }

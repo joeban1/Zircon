@@ -130,6 +130,10 @@ namespace MirBot
 
         public Action<bool> OnRepairResult;
 
+        private DateTime _repairSentAt = DateTime.MinValue;
+
+        private static readonly TimeSpan RepairReplyWindow = TimeSpan.FromSeconds(6);
+
         public void Process(S.NPCRepair p)
         {
             // Nothing else reports a completed repair, so apply the server's own formula locally.
@@ -138,7 +142,32 @@ namespace MirBot
             if (p.Success) Items.NoteRepaired(_pendingRepair, _pendingSpecial);
 
             _pendingRepair = null;
+            _repairSentAt = DateTime.MinValue;
             OnRepairResult?.Invoke(p.Success);
+        }
+
+        /// <summary>
+        /// A repair we asked for and never heard about again.
+        ///
+        /// When the bill is more than the character's gold, PlayerObject.NPCRepair sends a CHAT
+        /// line and returns - there is no S.NPCRepair at all, success or failure
+        /// (PlayerObject.cs:11730). So the obvious hook, "tell me when a repair fails", is never
+        /// called, and a bot waiting to be told will wait forever.
+        ///
+        /// Silence is therefore the signal, and it is measured rather than parsed: matching on the
+        /// message text would break the moment someone plays in another language, and this catches
+        /// every silent refusal rather than only the one about gold. That is worth having - this is
+        /// the third silent refusal found tonight, after an unaffordable NPCBuy and a repair whose
+        /// batch was rejected wholesale.
+        /// </summary>
+        public void CheckRepairTimeout()
+        {
+            if (_pendingRepair == null || _repairSentAt == DateTime.MinValue) return;
+            if (DateTime.UtcNow - _repairSentAt < RepairReplyWindow) return;
+
+            _pendingRepair = null;
+            _repairSentAt = DateTime.MinValue;
+            OnRepairResult?.Invoke(false);
         }
 
         public void Process(S.ItemDurability p) =>
@@ -154,6 +183,11 @@ namespace MirBot
         public Action<MagicType, bool> OnMagicToggle;
 
         public void Process(S.MagicToggle p) => OnMagicToggle?.Invoke(p.Magic, p.CanUse);
+
+        /// <summary>Spell index and how long until it may be cast again.</summary>
+        public Action<int, int> OnMagicCooldown;
+
+        public void Process(S.MagicCooldown p) => OnMagicCooldown?.Invoke(p.InfoIndex, p.Delay);
 
         /// <summary>Manual revive from the status page - never automatic.</summary>
         public void Revive() => Enqueue(new C.TownRevive());
@@ -303,6 +337,21 @@ namespace MirBot
                     Enqueue(new C.MagicToggle { Magic = decision.Magic, CanUse = true });
                     break;
 
+                case BotAction.Cast:
+                    // The single-target shape, copied from the client's own cast handler
+                    // (GameScene.cs): the direction is derived from the target rather than the
+                    // mouse, and Location carries the target's cell so the area-cast spells that
+                    // read it - the talismans - land where the target is standing.
+                    Enqueue(new C.Magic
+                    {
+                        Direction = decision.Direction,
+                        Action = MirAction.Spell,
+                        Type = decision.Magic,
+                        Target = decision.TargetID,
+                        Location = decision.Point
+                    });
+                    break;
+
                 case BotAction.Unlock:
                     Enqueue(new C.ItemLock
                     {
@@ -377,6 +426,7 @@ namespace MirBot
                     });
                     _pendingRepair = decision.RepairSlots;
                     _pendingSpecial = decision.Special;
+                    _repairSentAt = DateTime.UtcNow;
                     break;
 
                 case BotAction.LearnBook:
