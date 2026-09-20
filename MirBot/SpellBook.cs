@@ -54,12 +54,78 @@ namespace MirBot
 
             // Taoist
             MagicType.ExplosiveTalisman, MagicType.ImprovedExplosiveTalisman,
-            MagicType.EvilSlayer, MagicType.GreaterEvilSlayer, MagicType.PoisonDust,
+            MagicType.EvilSlayer, MagicType.GreaterEvilSlayer,
             MagicType.SearingLight, MagicType.BrainStorm,
+            // PoisonDust is NOT here. It has its own path (ChoosePoison) because it needs the
+            // applied/confirmed bookkeeping, and casting it as an ordinary damage spell would
+            // bypass that and re-poison an already-poisoned target every other turn.
 
             // Assassin
             MagicType.Hemorrhage, MagicType.FlamingDaggers, MagicType.Shredding
         };
+
+        /// <summary>
+        /// Self-buffs worth keeping up, and the BuffType each one grants.
+        ///
+        /// The pairing has to be explicit because nothing in the data says which magics are buffs:
+        /// MagicInfo.School is elemental, MagicProperty is display-only and nothing branches on it,
+        /// and the behaviour lives in per-class C# subclasses on the server. So this is a list, and
+        /// the BuffType is what makes "do I already have it" answerable.
+        ///
+        /// Deliberately short:
+        ///   - Renounce is NOT here. It trades health percentage for MC (Renounce.cs:51), which is
+        ///     a stance to take deliberately, not a buff to hold permanently.
+        ///   - Tornado is NOT here. The enum comment calls it uncoded and the comment is stale -
+        ///     there is a real implementation - but it spawns a tornado monster rather than
+        ///     buffing the caster.
+        ///   - The Taoist entries are ground-targeted radius-3 AoE rather than self-casts. They
+        ///     still land on us, because CanHelpTarget always returns true for the caster, so
+        ///     casting at our own feet is the correct way to self-buff with them.
+        /// </summary>
+        private static readonly (MagicType Magic, BuffType Buff, bool AtOwnFeet)[] SelfBuffs =
+        {
+            // Wizard
+            (MagicType.MagicShield, BuffType.MagicShield, false),
+            (MagicType.SuperiorMagicShield, BuffType.SuperiorMagicShield, false),
+
+            // Taoist - ground-targeted, cast at our own location
+            (MagicType.MagicResistance, BuffType.MagicResistance, true),
+            (MagicType.Resilience, BuffType.Resilience, true),
+            (MagicType.StrengthOfFaith, BuffType.StrengthOfFaith, false)
+        };
+
+        /// <summary>
+        /// When a buff attempt may next be made, keyed by MagicInfo.Index, and how many attempts
+        /// have gone unanswered.
+        ///
+        /// This is the starvation guard. A buff branch sitting above damage repeats for ever if the
+        /// server refuses silently - no reagent, wrong shape, a precondition we cannot see - and
+        /// this server refuses a great deal silently. Confirmation is S.BuffAdd arriving and
+        /// HasBuff going true; until then each attempt pushes the next one further out.
+        /// </summary>
+        private readonly Dictionary<int, DateTime> _buffRetry = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, int> _buffTries = new Dictionary<int, int>();
+
+        public int BuffsCast;
+        public int PoisonsCast;
+
+        /// <summary>
+        /// Targets we have thrown poison at but have not yet seen poisoned.
+        ///
+        /// Strictly NON-AUTHORITATIVE, and never reported as an applied effect. The authoritative
+        /// answer is WorldObject.Poison, fed by S.ObjectPoison - but that is broadcast only when
+        /// the mask CHANGES, so there is a gap between our cast going out and the flag coming back
+        /// during which we would otherwise poison the same monster over and over.
+        ///
+        /// An entry is deleted the moment the server confirms, because from then on the flag does
+        /// the suppressing and a second record could only drift out of step with it.
+        /// </summary>
+        private readonly Dictionary<uint, DateTime> _poisonPending = new Dictionary<uint, DateTime>();
+
+        private static readonly TimeSpan PoisonConfirmWindow = TimeSpan.FromSeconds(8);
+
+        /// <summary>Why the last buff attempt was skipped, for the log.</summary>
+        public string BuffDiagnostic = "";
 
         private readonly BotConfig _config;
 
@@ -121,6 +187,47 @@ namespace MirBot
             return false;
         }
 
+        /// <summary>
+        /// Is there an attack spell we could cast RIGHT NOW - mana in the pool, off cooldown?
+        ///
+        /// Distinct from HasCastable, which answers the much weaker "does this character know any
+        /// attack spell at all". The two were being used interchangeably and the difference is not
+        /// academic: the kiting branch asked HasCastable and so kept backing away to spell range on
+        /// behalf of a spell it had no mana to cast.
+        ///
+        /// Measured on the running bots before this was fixed: a level 14 Taoist backed off to
+        /// "cast from 7" forty-one times at 0 of 74 mana, a level 19 Wizard seventy-eight times at
+        /// 0 of 293. Both then walked back in, and out again, until the no-progress watchdog gave
+        /// up on the target - 182 and 105 abandoned chases respectively, against zero for either
+        /// melee bot. A caster with an empty pool is a melee character and has to fight like one.
+        ///
+        /// The gates are deliberately the same ones ChooseAttack applies, including the mana floor,
+        /// so this cannot say yes to something that would then be refused. The global _nextCast
+        /// throttle is NOT included: it is a sub-second gap between casts, and treating it as
+        /// "cannot cast" would make the bot lurch in and out of range between every spell.
+        /// </summary>
+        public bool CanCastNow(WorldModel world)
+        {
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+
+            foreach (ClientUserMagic magic in world.Magics)
+            {
+                if (magic?.Info == null || magic.ItemRequired) continue;
+                if (!Castable.Contains(magic.Info.Magic)) continue;
+                if (world.Level < magic.Info.NeedLevel1) continue;
+
+                if (_cooldowns.TryGetValue(magic.InfoIndex, out DateTime until) &&
+                    DateTime.UtcNow < until)
+                    continue;
+
+                if (world.Mana - magic.Cost < floor) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
         /// <summary>S.MagicCooldown: the server putting one spell on ice for Delay milliseconds.</summary>
         public void Cooldown(int magicInfoIndex, int delayMilliseconds)
         {
@@ -131,7 +238,160 @@ namespace MirBot
         public void Reset()
         {
             _cooldowns.Clear();
+            _buffRetry.Clear();
+            _buffTries.Clear();
+            _poisonPending.Clear();
             _nextCast = DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// A self-buff we are missing and can afford, or null.
+        ///
+        /// "Missing" is the server's answer, not ours: S.BuffAdd, S.BuffRemove and the login dump
+        /// keep WorldModel.HasBuff authoritative, and expiry arrives as an ordinary remove. There
+        /// is no duration tracking and no re-cast timer here, and there should never be one - the
+        /// Mir 2 agents need a two-minute guess only because their server will not tell them about
+        /// other players' buffs, which is a problem we do not have.
+        /// </summary>
+        public ClientUserMagic ChooseBuff(WorldModel world, out bool atOwnFeet)
+        {
+            atOwnFeet = false;
+
+            if (!_config.CastSpells || !_config.MaintainBuffs) return null;
+            if (world.KnownMagicCount == 0) return null;
+            if (DateTime.UtcNow < _nextCast) return null;
+
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+
+            foreach ((MagicType magic, BuffType buff, bool feet) in SelfBuffs)
+            {
+                if (world.HasBuff(buff)) continue;
+                if (!world.TryGetMagic(magic, out ClientUserMagic known)) continue;
+                if (known.Info == null) continue;
+                if (world.Level < known.Info.NeedLevel1) continue;
+                if (known.ItemRequired) continue;
+
+                if (_cooldowns.TryGetValue(known.Info.Index, out DateTime ready) &&
+                    DateTime.UtcNow < ready)
+                    continue;
+
+                if (_buffRetry.TryGetValue(known.Info.Index, out DateTime retry) &&
+                    DateTime.UtcNow < retry)
+                    continue;
+
+                if (world.Mana - known.Cost < floor)
+                {
+                    BuffDiagnostic = $"{known.Info.Name} needs {known.Cost} mana, have {world.Mana}";
+                    continue;
+                }
+
+                atOwnFeet = feet;
+                return known;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// A buff cast went out. Back the next attempt off, because the only proof it worked is
+        /// HasBuff turning true - and if it does, ChooseBuff stops selecting this spell anyway, so
+        /// the backoff never gets in the way of a buff that is actually landing.
+        /// </summary>
+        public void BuffIssued(ClientUserMagic magic)
+        {
+            if (magic?.Info == null) return;
+
+            _buffTries.TryGetValue(magic.Info.Index, out int tries);
+            tries++;
+            _buffTries[magic.Info.Index] = tries;
+
+            // 5s, 10s, 20s, 40s, capped at a minute. A silent refusal must cost less and less
+            // attention, without ever giving up completely - a missing reagent can be bought.
+            int seconds = Math.Min(60, 5 * (int)Math.Pow(2, Math.Min(4, tries - 1)));
+            _buffRetry[magic.Info.Index] = DateTime.UtcNow.AddSeconds(seconds);
+
+            // NOT Issued() - the brain calls that for every BotAction.Cast, buff or damage, so
+            // doing it here too would double-count the casts and apply the magic delay twice.
+            BuffsCast++;
+        }
+
+        /// <summary>
+        /// Poison worth applying to this target, or null.
+        ///
+        /// Chosen before damage because a poison ticks for the whole fight, so the earlier it lands
+        /// the more it is worth - and because re-applying it is pure waste, which is what the
+        /// bookkeeping below exists to prevent.
+        ///
+        /// Which poison lands is not our choice: PoisonDust reads the EQUIPPED poison item and
+        /// takes its Shape to decide green or red (PoisonDust.cs:64). So the test is simply whether
+        /// the target already carries either - we cannot aim for the one it is missing without
+        /// swapping equipment mid-fight, and the single Poison slot makes that a bad trade.
+        /// </summary>
+        public ClientUserMagic ChoosePoison(WorldModel world, Backpack items, WorldObject target,
+            int distance)
+        {
+            if (!_config.CastSpells || target == null) return null;
+            if (distance > Math.Min(_config.CastRange, 10)) return null;
+            if (DateTime.UtcNow < _nextCast) return null;
+
+            if (!world.TryGetMagic(MagicType.PoisonDust, out ClientUserMagic magic)) return null;
+            if (magic.Info == null || world.Level < magic.Info.NeedLevel1) return null;
+
+            // No poison, no poisoning. PoisonDust takes the reagent from the EQUIPMENT slot inside
+            // MagicCast and simply stops if it is not there (PoisonDust.cs:64) - no error, no
+            // cooldown, nothing to learn from. Checking here makes the refusal ours and visible,
+            // rather than a spell that appears to be cast and silently never happens.
+            if (items == null || items.CountReagent(ItemType.Poison) <= 0) return null;
+
+            // Confirmed by the server: stop, and drop our guess, which has served its purpose.
+            if (target.Poison.HasFlag(PoisonType.Green) || target.Poison.HasFlag(PoisonType.Red))
+            {
+                _poisonPending.Remove(target.ObjectID);
+                return null;
+            }
+
+            if (_poisonPending.TryGetValue(target.ObjectID, out DateTime until))
+            {
+                if (DateTime.UtcNow < until) return null;
+
+                // The window elapsed with no confirmation. Either it missed or the poison was
+                // resisted (PoisonResistance is a roll, MapObject.cs:1645), so it is worth one
+                // more attempt rather than assuming it landed.
+                _poisonPending.Remove(target.ObjectID);
+            }
+
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            if (world.Mana - magic.Cost < floor) return null;
+
+            if (_cooldowns.TryGetValue(magic.Info.Index, out DateTime ready) &&
+                DateTime.UtcNow < ready)
+                return null;
+
+            return magic;
+        }
+
+        /// <summary>A poison cast went out. Optimistic, short-lived, and explicitly a guess.</summary>
+        public void PoisonIssued(uint targetID)
+        {
+            _poisonPending[targetID] = DateTime.UtcNow + PoisonConfirmWindow;
+            PoisonsCast++;
+        }
+
+        /// <summary>
+        /// Forget targets that are gone. Object ids are recycled by the server, so a pending entry
+        /// that outlives its monster would suppress poison on whatever inherits the id.
+        /// </summary>
+        public void ForgetPoison(uint targetID) => _poisonPending.Remove(targetID);
+
+        public void ForgetAllPoison() => _poisonPending.Clear();
+
+        /// <summary>The buff landed, so the backoff it accumulated is meaningless.</summary>
+        public void BuffConfirmed(ClientUserMagic magic)
+        {
+            if (magic?.Info == null) return;
+
+            _buffTries.Remove(magic.Info.Index);
+            _buffRetry.Remove(magic.Info.Index);
         }
 
         /// <summary>Record that a cast went out, and hold off for the server's magic delay.</summary>

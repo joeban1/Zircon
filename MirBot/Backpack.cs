@@ -32,6 +32,65 @@ namespace MirBot
         private readonly Dictionary<int, ClientUserItem> _equipment = new Dictionary<int, ClientUserItem>();
 
         public int InventoryCount => _inventory.Count;
+
+        /// <summary>
+        /// Slots still free. Globals.InventorySize is a flat 48 on this server - PlayerObject
+        /// allocates `new UserItem[Globals.InventorySize]` with no expansion - so this is the whole
+        /// story, and weight is a SEPARATE limit that can be nowhere near its own cap while every
+        /// slot is taken. Light junk fills slots without moving the scales.
+        /// </summary>
+        public int FreeSlotCount => Math.Max(0, Globals.InventorySize - _inventory.Count);
+
+        /// <summary>
+        /// Would the server let us pick this up? Mirrors PlayerObject.CanGainItems with
+        /// checkWeight false, which is how ItemObject.PickUpItem calls it - weight is enforced
+        /// elsewhere, slots are enforced here.
+        ///
+        /// This matters because a refusal is SILENT. ItemObject.PickUpItem simply returns false:
+        /// no packet, no message, the item stays on the ground. A bot that does not model this
+        /// walks onto the item, sends C.PickUp, sees the item still there, and sends it again -
+        /// for ever. Bot 1 was found standing still doing exactly that with 48 of 48 slots used
+        /// and the bag only three-quarters of its weight limit.
+        /// </summary>
+        public bool HasRoomFor(ItemInfo info, ClientUserItem instance)
+        {
+            if (info == null) return false;
+
+            // Things that never occupy a slot. Currency is the important one: gold drops as an
+            // ordinary ground item, and refusing to collect it because the bag is full would be
+            // exactly backwards - gold is what pays for the trip that empties the bag.
+            if (info.ItemEffect == ItemEffect.Experience) return true;
+            if (IsCurrency(info)) return true;
+
+            UserItemFlags flags = instance?.Flags ?? UserItemFlags.None;
+
+            if ((flags & UserItemFlags.QuestItem) == UserItemFlags.QuestItem) return true;
+
+            if (FreeSlotCount > 0) return true;
+
+            // No free slot, so the only way in is merging onto a stack that has room. An expirable
+            // item never merges (the server refuses to pool different expiry times).
+            if (info.StackSize <= 1) return false;
+            if ((flags & UserItemFlags.Expirable) == UserItemFlags.Expirable) return false;
+
+            foreach (ClientUserItem existing in _inventory.Values)
+            {
+                if (existing?.Info != info) continue;
+                if (existing.Count >= info.StackSize) continue;
+                if ((existing.Flags & UserItemFlags.Expirable) == UserItemFlags.Expirable) continue;
+                if ((existing.Flags & UserItemFlags.Bound) != (flags & UserItemFlags.Bound)) continue;
+                if ((existing.Flags & UserItemFlags.Worthless) != (flags & UserItemFlags.Worthless)) continue;
+                if ((existing.Flags & UserItemFlags.NonRefinable) != (flags & UserItemFlags.NonRefinable)) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsCurrency(ItemInfo info) =>
+            Globals.CurrencyInfoList?.Binding != null &&
+            Globals.CurrencyInfoList.Binding.Any(x => x.DropItem == info);
         public int EquippedCount => _equipment.Count;
 
         /// <summary>Gained items the bag had no room for. The server did not place them either.</summary>
@@ -116,27 +175,59 @@ namespace MirBot
         public void ResetStorage(IEnumerable<ClientUserItem> items)
         {
             _storage.Clear();
+            _partsStorage.Clear();
             if (items == null) return;
 
+            // Two grids, not one. The server keeps item parts in a SEPARATE PartsStorage array and
+            // distinguishes them by slot: anything at or above Globals.PartsStorageOffset (2000)
+            // belongs to it (PlayerObject.cs:194). Treating them as one grid is what made every
+            // part deposit fail - the bot asked to put a part into GridType.Storage, the server
+            // declined without a word, and the bot's own model happily recorded it as banked.
             foreach (ClientUserItem item in items)
-                if (item?.Info != null)
+            {
+                if (item?.Info == null) continue;
+
+                if (item.Slot >= Globals.PartsStorageOffset)
+                    _partsStorage[item.Slot - Globals.PartsStorageOffset] = item;
+                else
                     _storage[item.Slot] = item;
+            }
         }
 
+        private readonly Dictionary<int, ClientUserItem> _partsStorage =
+            new Dictionary<int, ClientUserItem>();
+
+        public int PartsStoredCount => _partsStorage.Count;
+
+        public IEnumerable<KeyValuePair<int, ClientUserItem>> PartsStored => _partsStorage;
+
         public IEnumerable<KeyValuePair<int, ClientUserItem>> Stored => _storage;
+
+        /// <summary>Which grid this item belongs in. Parts have their own.</summary>
+        public static bool StoresInPartsGrid(ClientUserItem item) => IsItemPart(item);
+
+        public int FirstFreePartsStorageSlot(int storageSize)
+        {
+            for (int i = 0; i < storageSize; i++)
+                if (!_partsStorage.ContainsKey(i)) return i;
+
+            return -1;
+        }
 
         /// <summary>Equipped items keyed by EquipmentSlot index. Read-only use only - this is
         /// the live dictionary, so never hand it to another thread.</summary>
         public IEnumerable<KeyValuePair<int, ClientUserItem>> Worn => _equipment;
         public IEnumerable<KeyValuePair<int, ClientUserItem>> Carried => _inventory;
 
-        public void NoteDeposited(int fromSlot, int toSlot)
+        public void NoteDeposited(int fromSlot, int toSlot, bool parts)
         {
             if (!_inventory.TryGetValue(fromSlot, out ClientUserItem item)) return;
 
             _inventory.Remove(fromSlot);
             item.Slot = toSlot;
-            _storage[toSlot] = item;
+
+            if (parts) _partsStorage[toSlot] = item;
+            else _storage[toSlot] = item;
         }
 
         public void NoteWithdrawn(int fromSlot, int toSlot)
@@ -192,6 +283,33 @@ namespace MirBot
         }
 
         /// <summary>
+        /// Could this character ever meet the item's requirement?
+        ///
+        /// Only the stats a class actually builds count. The three offensive stats are each one
+        /// class's primary and near-zero for the others, so a requirement on the wrong one is
+        /// permanent rather than temporary. AC, MR, Health, Accuracy and Agility come from gear
+        /// and levels for everybody, so those stay eligible.
+        /// </summary>
+        private static bool RequirementCanGrow(ItemInfo info, MirClass mirClass, int level)
+        {
+            switch (info.RequiredType)
+            {
+                // Already past the cap and levels only go up, so this can never come back.
+                case RequiredType.MaxLevel: return level <= info.RequiredAmount;
+
+                case RequiredType.DC: return mirClass == MirClass.Warrior ||
+                                             mirClass == MirClass.Assassin;
+
+                case RequiredType.MC: return mirClass == MirClass.Wizard ||
+                                             mirClass == MirClass.Taoist;
+
+                case RequiredType.SC: return mirClass == MirClass.Taoist;
+
+                default: return true;
+            }
+        }
+
+        /// <summary>
         /// Worth keeping for later: the right class and gender, but a requirement we do not meet
         /// yet. Levelling will unlock it, so it goes to the bank instead of the vendor. Skill books
         /// for our class count too - they are useless now and valuable later.
@@ -225,6 +343,17 @@ namespace MirBot
 
             // Already usable - it belongs in the bag, not the bank.
             if (MeetsRequirement(item.Info, level, stats)) return false;
+
+            // The whole premise of storing something is that we will GROW into it. That holds for
+            // a level requirement and it does not hold for a requirement on a stat this class does
+            // not build: a warrior's MaxMC stays near zero for ever, so a necklace gated on MC is
+            // not a future upgrade, it is a vendor item that happens to be unequippable today.
+            //
+            // CanEquip does not catch this because such items are usually RequiredClass.All - they
+            // are not forbidden to a warrior, merely pointless - so the only thing standing between
+            // them and the bank was a requirement that would never be met. A warrior banked a
+            // Platinum Necklace this way.
+            if (!RequirementCanGrow(item.Info, mirClass, level)) return false;
 
             return SlotFor(item.Info.ItemType) != null;
         }
@@ -276,6 +405,18 @@ namespace MirBot
                     continue;
                 }
 
+                // Anything the bank should never have taken comes back out to be sold. Storing is
+                // a bet that levelling will unlock the item, and a bet on a stat this class does
+                // not build never comes in - a warrior banked a Platinum Necklace on exactly that
+                // mistake and, once the rule was fixed, it would have sat there for ever, because
+                // the only way out of storage used to be becoming USABLE.
+                if (!WorthStoring(item, mirClass, gender, level, stats, books, world) &&
+                    !MeetsRequirement(item.Info, level, stats))
+                {
+                    found.Add(new Reclaim(pair.Key, item, "should not have been banked - selling"));
+                    continue;
+                }
+
                 if (!CanEquip(item, mirClass, gender)) continue;
                 if (!MeetsRequirement(item.Info, level, stats)) continue;
 
@@ -298,13 +439,29 @@ namespace MirBot
             return (int)Math.Min(int.MaxValue, total);
         }
 
+        /// <summary>
+        /// Both grids. This line is logged at login straight from the server's own S.Login.Items,
+        /// which makes it the ONE authoritative view of storage the bot has - everything else is
+        /// its optimistic local model, which records a refused deposit as a success. Reporting only
+        /// the ordinary grid made it say "empty" while parts storage held items, which is precisely
+        /// the kind of confident wrong answer that hid the parts bug in the first place.
+        /// </summary>
         public string DescribeStorage()
         {
-            if (_storage.Count == 0) return "empty";
+            if (_storage.Count == 0 && _partsStorage.Count == 0) return "empty";
 
-            return string.Join(", ", _storage
+            string main = string.Join(", ", _storage
                 .OrderBy(x => x.Key)
                 .Select(x => $"{x.Key}:{x.Value.Info.ItemName}"));
+
+            string parts = string.Join(", ", _partsStorage
+                .OrderBy(x => x.Key)
+                .Select(x => $"{Globals.PartsStorageOffset + x.Key}:{x.Value.Info.ItemName}"));
+
+            if (main.Length == 0) return $"(parts) {parts}";
+            if (parts.Length == 0) return main;
+
+            return $"{main} | (parts) {parts}";
         }
 
         /// <summary>The first carried book this character can learn right now, or -1.</summary>
@@ -549,13 +706,123 @@ namespace MirBot
             item.Info.ItemType == ItemType.Consumable &&
             item.Info.Stats[Stat.Health] > 0;
 
-        public int FindHealthPotionSlot()
-        {
-            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
-                if (pair.Key >= 0 && IsHealthPotion(pair.Value) && pair.Value.Count > 0)
-                    return pair.Key;
+        /// <summary>
+        /// Amulets and poison: ammunition for spells, not jewellery.
+        ///
+        /// Zircon consumes these from the EQUIPMENT slot and matches them by exact Shape -
+        /// UseAmulet reads Equipment[EquipmentSlot.Amulet] (PlayerObject.cs:7963) and UsePoison the
+        /// Poison slot (:7933). A Taoist with no amulet equipped cannot summon, cannot shield and
+        /// cannot poison, and the server refuses each attempt in silence.
+        ///
+        /// They must never be scored as gear. A nine-stack and a one-stack of the same amulet have
+        /// identical stats, so any upgrade comparison calls them equal and the spare is sold as
+        /// junk - which is how a caster ends up unable to cast while standing next to its own
+        /// reagents in a vendor window.
+        /// </summary>
+        public static bool IsReagent(ClientUserItem item) =>
+            item?.Info != null &&
+            (item.Info.ItemType == ItemType.Amulet || item.Info.ItemType == ItemType.Poison);
 
-            return -1;
+        /// <summary>How many of this reagent type we hold, carried and equipped together.</summary>
+        public int CountReagent(ItemType type)
+        {
+            long total = 0;
+
+            foreach (ClientUserItem item in _inventory.Values)
+                if (item?.Info != null && item.Info.ItemType == type) total += item.Count;
+
+            foreach (ClientUserItem item in _equipment.Values)
+                if (item?.Info != null && item.Info.ItemType == type) total += item.Count;
+
+            return (int)Math.Min(int.MaxValue, total);
+        }
+
+        public bool HasHealthPotion() => FindHealthPotionSlot(int.MaxValue) >= 0;
+
+        /// <summary>
+        /// The best health potion to drink right now, or -1 when we carry none.
+        ///
+        /// This used to return the LOWEST SLOT holding any health potion, which is an arbitrary
+        /// choice dressed up as a decision. A wizard carrying tier 2 at slot 16 and thirteen tier 1
+        /// at slot 38 drank slot 16 every single time, and slot 38 was unreachable for as long as
+        /// any tier 2 remained - so the weak stack was never touched, and buying stronger potions
+        /// in town made it worse by filling a lower slot.
+        ///
+        /// Ranked instead: the smallest potion that still covers what we are missing, because that
+        /// heals fully without throwing the surplus away, and the LARGEST available when nothing
+        /// covers it, because at that point the bot is in trouble and wants the biggest drink it
+        /// has. Either way it never refuses to drink while it is holding something.
+        ///
+        /// Pass the deficit rather than the world: Backpack must not hold a reference to mutable
+        /// player health.
+        /// </summary>
+        public int FindHealthPotionSlot(int missingHealth) =>
+            BestPotionSlot(missingHealth, IsHealthPotion, Stat.Health);
+
+        /// <summary>The biggest health potion carried, for when survival beats economy.</summary>
+        public int FindBiggestHealthPotionSlot() =>
+            BestPotionSlot(int.MaxValue, IsHealthPotion, Stat.Health);
+
+        /// <summary>The same ranking on the other pool.</summary>
+        public int FindManaPotionSlot(int missingMana) =>
+            BestPotionSlot(missingMana, IsManaPotion, Stat.Mana);
+
+        public bool HasManaPotion() => FindManaPotionSlot(int.MaxValue) >= 0;
+
+        /// <summary>
+        /// The heal a given slot would deliver, or 0. Lets the caller decide whether drinking it
+        /// now would waste most of it.
+        /// </summary>
+        public int RestoreAmount(int slot, bool health)
+        {
+            if (!_inventory.TryGetValue(slot, out ClientUserItem item) || item?.Info == null) return 0;
+
+            return item.Info.Stats[health ? Stat.Health : Stat.Mana];
+        }
+
+        private int BestPotionSlot(int missing, Func<ClientUserItem, bool> predicate, Stat restores)
+        {
+            int covering = -1, coveringSize = int.MaxValue;
+            int largest = -1, largestSize = -1;
+            int smallest = -1, smallestSize = int.MaxValue;
+
+            // Ordered so ties resolve to the lowest slot, which keeps the choice deterministic
+            // and therefore reproducible when reading a log back.
+            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
+            {
+                if (pair.Key < 0 || pair.Value.Count <= 0) continue;
+                if (!predicate(pair.Value)) continue;
+
+                int heals = pair.Value.Info.Stats[restores];
+                if (heals <= 0) continue;
+
+                if (heals >= missing && heals < coveringSize)
+                {
+                    coveringSize = heals;
+                    covering = pair.Key;
+                }
+
+                if (heals > largestSize)
+                {
+                    largestSize = heals;
+                    largest = pair.Key;
+                }
+
+                if (heals < smallestSize)
+                {
+                    smallestSize = heals;
+                    smallest = pair.Key;
+                }
+            }
+
+            // Smallest that covers the deficit: heals fully, wastes nothing.
+            if (covering >= 0) return covering;
+
+            // Nothing covers it. Prefer the SMALLEST rather than the largest - it is the closest
+            // fit to what is actually missing, and the surplus of a big potion is thrown away
+            // against the health cap. The caller decides whether the situation is desperate enough
+            // to want the biggest thing available regardless.
+            return smallest >= 0 ? smallest : largest;
         }
 
         /// <summary>
@@ -569,27 +836,43 @@ namespace MirBot
             item.Info.Stats[Stat.Health] <= 0 &&
             item.Info.Stats[Stat.Mana] > 0;
 
-        public int FindManaPotionSlot()
-        {
-            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
-                if (pair.Key >= 0 && IsManaPotion(pair.Value) && pair.Value.Count > 0)
-                    return pair.Key;
-
-            return -1;
-        }
 
         /// <summary>
-        /// Drop slots we just sold. S.ItemsChanged is echoed before the server validates the sale
-        /// (PlayerObject.cs:10267), so it is not a reliable success signal; the local model is
-        /// updated optimistically instead and corrected by the next authoritative update. Without
-        /// this the bot re-offers the same item on every subsequent trip.
+        /// Drop what the server CONFIRMED it took, and nothing else.
+        ///
+        /// The earlier version of this ran the moment the packet was sent, on the reading that
+        /// S.ItemsChanged is echoed before the sale is validated and so cannot be trusted. The echo
+        /// part is true; the conclusion was wrong. The server enqueues the packet OBJECT and
+        /// serialises it later (BaseConnection.cs:156, SendList.Enqueue), then sets Success on that
+        /// same object once the sale goes through - so what reaches us does carry the verdict.
+        ///
+        /// Trusting the send instead cost two hours of bot time. NPCSell on this server is
+        /// all-or-nothing: its validation loop RETURNS on the first bad link rather than skipping
+        /// it, so one locked, worthless, zero-count or already-gone slot voids the entire order,
+        /// silently. Cross thirty-five slots off on send, have the server take none, and the bag
+        /// still weighs what it weighed while the model believes it is nearly empty. A level 24
+        /// warrior spent twenty-four consecutive town trips reporting "0 sellable of 7 slots" while
+        /// actually carrying forty-two, because it could no longer see its own inventory. Nothing
+        /// recovered it short of a relog, which rebuilds the model from StartInformation.Items.
+        ///
+        /// Erring the other way is cheap: an item we wrongly believe we still hold is re-offered on
+        /// the next trip and sold then. An item we wrongly believe is gone is invisible for ever.
         /// </summary>
-        public void NoteSold(IEnumerable<int> slots)
+        public void NoteSoldConfirmed(IEnumerable<CellLinkInfo> links)
         {
-            if (slots == null) return;
+            if (links == null) return;
 
-            foreach (int slot in slots.ToList())
-                _inventory.Remove(slot);
+            foreach (CellLinkInfo link in links)
+            {
+                if (link == null || link.GridType != GridType.Inventory) continue;
+                if (!_inventory.TryGetValue(link.Slot, out ClientUserItem item)) continue;
+
+                // Partial sales are possible - ParseLinks merges duplicate slots and the server
+                // decrements rather than removing when it takes less than the stack.
+                item.Count -= link.Count;
+
+                if (item.Count <= 0) _inventory.Remove(link.Slot);
+            }
         }
 
         public void NoteUsed(int slot)
@@ -637,6 +920,12 @@ namespace MirBot
             long gold, LootValueRule value)
         {
             if (info == null) return !heavy;
+
+            // No slot for it, so wanting it is beside the point - the server will refuse without
+            // saying so and the bot will stand on the item asking for ever. Checked first because
+            // every rule below this decides whether we WANT the item, and this decides whether we
+            // can have it at all.
+            if (!HasRoomFor(info, instance)) return false;
 
             // A town scroll is the only way home, so it is worth its weight even at capacity.
             bool isConsumable = info.ItemType == ItemType.Consumable;
@@ -775,8 +1064,16 @@ namespace MirBot
 
         public const int TownTeleportShape = 2;
 
+        /// <summary>
+        /// How many are in this slot, or 0 when we do not believe anything is.
+        ///
+        /// It used to answer 1 for an unknown slot. That guess is not harmless here: the server
+        /// rejects a whole sell order if any link has Count &lt;= 0 or names an empty slot
+        /// (ParseLinks, and the null check in NPCSell), so one invented count loses the sale for
+        /// every other item in the same order. Callers skip a zero instead.
+        /// </summary>
         public long CountInSlot(int slot) =>
-            _inventory.TryGetValue(slot, out ClientUserItem item) ? item.Count : 1;
+            _inventory.TryGetValue(slot, out ClientUserItem item) ? item.Count : 0;
 
         /// <summary>Total healing potions carried, across stacks and tiers.</summary>
         public int CountHealthPotions()
@@ -1173,6 +1470,38 @@ namespace MirBot
             }
         }
 
+        /// <summary>
+        /// How much bag weight a town trip could actually shed.
+        ///
+        /// The weight trigger used to read the scales alone, and that is only half a question. A
+        /// bag can be at 100% and hold nothing a vendor wants: potions, scrolls and worn equipment
+        /// are all reserved, all heavy, and none of them disposable. The trip then fires, walks the
+        /// whole itinerary, sells nothing, comes home exactly as heavy, and fires again after the
+        /// cooldown - for ever.
+        ///
+        /// Observed running: a level 24 warrior at 242/242 weight reporting "0 sellable of 7 slots"
+        /// on every stop, 24 trips deep, and a level 16 assassin at 109/120 doing the same with a
+        /// ten-stop lap. Between them they spent two hours shopping and managed 223 combat actions.
+        ///
+        /// So the trigger asks both halves now: are we heavy, AND is there something to put down.
+        /// </summary>
+        public int DisposableWeight(MirClass mirClass, MirGender gender, int level,
+            Stats stats, int healthReserve, int manaReserve, int scrollReserve,
+            MagicBooks books, WorldModel world)
+        {
+            int weight = 0;
+
+            foreach (int slot in DisposableSlots(mirClass, gender, level, stats,
+                         healthReserve, manaReserve, scrollReserve, books, world))
+            {
+                // The stack's weight, not the unit's - InSlot returns the instance, whose Weight
+                // already accounts for Count.
+                weight += InSlot(slot)?.Weight ?? 0;
+            }
+
+            return weight;
+        }
+
         public List<int> DisposableSlots(MirClass mirClass, MirGender gender, int level,
             Stats stats, int healthReserve, int manaReserve, int scrollReserve,
             MagicBooks books, WorldModel world)
@@ -1210,6 +1539,11 @@ namespace MirBot
                     slots.Add(pair.Key);   // Junk / WrongClass / AlreadyKnown / duplicate
                     continue;
                 }
+
+                // Reagents are ammunition. Selling them is selling the ability to cast, and
+                // because they carry no stats every gear comparison rates them worthless, so
+                // without this they fall straight through to the junk pile.
+                if (IsReagent(item)) continue;
 
                 // An item part is never junk. Its own ItemInfo is a generic placeholder - the
                 // real item is named by AddedStats[Stat.ItemIndex] - so it looks like a nameless

@@ -13,6 +13,7 @@ namespace MirBot
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MirBot</title>
 <style>
   :root {
@@ -25,16 +26,19 @@ namespace MirBot
   h1 { font-size:15px; font-weight:600; margin:0 0 14px; color:var(--dim); }
   h1 span { color:var(--text); }
   .bot { background:var(--card); border:1px solid var(--line); border-radius:10px;
-         padding:14px; margin-bottom:14px; }
+         padding:12px 14px; margin-bottom:10px; }
   .top { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .name { font-size:17px; font-weight:600; }
   .state { font-size:12px; padding:2px 8px; border-radius:99px; background:#262b34; color:var(--dim); }
   .state.Playing { background:rgba(78,201,165,.15); color:var(--good); }
   .state.Faulted, .state.Banned { background:rgba(226,104,95,.15); color:var(--bad); }
   .dead { background:var(--bad); color:#fff; padding:2px 8px; border-radius:99px; font-size:12px; }
-  .action { margin:10px 0 12px; font-size:15px; }
+  .action { margin:8px 0 10px; font-size:14px; }
   .action .detail { color:var(--dim); font-size:13px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px 18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(112px,180px));
+          gap:7px 14px; align-content:start; }
+  .grid .wide { grid-column:span 3; }
+  @media (max-width:620px){ .grid .wide { grid-column:span 2; } }
   .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
   .v { font-variant-numeric:tabular-nums; }
   .bar { height:6px; background:#262b34; border-radius:99px; overflow:hidden; margin-top:4px; }
@@ -52,17 +56,258 @@ namespace MirBot
   button { background:#262b34; color:var(--text); border:1px solid var(--line);
            border-radius:6px; padding:5px 12px; font-size:13px; cursor:pointer; margin-right:6px; }
   button:hover { border-color:var(--accent); }
+  select { background:#262b34; color:var(--text); border:1px solid var(--line);
+           border-radius:6px; padding:5px 8px; font-size:13px; margin-right:6px; }
   .err { color:var(--bad); font-size:13px; margin-top:8px; }
   footer { color:var(--dim); font-size:12px; margin-top:6px; }
+  .hide { display:none; }
+
+  /* --- page tabs --- */
+  .tabs { display:flex; gap:4px; margin:0 0 14px; border-bottom:1px solid var(--line); }
+  .tabs button { background:none; border:none; border-bottom:2px solid transparent;
+                 border-radius:0; color:var(--dim); padding:7px 14px; margin:0; font-size:13px; }
+  .tabs button.on { color:var(--text); border-bottom-color:var(--accent); }
+  .tabs button:hover { border-color:transparent; border-bottom-color:var(--line); color:var(--text); }
+  .tabs button.on:hover { border-bottom-color:var(--accent); }
+
+  /* --- compact card --- */
+  .body { display:grid; grid-template-columns:1fr 320px; gap:14px; align-items:start; }
+  @media (max-width:620px){ .body { grid-template-columns:1fr; } }
+
+  /* Everything on show at once, side by side.
+     Only one bot is expanded now, so there is room to stop hiding things behind buttons - and a
+     pane you have to click for is a pane you forget to look at. Each one scrolls on its own so a
+     forty-item bag cannot stretch the card past the others. */
+  /* An explicit column count, NOT auto-fit.
+     auto-fit only collapses tracks that nothing occupies, and the full-width "Why not?" row
+     spans every track by definition - so on a wide screen it created nine columns, put the four
+     tables in the first four at their 215px minimum, and left the right half of the card empty. */
+  .panes { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+           gap:8px 16px; margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
+  @media (min-width:1000px){ .panes { grid-template-columns:repeat(4,minmax(0,1fr)); } }
+  @media (max-width:620px) { .panes { grid-template-columns:minmax(0,1fr); } }
+  .pane { min-width:0; }
+  .pane > h4 { margin:0; color:var(--dim); font-size:11px; font-weight:500;
+               text-transform:uppercase; letter-spacing:.04em; }
+  .pane .scroll { max-height:380px; overflow:auto; }
+  .pane table { margin-top:4px; }
+  .pane td, .pane th { font-size:12px; }
+  .whypane { grid-column:1/-1; }
+  .whypane .row { margin-top:4px; font-size:13px; }
+  .whypane .row b { color:var(--dim); font-weight:500; }
+
+  /* --- item cells ---
+     Coloured tiles keyed on item type, not artwork. The client's sprites live in a container
+     format nothing here can decode yet, so the grid is built to work without them: every cell
+     already carries its image index, and a tile becomes an icon the day the icons exist. */
+  .cells { display:grid; grid-template-columns:repeat(auto-fill,minmax(38px,1fr)); gap:3px;
+           margin-top:4px; }
+  .cell { position:relative; aspect-ratio:1; border:1px solid var(--line); border-radius:5px;
+          background:#171a20; display:flex; align-items:center; justify-content:center;
+          font-size:9px; line-height:1.05; text-align:center; overflow:hidden; padding:2px;
+          color:var(--dim); cursor:default; }
+  .cell.full { color:var(--text); }
+  .cell.broken { border-color:var(--bad); }
+  .cell.worn { border-color:var(--warn); }
+  .cell .n { position:absolute; right:2px; bottom:1px; font-size:9px; color:var(--accent);
+             background:rgba(20,22,26,.85); border-radius:3px; padding:0 2px; }
+  .cell .lbl { position:absolute; inset:0; display:flex; align-items:center;
+               justify-content:center; padding:2px; }
+  /* The initials are the FALLBACK, not a backdrop. Item art is mostly transparent, so leaving the
+     text underneath showed it through the gaps. The cell only stops drawing it once the image has
+     actually loaded - so a missing icon still reads, and a present one is clean. */
+  .cell.art .lbl { display:none; }
+  .cell img { position:absolute; inset:2px; width:calc(100% - 4px); height:calc(100% - 4px);
+              object-fit:contain; image-rendering:pixelated; }
+
+  /* item type families, so a bag is readable at a glance */
+  .t-weapon   { background:#2a2130; } .t-armour  { background:#1d2733; }
+  .t-jewel    { background:#2b2733; } .t-potion  { background:#1f2b26; }
+  .t-scroll   { background:#2c2a20; } .t-book    { background:#232a33; }
+  .t-ore      { background:#26231e; } .t-part    { background:#2a2024; }
+  .t-reagent  { background:#1e2a2a; }
+
+  /* Two columns, filled ROW BY ROW - EQUIP_ORDER is written as left/right pairs, so ordinary row
+     flow puts body-and-hands down the left and jewellery down the right. Column flow would take
+     the first six entries as one column and scramble the pairing. */
+  .slots { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 10px;
+           margin-top:4px; }
+  @media (max-width:620px){ .slots { grid-template-columns:minmax(0,1fr); } }
+  .slot.empty { opacity:.45; }
+  .slot.empty .cell { border-style:dashed; }
+  .slot { display:flex; align-items:center; gap:5px; min-width:0; }
+  .slot .cell { width:32px; flex:0 0 32px; }
+  .slot .who { min-width:0; }
+  .slot .who .s { color:var(--dim); font-size:10px; text-transform:uppercase;
+                  letter-spacing:.03em; }
+  .slot .who .i { font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* --- tooltip --- */
+  #tip { position:fixed; z-index:50; pointer-events:none; max-width:280px;
+         background:#11131a; border:1px solid var(--line); border-radius:8px; padding:9px 11px;
+         font-size:12px; box-shadow:0 8px 24px rgba(0,0,0,.55); display:none; }
+  #tip .tn { font-weight:600; font-size:13px; }
+  #tip .tt { color:var(--dim); font-size:11px; margin-bottom:5px; }
+  #tip .st { display:flex; justify-content:space-between; gap:12px; }
+  #tip .st b { font-weight:500; color:var(--dim); }
+  #tip .add { color:var(--good); }
+  #tip .req { color:var(--warn); margin-top:4px; }
+  #tip .desc { color:var(--dim); margin-top:5px; font-style:italic; }
+  #tip hr { border:none; border-top:1px solid var(--line); margin:5px 0; }
+
+  /* --- the summary strip --- */
+  .strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr));
+           gap:8px; margin-bottom:12px; }
+  .mini { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:9px 11px; cursor:pointer; }
+  .mini:hover { border-color:#3a4150; }
+  .mini.on { border-color:var(--accent); background:#20242c; cursor:default; }
+  .mini .row1 { display:flex; align-items:center; gap:7px; }
+  .mini .nm { font-weight:600; font-size:14px; }
+  .mini .lv { color:var(--dim); font-size:12px; margin-left:auto;
+              font-variant-numeric:tabular-nums; }
+  .mini .act { font-size:12px; margin-top:5px; white-space:nowrap; overflow:hidden;
+               text-overflow:ellipsis; }
+  .mini .act b { font-weight:600; }
+  .mini .sub { color:var(--dim); font-size:11px; margin-top:2px; white-space:nowrap;
+               overflow:hidden; text-overflow:ellipsis; }
+  .mini .bars { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; margin-top:6px; }
+  .mini .bars span { color:var(--dim); font-size:10px; font-variant-numeric:tabular-nums; }
+  .mini .bar { margin-top:2px; }
+
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex:0 0 auto; }
+  .dot.green { background:var(--good); }
+  .dot.yellow { background:var(--warn); }
+  .dot.red { background:var(--bad); box-shadow:0 0 0 3px rgba(226,104,95,.2); }
+  .dot.grey { background:#4a515e; }
+  .since { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+
+
+  #alerts { margin-bottom:14px; }
+  .alert { background:rgba(226,104,95,.12); border:1px solid rgba(226,104,95,.35);
+           color:var(--bad); border-radius:8px; padding:8px 12px; margin-bottom:6px;
+           font-size:13px; }
+  .alert.warn { background:rgba(226,179,65,.12); border-color:rgba(226,179,65,.35);
+                color:var(--warn); }
+
+  .spark { display:block; width:100%; height:20px; margin-top:3px; }
+  .spark path { fill:none; stroke:var(--warn); stroke-width:1.5; }
+  .spark .fill { fill:rgba(226,179,65,.12); stroke:none; }
+
+  details.mem { background:var(--card); border:1px solid var(--line); border-radius:10px;
+                padding:12px 14px; margin-bottom:14px; }
+  details.mem summary { cursor:pointer; font-weight:600; }
+  details.mem table { margin-top:10px; }
+  details.mem td.num, details.mem th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  tr.lethal td { color:var(--bad); }
+  tr.here td { background:rgba(106,169,255,.08); }
+  .tag { font-size:10px; padding:1px 6px; border-radius:99px; background:#262b34;
+         color:var(--dim); margin-left:6px; }
+  .tag.bad { background:rgba(226,104,95,.18); color:var(--bad); }
+
+  .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  .controls input[type=search] { background:#262b34; color:var(--text);
+        border:1px solid var(--line); border-radius:6px; padding:5px 10px; font-size:13px;
+        min-width:190px; }
+  .controls label { color:var(--dim); font-size:12px; display:flex; align-items:center; gap:5px; }
+  .controls .n { color:var(--dim); font-size:12px; margin-left:auto; }
+  th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  th.sortable:hover { color:var(--text); }
+  th.sortable .arrow { color:var(--accent); }
+
+  .map { margin-top:0; }
+  /* Capped, not just full-width. Stacked on a narrow screen a square map takes the whole column
+     and becomes the tallest thing on the card - which is the opposite of the point. */
+  /* Big enough to actually read the cave. Still capped, because these maps are square and an
+     uncapped one stacks to the full column width on a phone and becomes the tallest thing here. */
+  .map canvas { width:100%; max-width:320px; display:block; border:1px solid var(--line);
+                border-radius:6px; background:#0f1115; image-rendering:pixelated; }
+  .map .legend { color:var(--dim); font-size:11px; margin-top:4px; }
+  .map .legend b { color:var(--accent); font-weight:600; }
+  .map .legend i { color:var(--warn); font-style:normal; font-weight:600; }
+
+  details.cfg { margin-top:12px; border-top:1px solid var(--line); padding-top:8px; }
+  details.cfg summary { cursor:pointer; color:var(--dim); font-size:11px;
+                        text-transform:uppercase; letter-spacing:.04em; }
+  .cfggroup { margin-top:10px; }
+  .cfggroup > b { color:var(--dim); font-size:11px; text-transform:uppercase;
+                  letter-spacing:.04em; font-weight:500; }
+  .cfgrow { display:flex; align-items:center; gap:8px; margin-top:5px; font-size:13px; }
+  .cfgrow .name { min-width:200px; }
+  .cfgrow .note { color:var(--dim); font-size:12px; flex:1; }
+  .cfgrow input[type=number] { width:110px; background:#262b34; color:var(--text);
+        border:1px solid var(--line); border-radius:6px; padding:4px 8px; font-size:13px;
+        font-variant-numeric:tabular-nums; }
+  .cfgrow input.dirty { border-color:var(--warn); }
+  .cfgrow .reach { font-size:10px; color:var(--dim); }
+  .cfgresult { margin-top:8px; font-size:12px; color:var(--good); }
 </style>
 </head>
 <body>
 <h1>MirBot — <span id="host"></span></h1>
-<div id="bots"></div>
+<div class="tabs">
+  <button id="tab-bots" class="on">Bots</button>
+  <button id="tab-settings">Settings</button>
+</div>
+<div id="page-bots">
+<div id="alerts"></div>
+<div id="strip" class="strip"></div>
+<div id="botdetail"></div>
+<details class="mem" id="huntmem"><summary>Hunting memory</summary>
+  <div class="controls">
+    <input type="search" id="huntq" placeholder="search map or class" autocomplete="off">
+    <select id="huntclass"><option value="">all classes</option></select>
+    <label><input type="checkbox" id="huntmine"> only where bots are</label>
+    <label><input type="checkbox" id="huntlethal"> hide lethal</label>
+    <label><input type="checkbox" id="huntmeasured"> measured only</label>
+    <span class="n" id="huntcount"></span>
+  </div>
+  <div id="hunttable"></div></details>
+<details class="mem" id="deathmem"><summary>Recent deaths</summary>
+  <div id="deathtable"></div></details>
+</div>
+
+<div id="page-settings" class="hide">
+  <div class="mem">
+    <b>Settings apply to every bot.</b>
+    <div class="detail" style="margin-top:4px">Each bot applies the change on its own thread and
+      writes its own ini, so a value survives a restart. A setting marked <i>mixed</i> means the
+      bots do not currently agree - setting it again brings them back into line.</div>
+    <div class="cfgresult" id="cfgresult"></div>
+    <div id="cfgform"></div>
+  </div>
+</div>
+
+<div id="tip"></div>
 <footer id="foot"></footer>
 <script>
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const pct = (a,b) => b > 0 ? Math.min(100, Math.round(a/b*100)) : 0;
+"use strict";
+
+// ---------------------------------------------------------------------------------------------
+// Cards are BUILT ONCE and PATCHED thereafter.
+//
+// The previous version reassigned the whole #bots innerHTML on every poll, once a second. That
+// destroys and recreates every element underneath it, which was already costing real usability -
+// an open <select> closed itself about once a second, and the workaround was to skip the refresh
+// entirely while one had focus, so the numbers stopped updating whenever you tried to use a
+// control. It also rules out anything that owns state of its own: an input mid-edit, an expanded
+// <details>, a hovered tooltip, a <canvas> with a drawing on it.
+//
+// So each bot gets a DOM subtree once, a bag of references into it, and per-field updates. The
+// only wholesale rewrites left are the four tables, and those are gated on a content signature so
+// an unchanged table is not touched either.
+// ---------------------------------------------------------------------------------------------
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+
+const pct = (v, max) => max > 0 ? Math.max(0, Math.min(100, Math.round(v * 100 / max))) : 0;
+
+const stripEl = document.getElementById("strip");
+const cards = new Map();          // bot id -> full card, built on first selection
+const minis = new Map();          // bot id -> summary card, always present
+
+// --- controls ---------------------------------------------------------------------------------
 
 async function send(id, action, query) {
   try {
@@ -72,9 +317,14 @@ async function send(id, action, query) {
   refresh();
 }
 
-// Destinations are fetched once: the map graph is built at startup and never changes.
+function goMap(id) {
+  const sel = cards.get(id)?.el.map;
+  if (sel && sel.value) send(id, "travel", "map=" + encodeURIComponent(sel.value));
+}
+
+// The map list never changes, so it is fetched once and every new card is filled from it. A card
+// is only built once now, so there is no need to re-fill or to remember the chosen value.
 let mapList = null;
-const chosenMap = {};
 
 async function loadMaps() {
   if (mapList) return mapList;
@@ -85,131 +335,1121 @@ async function loadMaps() {
   return mapList;
 }
 
-// Re-filling the <select> every second would fight the user's own selection, so each one is
-// populated once and then left alone.
-async function fillMaps() {
+async function fillMap(sel) {
   const maps = await loadMaps();
+  if (!maps.length || sel.options.length) return;
+  sel.appendChild(new Option("auto", ""));
+  for (const m of maps) sel.appendChild(new Option(m.name, m.name));
+}
 
-  for (const sel of document.querySelectorAll("select[id^='map-']")) {
-    if (sel.dataset.filled) continue;
-    sel.dataset.filled = "1";
-    sel.innerHTML = maps.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+// --- card construction ------------------------------------------------------------------------
 
-    // Restore what was chosen before the card was rebuilt.
-    const id = sel.id.substring(4);
-    if (chosenMap[id]) sel.value = chosenMap[id];
+const CARD_HTML = `
+  <div class="top">
+    <span class="dot" data-r="dot"></span>
+    <span class="name" data-r="name"></span>
+    <span class="state" data-r="state"></span>
+    <span class="since" data-r="since"></span>
+    <span class="dead hide" data-r="dead">DEAD</span>
+    <span style="margin-left:auto">
+      <button data-a="start">Start</button>
+      <button data-a="stop">Stop</button>
+      <button data-a="towntrip">Town trip</button>
+      <button data-a="forcerepair">Repair</button>
+      <button data-a="travel">Travel</button>
+      <select data-r="map"></select>
+      <button data-a="go">Go</button>
+      <button data-a="revive">Revive</button>
+    </span>
+  </div>
 
-    sel.addEventListener("change", () => { chosenMap[id] = sel.value; });
+  <div class="action"><b data-r="action"></b><span data-r="subject"></span>
+    <div class="detail" data-r="detail"></div></div>
+
+  <div class="err hide" data-r="exit"></div>
+  <div class="err hide" data-r="error"></div>
+
+  <div class="body">
+    <div class="grid">
+      <div><div class="k">Level</div><div class="v" data-r="level"></div></div>
+      <div><div class="k">HP</div><div class="v" data-r="hp"></div>
+           <div class="bar hp"><i data-r="hpbar"></i></div></div>
+      <div><div class="k">MP</div><div class="v" data-r="mp"></div>
+           <div class="bar mp"><i data-r="mpbar"></i></div></div>
+      <div><div class="k">Experience</div><div class="v" data-r="xp"></div>
+           <div class="bar xp"><i data-r="xpbar"></i></div></div>
+      <div><div class="k">Gold</div><div class="v" data-r="gold"></div>
+           <svg class="spark" data-r="spark" preserveAspectRatio="none" viewBox="0 0 100 26">
+             <path class="fill" data-r="sparkfill"></path><path data-r="sparkline"></path></svg></div>
+      <div><div class="k">Bag</div><div class="v" data-r="bag"></div></div>
+      <div><div class="k">Location</div><div class="v" data-r="loc"></div>
+           <div class="detail" data-r="locdetail"></div></div>
+      <div><div class="k">Town trip</div><div class="v" data-r="trip"></div>
+           <div class="detail" data-r="tripdetail"></div></div>
+      <div><div class="k">Bank</div><div class="v" data-r="bank"></div></div>
+      <div class="wide"><div class="k">Counters</div><div class="v" data-r="counters"></div>
+           <div class="detail" data-r="counters2"></div></div>
+    </div>
+
+    <div class="map"><canvas data-r="canvas" width="10" height="10"></canvas>
+      <div class="legend" data-r="legend"></div></div>
+  </div>
+
+  <div class="panes">
+    <div class="pane whypane"><h4>Why not?</h4><div data-r="why"></div></div>
+
+    <div class="pane"><h4 data-r="equiphead">Equipped</h4>
+      <div class="scroll slots" data-r="equip"></div></div>
+
+    <div class="pane"><h4 data-r="baghead">Bag</h4>
+      <div class="scroll cells" data-r="baglist"></div></div>
+
+    <div class="pane"><h4 data-r="storehead">Storage</h4>
+      <div class="scroll cells" data-r="storelist"></div></div>
+
+    <div class="pane"><h4>History</h4>
+      <div class="scroll"><table><tr><th>Action</th><th>Subject</th><th>When</th></tr>
+        <tbody data-r="hist"></tbody></table></div></div>
+  </div>`;
+
+// --- the summary strip ------------------------------------------------------------------------
+//
+// One bot is shown in full and the rest are one-line summaries. Four full cards meant scrolling
+// past three of them to read the fourth, and in practice you are looking at one bot at a time -
+// the other three only need to answer "is anything wrong over there?", which a dot, a couple of
+// bars and the current action do perfectly well.
+//
+// Only the selected bot's full card is patched each tick, so the map, the sparkline and the
+// tables cost nothing for the bots you are not looking at.
+
+const MINI_HTML = `
+  <div class="row1">
+    <span class="dot" data-r="dot"></span>
+    <span class="nm" data-r="name"></span>
+    <span class="state" data-r="state"></span>
+    <span class="lv" data-r="lv"></span>
+  </div>
+  <div class="act"><b data-r="action"></b><span data-r="subject"></span></div>
+  <div class="sub" data-r="sub"></div>
+  <div class="bars">
+    <div><span data-r="hp"></span><div class="bar hp"><i data-r="hpbar"></i></div></div>
+    <div><span data-r="mp"></span><div class="bar mp"><i data-r="mpbar"></i></div></div>
+    <div><span data-r="xp"></span><div class="bar xp"><i data-r="xpbar"></i></div></div>
+  </div>`;
+
+function makeMini(id) {
+  const root = document.createElement("div");
+  root.className = "mini";
+  root.innerHTML = MINI_HTML;
+
+  const el = {};
+  for (const node of root.querySelectorAll("[data-r]")) el[node.dataset.r] = node;
+
+  root.addEventListener("click", () => select(id));
+  return { root, el };
+}
+
+function patchMini(mini, b) {
+  const el = mini.el;
+
+  const dot = dotFor(b);
+  if (el.dot.dataset.cls !== dot) {
+    el.dot.className = "dot " + dot;
+    el.dot.dataset.cls = dot;
+  }
+
+  text(el.name, b.characterName || b.id);
+  text(el.state, b.state);
+  if (el.state.dataset.cls !== b.state) {
+    el.state.className = "state " + b.state;
+    el.state.dataset.cls = b.state;
+  }
+
+  text(el.lv, b.level ? `L${b.level} ${b.class}` : "");
+  text(el.action, b.currentAction || "—");
+  text(el.subject, b.currentSubject ? " · " + b.currentSubject : "");
+
+  const ever = b.secondsSinceGain !== null && b.secondsSinceGain !== undefined;
+
+  text(el.sub,
+    (b.mapName || ("map " + b.mapIndex)) + " · " +
+    (b.state !== "Playing" ? b.state
+      : ever ? `kill ${ago(b.secondsSinceGain)} ago`
+      : `no kill · ${ago(b.secondsInGame)}`));
+
+  text(el.hp, `HP ${b.healthPercent}%`);
+  el.hpbar.style.width = pct(b.health, b.maxHealth) + "%";
+  text(el.mp, `MP ${b.manaPercent}%`);
+  el.mpbar.style.width = pct(b.mana, b.maxMana) + "%";
+  text(el.xp, b.experiencePercent === null
+    ? (b.atMaxLevel ? "XP max" : "XP —")
+    : `XP ${b.experiencePercent}%`);
+  el.xpbar.style.width = (b.experiencePercent ?? 0) + "%";
+}
+
+// Which bot fills the screen. Remembered, so a reload or a deploy does not throw you back to the
+// first bot every time.
+let selected = null;
+
+try { selected = localStorage.getItem("mirbot.selected"); } catch (e) { }
+
+function select(id) {
+  if (selected === id) return;
+
+  selected = id;
+  try { localStorage.setItem("mirbot.selected", id); } catch (e) { }
+
+  const detail = document.getElementById("botdetail");
+  while (detail.firstChild) detail.firstChild.remove();
+
+  for (const [botId, mini] of minis) mini.root.classList.toggle("on", botId === id);
+
+  const card = cards.get(id);
+  if (card) detail.appendChild(card.root);
+}
+
+function makeCard(id) {
+
+  const root = document.createElement("div");
+  root.className = "bot";
+  root.innerHTML = CARD_HTML;
+
+  const el = {};
+  for (const node of root.querySelectorAll("[data-r]")) el[node.dataset.r] = node;
+
+  for (const btn of root.querySelectorAll("[data-a]")) {
+    const action = btn.dataset.a;
+    btn.addEventListener("click", () =>
+      action === "go" ? goMap(id) : send(id, action));
+  }
+
+  fillMap(el.map);
+  return { root, el, sig: {} };
+}
+
+// --- patching ---------------------------------------------------------------------------------
+
+/** Assign only when different: touching textContent needlessly still costs a layout pass. */
+function text(node, value) {
+  const v = value ?? "";
+  if (node.textContent !== v) node.textContent = v;
+}
+
+function show(node, on) { node.classList.toggle("hide", !on); }
+
+/** Rewrite a table body only when its contents actually changed. */
+function rows(card, key, node, html) {
+  if (card.sig[key] === html) return;
+  card.sig[key] = html;
+  node.innerHTML = html;
+}
+
+// Ten minutes with nothing earned. The threshold the whole dot exists for.
+const STALE_SECONDS = 600;
+
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 60) return seconds + "s";
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  if (m < 60) return `${m}m${String(s).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+// Red outranks yellow outranks green, deliberately.
+//
+// A bot looping through town for an hour is the exact failure this is meant to catch, and if
+// "busy in town" could mask it the light would be green on the one bot that needs looking at.
+// Grey covers both "not playing" and "has not earned anything yet", which are the two states
+// where there is genuinely nothing to judge.
+function idleSeconds(b) {
+  // Before the first kill the clock runs from the moment the character entered the world, not
+  // from nothing. A bot fifteen minutes in with nothing to show for it is in the same trouble as
+  // one that stopped killing fifteen minutes ago, and a dash would have said nothing about the
+  // very bot most worth looking at.
+  const since = b.secondsSinceGain;
+  return (since === null || since === undefined) ? b.secondsInGame : since;
+}
+
+function dotFor(b) {
+  if (b.state !== "Playing") return "grey";
+
+  const idle = idleSeconds(b);
+  if (idle === null || idle === undefined) return "grey";
+  if (idle > STALE_SECONDS) return "red";
+  if (b.activity === "town" || b.activity === "travel") return "yellow";
+  return "green";
+}
+
+const WHY = [
+  ["sellDiagnostic",    "Selling"],
+  ["weightDiagnostic",  "Weight"],
+  ["supplyDiagnostic",  "Supplies"],
+  ["repairDiagnostic",  "Repair"],
+  ["reagentDiagnostic", "Reagents"],
+  ["bookDiagnostic",    "Books"],
+  ["gearDiagnostic",    "Gear"],
+  ["bankStatus",        "Bank"]
+];
+
+function patch(card, b) {
+  const el = card.el;
+
+  const dot = dotFor(b);
+  if (el.dot.dataset.cls !== dot) {
+    el.dot.className = "dot " + dot;
+    el.dot.dataset.cls = dot;
+  }
+
+  // Honest about which clock is being shown: claiming a "last kill" before there has been one
+  // would be a lie told by the very widget meant to catch bots that are not killing anything.
+  const ever = b.secondsSinceGain !== null && b.secondsSinceGain !== undefined;
+
+  text(el.since, b.state !== "Playing" ? ""
+    : ever ? `last kill: ${ago(b.secondsSinceGain)} ago`
+    : `no kill yet · ${ago(b.secondsInGame)} in game`);
+
+  rows(card, "why", el.why, WHY
+    .filter(([k]) => b[k])
+    .map(([k, label]) => `<div class="row"><b>${label}:</b> ${esc(b[k])}</div>`)
+    .join("") || '<div class="row detail">nothing to report</div>');
+
+  text(el.name, b.characterName || b.id);
+  text(el.state, b.state);
+  if (el.state.dataset.cls !== b.state) {
+    el.state.className = "state " + b.state;
+    el.state.dataset.cls = b.state;
+  }
+  show(el.dead, b.dead);
+
+  text(el.action, b.currentAction || "—");
+  text(el.subject, b.currentSubject ? " · " + b.currentSubject : "");
+  text(el.detail, b.currentDetail);
+
+  show(el.exit, !!b.exitReason);  text(el.exit, b.exitReason);
+  show(el.error, !!b.lastError);  text(el.error, b.lastError);
+
+  text(el.level, `${b.level} ${b.class}`);
+  text(el.hp, `${b.health}/${b.maxHealth}`);
+  el.hpbar.style.width = pct(b.health, b.maxHealth) + "%";
+  text(el.mp, `${b.mana}/${b.maxMana}`);
+  el.mpbar.style.width = pct(b.mana, b.maxMana) + "%";
+
+  text(el.xp, b.experiencePercent === null
+    ? (b.atMaxLevel ? "max level" : "—")
+    : `${b.experiencePercent}%`);
+  el.xpbar.style.width = (b.experiencePercent ?? 0) + "%";
+
+  // Gold arrives as a STRING because it can exceed 2^53 - see the comment on BotStatus. Grouping
+  // is done on the digits themselves rather than via Number(), which would quietly round it.
+  text(el.gold, String(b.gold).replace(/\B(?=(\d{3})+(?!\d))/g, ","));
+
+  drawSpark(card, goldSeries.get(b.id));
+  drawMap(card, b);
+
+  text(el.loc, `${b.mapName || ("map " + b.mapIndex)} · ${b.x},${b.y}` +
+               (b.inSafeZone ? " · safe" : ""));
+  text(el.locdetail, "map " + b.mapIndex);
+  text(el.bag, `${b.bagWeight}/${b.maxBagWeight} (${b.bagPercent}%)`);
+  text(el.trip, b.tripPhase || "—");
+  text(el.tripdetail, b.tripStatus);
+
+  text(el.counters, `${b.decisions} dec · ${b.resyncs} resync · ${b.detours} detour` +
+                    (b.droppedPackets ? ` · ${b.droppedPackets} dropped` : ""));
+  // Abbreviated on purpose: spelled out, this wrapped to five lines and made the whole card
+  // taller than the map beside it.
+  text(el.counters2,
+    `${b.casts} cast · ${b.fightsAbandoned} abandoned · ${b.dangerAvoided} avoided · ` +
+    `${b.learnedBlockedCells} cells · ${b.doorwaysCleared} doors`);
+  text(el.bank, b.bankStatus || "—");
+
+  const storage = b.storage || [];
+  text(el.equiphead, `Equipped (${b.equipment.length})`);
+  text(el.baghead, `Bag (${b.inventory.length}/48)`);
+  text(el.storehead, `Storage (${storage.length})`);
+
+  renderSlots(card, el.equip, b.equipment);
+  renderCells(card, "bag", el.baglist, b.inventory, 48);
+  renderCells(card, "store", el.storelist, storage, 0);
+
+  rows(card, "hist", el.hist, b.history.slice().reverse().map(e => `<tr>
+      <td>${esc(e.action)} ${e.count > 1 ? `<span class="count">x${e.count}</span>` : ""}</td>
+      <td>${esc(e.subject)}</td>
+      <td>${new Date(e.lastAt).toLocaleTimeString()}</td>
+    </tr>`).join(""));
+}
+
+// --- gold history -----------------------------------------------------------------------------
+//
+// Fetched on its own slow cadence, not on the 1Hz status poll. The file only gains a line every
+// five minutes, so re-reading it every second would be four pointless file scans a second on the
+// single HTTP thread that also has to serve the status.
+
+const goldSeries = new Map();
+let goldFetchedAt = 0;
+
+async function loadGold(ids) {
+  const now = Date.now();
+  if (now - goldFetchedAt < 30000) return;
+  goldFetchedAt = now;
+
+  for (const id of ids) {
+    try {
+      const r = await fetch("/api/gold?bot=" + encodeURIComponent(id), { cache:"no-store" });
+      goldSeries.set(id, await r.json());
+    } catch (e) { /* the chart is optional */ }
   }
 }
 
-function goMap(id) {
-  const sel = document.getElementById("map-" + id);
-  if (!sel || !sel.value) return;
-  send(id, "travel", "map=" + encodeURIComponent(sel.value));
+function drawSpark(card, points) {
+  const line = card.el.sparkline, fill = card.el.sparkfill;
+  if (!line) return;
+
+  if (!points || points.length < 2) {
+    if (card.sig.spark !== "") {
+      card.sig.spark = "";
+      line.removeAttribute("d");
+      fill.removeAttribute("d");
+    }
+    return;
+  }
+
+  // Number() is safe HERE and only here: these become pixel coordinates, and a gold value would
+  // have to pass nine quadrillion before the rounding moved the line by one pixel.
+  const vals = points.map(pt => Number(pt.gold));
+  const lo = Math.min(...vals), hi = Math.max(...vals), span = (hi - lo) || 1;
+  const step = 100 / (vals.length - 1);
+
+  const d = vals.map((v, i) =>
+    (i ? "L" : "M") + (i * step).toFixed(1) + "," +
+    (24 - ((v - lo) / span) * 22).toFixed(1)).join("");
+
+  if (card.sig.spark === d) return;
+  card.sig.spark = d;
+
+  line.setAttribute("d", d);
+  fill.setAttribute("d", d + "L100,26 L0,26 Z");
 }
 
-function bar(cls, value, max) {
-  return `<div class="bar ${cls}"><i style="width:${pct(value,max)}%"></i></div>`;
+// --- the map ----------------------------------------------------------------------------------
+//
+// The server sends one bit per cell, base64, row-major. That is drawn to an offscreen canvas ONCE
+// per map and then blitted, because the largest map here is 1360x1500 - two million cells, which
+// is fine to rasterise occasionally and hopeless to redraw at 1Hz.
+//
+// Only the two markers move, so each poll copies the cached bitmap and draws two dots on top.
+
+const mapCache = new Map();     // "index:version" -> offscreen canvas
+const mapPending = new Set();
+
+async function mapBitmap(index) {
+  for (const [key, value] of mapCache) if (key.startsWith(index + ":")) return value;
+
+  if (mapPending.has(index)) return null;
+  mapPending.add(index);
+
+  try {
+    const m = await (await fetch("/api/map?index=" + index)).json();
+    const off = document.createElement("canvas");
+    off.width = m.width; off.height = m.height;
+
+    const ctx = off.getContext("2d");
+    const img = ctx.createImageData(m.width, m.height);
+
+    // atob gives a binary string; one bit per cell, in the same row-major order the server packed.
+    const bytes = atob(m.mask);
+
+    for (let i = 0, n = m.width * m.height; i < n; i++) {
+      const walkable = (bytes.charCodeAt(i >> 3) >> (i & 7)) & 1;
+      const o = i * 4;
+
+      // Walkable is the lighter of the two: the eye should pick out the floor, not the rock.
+      img.data[o] = img.data[o + 1] = img.data[o + 2] = walkable ? 58 : 22;
+      img.data[o + 3] = 255;
+    }
+
+    ctx.putImageData(img, 0, 0);
+    mapCache.set(index + ":" + m.version, off);
+    return off;
+  } catch (e) {
+    return null;
+  } finally {
+    mapPending.delete(index);
+  }
+}
+
+async function drawMap(card, b) {
+  const canvas = card.el.canvas;
+  if (!canvas) return;
+
+  if (!b.mapIndex) { text(card.el.legend, ""); return; }
+
+  const off = await mapBitmap(b.mapIndex);
+
+  if (!off) {
+    text(card.el.legend, "no grid for this map");
+    return;
+  }
+
+  if (canvas.width !== off.width || canvas.height !== off.height) {
+    canvas.width = off.width;
+    canvas.height = off.height;
+  }
+
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(off, 0, 0);
+
+  // Markers scale with the map so they stay visible on a 1360-wide cave and do not swamp a
+  // 200-wide town.
+  const r = Math.max(2, Math.round(off.width / 160));
+
+  if (b.destX !== null && b.destX !== undefined) {
+    ctx.strokeStyle = "#e2b341";
+    ctx.lineWidth = Math.max(1, r / 2);
+    ctx.beginPath();
+    ctx.moveTo(b.destX - r, b.destY - r); ctx.lineTo(b.destX + r, b.destY + r);
+    ctx.moveTo(b.destX + r, b.destY - r); ctx.lineTo(b.destX - r, b.destY + r);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#6aa9ff";
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  text(card.el.legend,
+    (b.destX !== null && b.destX !== undefined)
+      ? `${off.width}x${off.height} · you ${b.x},${b.y} · heading ${b.destX},${b.destY}`
+      : `${off.width}x${off.height} · you ${b.x},${b.y}`);
+}
+
+// --- memory views -----------------------------------------------------------------------------
+// --- memory views -----------------------------------------------------------------------------
+//
+// Only fetched while the panel is open, and then slowly. These read files and copy lists; there is
+// no reason to pay for it when nobody is looking at them.
+
+const money = n => Math.round(n).toLocaleString();
+const group = v => String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+// The rows are fetched slowly and kept, so sorting, searching and filtering are all local and
+// instant. State lives here rather than in the DOM because the table body is rewritten whenever
+// anything changes - the controls themselves sit OUTSIDE it and are built once, so a half-typed
+// search term is never destroyed.
+
+let huntRows = [];
+let huntBots = [];
+
+const huntState = { key: "score", dir: -1, q: "", cls: "", mine: false, hideLethal: false,
+                    measuredOnly: false };
+
+const HUNT_COLS = [
+  { key: "mapName",        label: "Map",     num: false },
+  { key: "class",          label: "Class",   num: false },
+  { key: "levelBand",      label: "Band",    num: true  },
+  { key: "averagePerHour", label: "Avg/h",   num: true  },
+  { key: "bestPerHour",    label: "Best/h",  num: true  },
+  { key: "hoursSampled",   label: "Hours",   num: true  },
+  { key: "deaths",         label: "Deaths",  num: true  },
+  { key: "score",          label: "Score",   num: true  }
+];
+
+function huntFiltered() {
+  const here = new Set(huntBots.map(b => b.class + "|" + b.mapIndex));
+  const q = huntState.q.trim().toLowerCase();
+
+  let rows = huntRows.filter(r => {
+    if (huntState.hideLethal && r.lethal) return false;
+    if (huntState.measuredOnly && !(r.averagePerHour > 0)) return false;
+    if (huntState.cls && r.class !== huntState.cls) return false;
+    if (huntState.mine && !here.has(r.class + "|" + r.mapIndex)) return false;
+    if (q && !(r.mapName + " " + r.class).toLowerCase().includes(q)) return false;
+    return true;
+  });
+
+  const key = huntState.key, dir = huntState.dir;
+
+  rows.sort((a, b) => {
+    const x = a[key], y = b[key];
+    const c = typeof x === "string" ? x.localeCompare(y) : (x - y);
+    return c * dir;
+  });
+
+  return { rows, here };
+}
+
+function renderHunting() {
+  const { rows, here } = huntFiltered();
+
+  document.getElementById("huntcount").textContent =
+    rows.length === huntRows.length
+      ? `${huntRows.length} record(s)`
+      : `${rows.length} of ${huntRows.length} record(s)`;
+
+  const head = HUNT_COLS.map(c => {
+    const active = huntState.key === c.key;
+    const arrow = active ? `<span class="arrow">${huntState.dir < 0 ? "\u25be" : "\u25b4"}</span>` : "";
+    return `<th class="sortable${c.num ? " num" : ""}" data-sort="${c.key}">${c.label} ${arrow}</th>`;
+  }).join("");
+
+  document.getElementById("hunttable").innerHTML = "<table><tr>" + head + "</tr>" +
+    rows.map(r => {
+      const cls = r.lethal ? "lethal" : here.has(r.class + "|" + r.mapIndex) ? "here" : "";
+      return "<tr class='" + cls + "'><td>" + esc(r.mapName) +
+        (r.lethal ? "<span class='tag bad'>lethal</span>" : "") + "</td>" +
+        "<td>" + esc(r.class) + "</td><td class='num'>" + r.levelBand + "</td>" +
+        "<td class='num'>" + money(r.averagePerHour) + "</td>" +
+        "<td class='num'>" + money(r.bestPerHour) + "</td>" +
+        "<td class='num'>" + r.hoursSampled.toFixed(2) + "</td>" +
+        "<td class='num'>" + r.deaths + "</td>" +
+        "<td class='num'>" + money(r.score) + "</td></tr>";
+    }).join("") +
+    (rows.length ? "" : "<tr><td colspan='8' class='detail'>nothing matches</td></tr>") +
+    "</table>";
+
+  for (const th of document.querySelectorAll("#hunttable th.sortable")) {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+
+      // Same column flips direction; a new column starts descending for numbers and ascending
+      // for names, which is what you almost always want first.
+      if (huntState.key === key) huntState.dir = -huntState.dir;
+      else {
+        huntState.key = key;
+        huntState.dir = HUNT_COLS.find(c => c.key === key).num ? -1 : 1;
+      }
+
+      renderHunting();
+    });
+  }
+}
+
+function huntClasses() {
+  const sel = document.getElementById("huntclass");
+  const classes = [...new Set(huntRows.map(r => r.class))].filter(Boolean).sort();
+  const sig = classes.join(",");
+
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+
+  const chosen = sel.value;
+  sel.innerHTML = "<option value=''>all classes</option>" +
+    classes.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  sel.value = chosen;
+}
+
+async function loadHunting(bots) {
+  huntBots = bots;
+
+  try { huntRows = await (await fetch("/api/hunting", { cache:"no-store" })).json(); }
+  catch (e) { return; }
+
+  huntClasses();
+  renderHunting();
+}
+
+document.getElementById("huntq").addEventListener("input", e => {
+  huntState.q = e.target.value; renderHunting();
+});
+document.getElementById("huntclass").addEventListener("change", e => {
+  huntState.cls = e.target.value; renderHunting();
+});
+for (const [id, field] of [["huntmine","mine"], ["huntlethal","hideLethal"],
+                           ["huntmeasured","measuredOnly"]]) {
+  document.getElementById(id).addEventListener("change", e => {
+    huntState[field] = e.target.checked; renderHunting();
+  });
+}
+
+async function loadDeaths() {
+  let rows;
+  try { rows = await (await fetch("/api/deaths?take=60", { cache:"no-store" })).json(); }
+  catch (e) { return; }
+
+  const box = document.getElementById("deathtable");
+
+  if (!rows.length) {
+    box.innerHTML = "<div class='detail'>none recorded yet</div>";
+    return;
+  }
+
+  box.innerHTML = "<table><tr><th>When</th><th>Who</th><th class='num'>Lvl</th><th>Map</th>" +
+    "<th>Killed by</th><th class='num'>Gold held</th><th>Where</th></tr>" +
+    rows.map(d => "<tr><td>" + new Date(d.utc).toLocaleString() + "</td>" +
+      "<td>" + esc(d.character || d.bot) + "</td><td class='num'>" + d.level + "</td>" +
+      "<td>" + esc(d.mapName) + "</td><td>" + esc(d.killer) + "</td>" +
+      "<td class='num'>" + group(d.gold) + "</td>" +
+      "<td>" + d.x + "," + d.y + "</td></tr>").join("") + "</table>";
+}
+
+let memFetchedAt = 0;
+
+async function loadMemory(bots) {
+  const now = Date.now();
+  if (now - memFetchedAt < 30000) return;
+  memFetchedAt = now;
+
+  if (document.getElementById("huntmem").open) loadHunting(bots);
+  if (document.getElementById("deathmem").open) loadDeaths();
+}
+
+for (const id of ["huntmem", "deathmem"]) {
+  document.getElementById(id).addEventListener("toggle", () => { memFetchedAt = 0; });
+}
+
+// --- settings, for the whole host -------------------------------------------------------------
+//
+// One form, not one per bot. Settings express how the operator wants the bots to play, and four
+// copies of that question on four cards was both a lot of scrolling and an invitation to let the
+// bots drift apart. They are still STORED per bot, in four ini files, so they can still disagree -
+// a field marked "mixed" says so rather than showing one bot's value as though it were the truth.
+//
+// Built once. The values refresh on a slow cadence, and a field you are editing is never
+// overwritten underneath you.
+
+let cfgFields = [];
+let cfgBuilt = false;
+let cfgInputs = new Map();
+let cfgFetchedAt = 0;
+
+async function setConfigAll(key, value) {
+  try {
+    const r = await fetch(`/api/config?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`,
+                          { method:"POST", headers:{ "X-MirBot":"1" } });
+
+    const body = await r.json().catch(() => ({}));
+
+    if (!r.ok) return { error: body.error || ("rejected (" + r.status + ")") };
+    return { bots: body.bots };
+  } catch (e) {
+    return { error: "could not reach the host" };
+  }
+}
+
+function cfgSay(message, bad) {
+  const box = document.getElementById("cfgresult");
+  text(box, message);
+  box.style.color = bad ? "var(--bad)" : "var(--good)";
+}
+
+function buildConfigForm() {
+  const groups = [];
+
+  for (const f of cfgFields) {
+    let g = groups.find(x => x.name === f.group);
+    if (!g) groups.push(g = { name: f.group, fields: [] });
+    g.fields.push(f);
+  }
+
+  document.getElementById("cfgform").innerHTML = groups.map(g =>
+    `<div class="cfggroup"><b>${esc(g.name)}</b>` +
+    g.fields.map(f => `<div class="cfgrow">
+        <span class="name">${esc(f.key)}</span>
+        ${f.kind === 1
+          ? `<select data-key="${esc(f.key)}">
+               <option value="true">true</option><option value="false">false</option></select>`
+          : `<input type="number" data-key="${esc(f.key)}" min="${f.min}" max="${f.max}">`}
+        <span class="note">${esc(f.note)}</span>
+        <span class="reach" data-mixed="${esc(f.key)}"></span>
+      </div>`).join("") + `</div>`).join("");
+
+  cfgInputs = new Map();
+
+  for (const input of document.querySelectorAll("#cfgform [data-key]")) {
+    const key = input.dataset.key;
+    cfgInputs.set(key, input);
+
+    const commit = async () => {
+      if (input.value === input.dataset.served) return;
+
+      const result = await setConfigAll(key, input.value);
+
+      if (result.error) {
+        cfgSay(`${key}: ${result.error}`, true);
+        input.value = input.dataset.served;      // never leave a refused value looking accepted
+      } else {
+        cfgSay(`${key} = ${input.value} on ${result.bots} bot(s)`, false);
+        cfgFetchedAt = 0;                        // read it back promptly
+      }
+
+      // Either way this is no longer an uncommitted edit, so it goes back to tracking the bots.
+      input.classList.remove("dirty");
+    };
+
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); input.blur(); }
+      if (e.key === "Escape") { input.value = input.dataset.served; input.blur(); }
+    });
+
+    input.addEventListener("change", commit);
+    input.addEventListener("blur", commit);
+    input.addEventListener("input", () =>
+      input.classList.toggle("dirty", input.value !== input.dataset.served));
+  }
+
+  cfgBuilt = true;
+}
+
+function patchConfigForm() {
+  if (!cfgBuilt) buildConfigForm();
+
+  for (const f of cfgFields) {
+    const input = cfgInputs.get(f.key);
+    if (!input) continue;
+
+    input.dataset.served = f.value;
+
+    const flag = document.querySelector(`[data-mixed="${CSS.escape(f.key)}"]`);
+    if (flag) {
+      text(flag, f.mixed ? "mixed: " + f.perBot.join(" / ")
+                         : (f.reach === 1 ? "re-applied" : ""));
+      flag.style.color = f.mixed ? "var(--warn)" : "var(--dim)";
+    }
+
+    if (input.value === f.value) input.classList.remove("dirty");
+    if (document.activeElement === input) continue;
+    if (input.classList.contains("dirty")) continue;
+    if (input.value !== f.value) input.value = f.value;
+  }
+}
+
+async function loadConfig() {
+  const now = Date.now();
+  if (now - cfgFetchedAt < 5000) return;
+  cfgFetchedAt = now;
+
+  try { cfgFields = await (await fetch("/api/config", { cache:"no-store" })).json(); }
+  catch (e) { return; }
+
+  patchConfigForm();
+}
+
+// --- page tabs --------------------------------------------------------------------------------
+
+let activeTab = "bots";
+
+function showTab(name) {
+  activeTab = name;
+
+  for (const id of ["bots", "settings"]) {
+    document.getElementById("tab-" + id).classList.toggle("on", id === name);
+    document.getElementById("page-" + id).classList.toggle("hide", id !== name);
+  }
+
+  if (name === "settings") { cfgFetchedAt = 0; loadConfig(); }
+}
+
+document.getElementById("tab-bots").addEventListener("click", () => showTab("bots"));
+document.getElementById("tab-settings").addEventListener("click", () => showTab("settings"));
+
+// --- items ------------------------------------------------------------------------------------
+//
+// A grid of tiles rather than three columns of text. The tiles are coloured by item type and the
+// detail lives in a tooltip, which is how the game itself presents a bag - and it makes "what is
+// this bot carrying" a glance instead of a read.
+//
+// Deliberately built to work with NO artwork. The client's sprites are in a container format
+// nothing in this project can decode yet, so every cell carries its image index and renders a
+// coloured tile with an abbreviated name. If icons ever appear under /icons/, the img swaps in and
+// nothing else changes.
+
+const TYPE_CLASS = {
+  Weapon:"t-weapon", Armour:"t-armour", Helmet:"t-armour", Shoes:"t-armour", Belt:"t-armour",
+  Necklace:"t-jewel", Bracelet:"t-jewel", Ring:"t-jewel", Torch:"t-scroll",
+  Consumable:"t-potion", Book:"t-book", Ore:"t-ore", Meat:"t-ore", Nothing:"t-ore",
+  Amulet:"t-reagent", Poison:"t-reagent", ItemPart:"t-part", Gem:"t-jewel"
+};
+
+// Every item on show, by cell id, so the tooltip can find one without another lookup.
+//
+// Keys are STABLE - pane plus position, nothing else. They used to carry a sequence number that
+// changed on every render, which made the generated HTML differ every tick even when the bag had
+// not moved. The signature never matched, the grid was rewritten once a second, and an <img> was
+// destroyed and recreated before it could ever finish loading. Only one detail card exists at a
+// time, so pane+position is unique, and a stale entry is simply overwritten.
+const itemIndex = new Map();
+
+function shortName(name) {
+  // Two or three initials read better at 38px than a truncated word.
+  const words = String(name).replace(/[()]/g, "").split(/\s+/).filter(Boolean);
+  if (words.length === 1) return words[0].slice(0, 4);
+  return words.slice(0, 3).map(w => w[0]).join("").toUpperCase();
+}
+
+function cellHtml(item, key) {
+  if (!item) return `<div class="cell"></div>`;
+
+  itemIndex.set(key, item);
+
+  const cls = TYPE_CLASS[item.type] || "t-ore";
+  const wear = item.maxDurability > 0 && item.durability === 0 ? " broken"
+             : item.maxDurability > 0 && item.durability * 100 / item.maxDurability <= 30 ? " worn"
+             : "";
+
+  // The artwork if it is there, the initials if it is not.
+  //
+  // Both are rendered: the label sits underneath and the image covers it, so an icon that 404s
+  // simply removes itself and the tile is already correct. No probing, no flicker, and a client
+  // whose icons were never extracted looks exactly as it did before they existed.
+  return `<div class="cell full ${cls}${wear}" data-item="${key}">` +
+         `<span class="lbl">${esc(shortName(item.name))}</span>` +
+         `<img src="/icons/${item.image}.png" alt="" ` +
+              `onload="this.parentNode.classList.add('art')" ` +
+              `onerror="this.remove()">` +
+         (item.count > 1 ? `<span class="n">${item.count}</span>` : "") +
+         `</div>`;
+}
+
+function renderCells(card, sigKey, node, items, size) {
+  const list = new Array(size).fill(null);
+
+  for (const it of items) {
+    if (it.slot >= 0 && it.slot < size) list[it.slot] = it;
+  }
+
+  // Storage and the parts grid use offset slot numbers, so anything that did not land goes on
+  // the end rather than vanishing.
+  for (const it of items) if (!list.includes(it)) list.push(it);
+
+  const html = list.map((it, i) => cellHtml(it, `${sigKey}-${i}`)).join("");
+
+  if (card.sig[sigKey] === html) return;
+  card.sig[sigKey] = html;
+  node.innerHTML = html;
+}
+
+// The order the game's own character screen uses, read off it rather than off the enum - the
+// enum is declaration order (Weapon, Armour, Helmet, Torch, ...) and puts the weapon above the
+// helmet, which reads as nothing in particular.
+//
+// Laid out as two columns flowing DOWN, the way the dialog flanks the character: body and hands on
+// the left, jewellery on the right.
+const EQUIP_ORDER = [
+  "Helmet", "Necklace",
+  "Armour", "BraceletL",
+  "Weapon", "BraceletR",
+  "Shoes",  "RingL",
+  "Torch",  "RingR",
+  "Amulet", "Poison"
+];
+
+function renderSlots(card, node, equipment) {
+  const worn = new Map(equipment.map(e => [e.slot, e]));
+
+  // Every slot in the list, occupied or not. An empty slot is information - "no shield", "no
+  // amulet" - and hiding it made the panel change shape whenever a bot equipped something.
+  const order = EQUIP_ORDER.slice();
+
+  // Anything worn that the list does not mention still has to appear; better an odd position than
+  // a silently missing item.
+  for (const e of equipment) if (!order.includes(e.slot)) order.push(e.slot);
+
+  const html = order.map((slot, i) => {
+    const e = worn.get(slot);
+    const key = `eq-${i}`;
+
+    if (!e)
+      return `<div class="slot empty"><div class="cell"></div>` +
+             `<div class="who"><div class="s">${esc(slot)}</div>` +
+             `<div class="i">&mdash;</div></div></div>`;
+
+    return `<div class="slot">` +
+      (e.item ? cellHtml(e.item, key) : `<div class="cell"></div>`) +
+      `<div class="who"><div class="s">${esc(slot)}</div>` +
+      `<div class="i${e.broken ? " broken" : e.worn ? " worn" : ""}">${esc(e.name)}` +
+      ` ${e.durability}/${e.maxDurability}</div></div></div>`;
+  }).join("");
+
+  if (card.sig.equip === html) return;
+  card.sig.equip = html;
+  node.innerHTML = html;
+}
+
+// --- the tooltip ------------------------------------------------------------------------------
+
+const tip = document.getElementById("tip");
+
+function statRows(list, extra) {
+  return list.map(st =>
+    `<div class="st ${extra || ""}"><b>${esc(st.name)}</b><span>` +
+    `${st.amount > 0 ? "+" : ""}${st.amount}</span></div>`).join("");
+}
+
+function showTip(item, x, y) {
+  const parts = [`<div class="tn">${esc(item.name)}` +
+                 (item.count > 1 ? ` <span class="n">x${item.count}</span>` : "") + `</div>`,
+                 `<div class="tt">${esc(item.type)}` +
+                 (item.slot >= 0 ? ` · slot ${item.slot}` : "") + `</div>`];
+
+  if (item.maxDurability > 0)
+    parts.push(`<div class="st"><b>Durability</b><span>${item.durability}/${item.maxDurability}` +
+               `</span></div>`);
+
+  if (item.stats?.length) parts.push(statRows(item.stats));
+  if (item.added?.length) parts.push(`<hr>` + statRows(item.added, "add"));
+  if (item.sockets?.length)
+    parts.push(`<div class="st"><b>Sockets</b><span>${esc(item.sockets.join(", "))}</span></div>`);
+
+  parts.push(`<hr><div class="st"><b>Weight</b><span>${item.weight}</span></div>`);
+  if (item.price > 0)
+    parts.push(`<div class="st"><b>Price</b><span>${group(item.price)}</span></div>`);
+  if (item.flags) parts.push(`<div class="st"><b>Flags</b><span>${esc(item.flags)}</span></div>`);
+  if (!item.canSell) parts.push(`<div class="req">cannot be sold</div>`);
+  if (item.requirement) parts.push(`<div class="req">needs ${esc(item.requirement)}</div>`);
+  if (item.description) parts.push(`<div class="desc">${esc(item.description)}</div>`);
+
+  tip.innerHTML = parts.join("");
+  tip.style.display = "block";
+
+  // Keep it on screen: flip to the other side of the cursor near an edge rather than letting the
+  // box run off and clip.
+  const box = tip.getBoundingClientRect();
+  const left = x + 14 + box.width > window.innerWidth ? x - box.width - 14 : x + 14;
+  const top = y + 12 + box.height > window.innerHeight ? y - box.height - 12 : y + 12;
+
+  tip.style.left = Math.max(4, left) + "px";
+  tip.style.top = Math.max(4, top) + "px";
+}
+
+// One listener on the document rather than one per cell: cells are rewritten whenever a bag
+// changes, and per-cell listeners would leak with them.
+document.addEventListener("mouseover", e => {
+  const cell = e.target.closest?.("[data-item]");
+  if (!cell) return;
+
+  const item = itemIndex.get(cell.dataset.item);
+  if (item) showTip(item, e.clientX, e.clientY);
+});
+
+document.addEventListener("mousemove", e => {
+  if (tip.style.display !== "block") return;
+  const cell = e.target.closest?.("[data-item]");
+  if (!cell) { tip.style.display = "none"; return; }
+
+  const item = itemIndex.get(cell.dataset.item);
+  if (item) showTip(item, e.clientX, e.clientY);
+});
+
+document.addEventListener("mouseout", e => {
+  if (e.target.closest?.("[data-item]")) tip.style.display = "none";
+});
+
+// --- render -----------------------------------------------------------------------------------
+// --- render -----------------------------------------------------------------------------------
+
+// Loops and deadlocks are what this codebase produces; crashes are rare. These are the three
+// shapes that have actually bitten, phrased so the banner says what to go and look at.
+function alertsFor(h) {
+  const out = [];
+
+  for (const b of h.bots) {
+    if (b.state !== "Playing") continue;
+
+    const idle = idleSeconds(b);
+
+    if (idle > STALE_SECONDS)
+      out.push([`${b.characterName || b.id} has earned nothing for ${ago(idle)} ` +
+                `(${b.activity})`, false]);
+
+    const trips = b.uptimeSeconds > 600 ? b.tripSequence / (b.uptimeSeconds / 3600) : 0;
+    if (trips >= 8)
+      out.push([`${b.characterName || b.id} has made ${b.tripSequence} town trips in ` +
+                `${Math.round(b.uptimeSeconds / 60)} min — check "Why not?"`, true]);
+
+    if (b.sellRefusals > 0)
+      out.push([`${b.characterName || b.id}: ${b.sellRefusals} sell order(s) refused whole — ` +
+                `the bag listing may not match what it is really carrying`, false]);
+  }
+
+  return out;
+}
+
+let alertSig = "";
+
+function renderAlerts(h) {
+  const list = alertsFor(h);
+  const sig = JSON.stringify(list);
+  if (sig === alertSig) return;
+  alertSig = sig;
+
+  document.getElementById("alerts").innerHTML = list
+    .map(([msg, warn]) => `<div class="alert${warn ? " warn" : ""}">${esc(msg)}</div>`)
+    .join("");
 }
 
 function render(h) {
-  document.getElementById("host").textContent =
-    `${h.server} · db ${h.databaseVersion} · ${h.bots.length} bot(s)`;
-  document.getElementById("foot").textContent =
+  renderAlerts(h);
+  text(document.getElementById("host"),
+    `${h.server} · db ${h.databaseVersion} · ${h.bots.length} bot(s)`);
+  text(document.getElementById("foot"),
     `updated ${new Date(h.generatedAt).toLocaleTimeString()} · host up ${h.uptimeSeconds}s ` +
-    `· ${h.magicCount} skills, ${h.monsterCount} monsters, ${h.vendorPages} trading pages`;
+    `· ${h.magicCount} skills, ${h.monsterCount} monsters, ${h.vendorPages} trading pages`);
 
-  document.getElementById("bots").innerHTML = h.bots.map(b => {
-    const xp = b.experiencePercent === null
-      ? (b.atMaxLevel ? "max level" : "—")
-      : `${b.experiencePercent}%`;
+  const seen = new Set();
 
-    const equip = b.equipment.map(e => `<tr>
-        <td>${esc(e.slot)}</td><td>${esc(e.name)}</td>
-        <td class="${e.broken ? "broken" : e.worn ? "worn" : ""}">
-          ${e.durability}/${e.maxDurability}${e.broken ? " BROKEN" : e.worn ? " worn" : ""}</td>
-      </tr>`).join("");
+  for (const b of h.bots) {
+    seen.add(b.id);
 
-    const bag = b.inventory.map(i => `<tr>
-        <td>${i.slot}</td><td>${esc(i.name)}</td><td>${i.count > 1 ? "x"+i.count : ""}</td>
-      </tr>`).join("");
+    let mini = minis.get(b.id);
 
-    const hist = b.history.slice().reverse().map(e => `<tr>
-        <td>${esc(e.action)} ${e.count > 1 ? `<span class="count">x${e.count}</span>` : ""}</td>
-        <td>${esc(e.subject)}</td>
-        <td>${new Date(e.lastAt).toLocaleTimeString()}</td>
-      </tr>`).join("");
+    if (!mini) {
+      mini = makeMini(b.id);
+      minis.set(b.id, mini);
+      stripEl.appendChild(mini.root);
+    }
 
-    return `<div class="bot">
-      <div class="top">
-        <span class="name">${esc(b.characterName || b.id)}</span>
-        <span class="state ${esc(b.state)}">${esc(b.state)}</span>
-        ${b.dead ? '<span class="dead">DEAD</span>' : ""}
-        <span style="margin-left:auto">
-          <button onclick="send('${esc(b.id)}','start')">Start</button>
-          <button onclick="send('${esc(b.id)}','stop')">Stop</button>
-          <button onclick="send('${esc(b.id)}','towntrip')">Town trip</button>
-          <button onclick="send('${esc(b.id)}','travel')">Travel</button>
-          <select id="map-${esc(b.id)}"></select>
-          <button onclick="goMap('${esc(b.id)}')">Go</button>
-          <button onclick="send('${esc(b.id)}','revive')">Revive</button>
-        </span>
-      </div>
+    patchMini(mini, b);
+  }
 
-      <div class="action"><b>${esc(b.currentAction) || "—"}</b>
-        ${b.currentSubject ? " · " + esc(b.currentSubject) : ""}
-        <div class="detail">${esc(b.currentDetail)}</div></div>
+  // Nothing chosen yet, or the chosen bot has gone away: fall back to the first.
+  if (!selected || !seen.has(selected)) {
+    selected = null;
+    if (h.bots.length) select(h.bots[0].id);
+  }
 
-      ${b.exitReason ? `<div class="err">${esc(b.exitReason)}</div>` : ""}
-      ${b.lastError ? `<div class="err">${esc(b.lastError)}</div>` : ""}
+  const chosen = h.bots.find(b => b.id === selected);
 
-      <div class="grid">
-        <div><div class="k">Level</div><div class="v">${b.level} ${esc(b.class)}</div></div>
-        <div><div class="k">HP</div><div class="v">${b.health}/${b.maxHealth}</div>
-             ${bar("hp", b.health, b.maxHealth)}</div>
-        <div><div class="k">MP</div><div class="v">${b.mana}/${b.maxMana}</div>
-             ${bar("mp", b.mana, b.maxMana)}</div>
-        <div><div class="k">Experience</div><div class="v">${xp}</div>
-             ${bar("xp", b.experiencePercent ?? 0, 100)}</div>
-        <div><div class="k">Gold</div><div class="v">${Number(b.gold).toLocaleString()}</div></div>
-        <div><div class="k">Location</div>
-             <div class="v">${esc(b.mapName) || ("map " + b.mapIndex)} · ${b.x},${b.y}${b.inSafeZone ? " · safe" : ""}</div>
-             <div class="detail">map ${b.mapIndex}</div></div>
-        <div><div class="k">Bag</div><div class="v">${b.bagWeight}/${b.maxBagWeight} (${b.bagPercent}%)</div></div>
-        <div><div class="k">Town trip</div><div class="v">${esc(b.tripPhase) || "—"}</div>
-             <div class="detail">${esc(b.tripStatus)}</div></div>
-        <div><div class="k">Counters</div>
-             <div class="v">${b.decisions} dec · ${b.resyncs} resync · ${b.detours} detour
-             ${b.droppedPackets ? ` · <span class="broken">${b.droppedPackets} dropped</span>` : ""}</div>
-             <div class="detail">${b.casts} cast · ${b.fightsAbandoned} given up ·
-             ${b.dangerAvoided} avoided · ${b.learnedBlockedCells} cells learned</div></div>
-        <div><div class="k">Bank</div><div class="v">${esc(b.bankStatus) || "—"}</div></div>
-      </div>
+  if (chosen) {
+    let card = cards.get(chosen.id);
 
-      <div class="cols">
-        <div><table><tr><th>Slot</th><th>Equipped</th><th>Durability</th></tr>${equip}</table></div>
-        <div><table><tr><th>#</th><th>Bag</th><th></th></tr>${bag}</table></div>
-      </div>
+    if (!card) {
+      card = makeCard(chosen.id);
+      cards.set(chosen.id, card);
+    }
 
-      <div class="hist"><table><tr><th>Action</th><th>Subject</th><th>When</th></tr>${hist}</table></div>
-    </div>`;
-  }).join("");
+    // Built lazily and only attached while selected, so the detail card for a bot you are not
+    // looking at is neither drawn nor patched.
+    const detail = document.getElementById("botdetail");
+    if (card.root.parentNode !== detail) {
+      while (detail.firstChild) detail.firstChild.remove();
+      detail.appendChild(card.root);
+    }
+
+    for (const [botId, mini] of minis) mini.root.classList.toggle("on", botId === chosen.id);
+
+    patch(card, chosen);
+  }
+
+  loadGold(selected ? [selected] : []);
+  loadMemory(h.bots);
+  if (activeTab === "settings") loadConfig();
+
+  for (const [id, mini] of minis) {
+    if (seen.has(id)) continue;
+    mini.root.remove();
+    minis.delete(id);
+    cards.get(id)?.root.remove();
+    cards.delete(id);
+  }
 }
 
 async function refresh() {
-  // The whole card is rebuilt from innerHTML each poll, which destroys and recreates every
-  // <select> - so an open dropdown closed itself about once a second and was unusable. While
-  // one has focus the refresh is skipped entirely; the numbers can wait a moment.
-  const a = document.activeElement;
-  if (a && (a.tagName === "SELECT" || a.dataset?.holdRefresh)) return;
-
+  // No focus guard any more. Cards are patched rather than rebuilt, so a focused select, a
+  // half-typed input and a hovered row all survive a poll - which is the whole point of 0c.
   try {
     const r = await fetch("/api/status", { cache:"no-store" });
     render(await r.json());
-    fillMaps();
   } catch (e) {
-    document.getElementById("foot").textContent = "host unreachable — " + e;
+    text(document.getElementById("foot"), "host unreachable — " + e);
   }
 }
 

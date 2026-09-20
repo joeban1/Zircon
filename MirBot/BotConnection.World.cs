@@ -45,7 +45,8 @@ namespace MirBot
 
             World.AddMonster(p.ObjectID,
                 !string.IsNullOrEmpty(p.CustomName) ? p.CustomName : info?.MonsterName ?? "monster",
-                info?.AI ?? 0, p.Location, p.Direction, p.Dead);
+                info?.AI ?? 0, p.Location, p.Direction, p.Dead,
+                p.PetOwner, p.MonsterIndex, p.Poison);
         }
 
         public void Process(S.ObjectNPC p)
@@ -67,10 +68,47 @@ namespace MirBot
 
         public void Process(S.DataObjectMonster p)
         {
+            // Ownership has to be read from BOTH monster packets. Handling only S.ObjectMonster
+            // leaves a pet that arrives through the data path looking wild, and a pet that looks
+            // wild is a target.
             World.AddMonster(p.ObjectID, p.MonsterInfo?.MonsterName ?? "monster",
-                p.MonsterInfo?.AI ?? 0, p.CurrentLocation, MirDirection.Up, p.Dead);
+                p.MonsterInfo?.AI ?? 0, p.CurrentLocation, MirDirection.Up, p.Dead,
+                p.PetOwner, p.MonsterIndex);
             World.ApplyHealthMana(p.ObjectID, p.Health, 0, p.Dead);
         }
+
+        /// <summary>A monster was tamed, released, or a summon's tame time ran out.</summary>
+        public void Process(S.ObjectPetOwnerChanged p) => World.ApplyPetOwner(p.ObjectID, p.PetOwner);
+
+        /// <summary>
+        /// The aggregate poison mask changed on something. Broadcast only on CHANGE
+        /// (MapObject.cs:405), so this is the authoritative "is it poisoned" signal and the reason
+        /// the bot needs no duration tracking of its own.
+        /// </summary>
+        public void Process(S.ObjectPoison p) => World.ApplyPoison(p.ObjectID, p.Poison);
+
+        #region Buffs
+
+        // Nothing here assumes a duration. S.BuffAdd carries RemainingTime, expiry arrives as an
+        // ordinary S.BuffRemove, and the login dump seeds the lot - so "do I have this buff" is
+        // always the server's answer, never a guess that can drift.
+        //
+        // All four of the others identify a buff by INDEX, which is why the store is keyed that way.
+
+        public void Process(S.BuffAdd p) => World.AddBuff(p.Buff);
+
+        public void Process(S.BuffRemove p) => World.RemoveBuff(p.Index);
+
+        public void Process(S.BuffChanged p) => World.ChangeBuff(p.Index, p.Stats);
+
+        public void Process(S.BuffTime p) => World.SetBuffTime(p.Index, p.Time);
+
+        public void Process(S.BuffPaused p) => World.SetBuffPaused(p.Index, p.Paused);
+
+        #endregion
+
+        /// <summary>The server confirming a pet-mode change. One mode covers every pet we own.</summary>
+        public void Process(S.ChangePetMode p) => World.ApplyPetMode(p.Mode);
 
         public void Process(S.DataObjectItem p)
         {
@@ -102,7 +140,17 @@ namespace MirBot
 
         public void Process(S.ObjectHarvest p) => World.ApplyTurn(p.ObjectID, p.Direction, p.Location);
 
-        public void Process(S.ObjectRemove p) => World.ApplyRemove(p.ObjectID);
+        public void Process(S.ObjectRemove p)
+        {
+            World.ApplyRemove(p.ObjectID);
+
+            // Object ids are recycled. Anything the bot remembers ABOUT an id has to die with the
+            // object, or it silently applies to whatever inherits the number next.
+            OnObjectGone?.Invoke(p.ObjectID);
+        }
+
+        /// <summary>Raised when an object leaves our view, so per-object bookkeeping can be cleared.</summary>
+        public Action<uint> OnObjectGone;
 
         /// <summary>True while the server is driving our movement via AutoPathService.</summary>
         public bool AutoPathing;
@@ -246,6 +294,12 @@ namespace MirBot
 
             if (attacker == null || attacker.Kind != ObjectKind.Monster) return;
 
+            // Never learn danger from an owned monster. A pet cannot hurt its owner, but another
+            // player's can, and either way the damage says nothing about what that monster KIND is
+            // worth fighting - which is the only thing MonsterMemory is for. One mislearnt entry
+            // makes the bot refuse a whole species for ever.
+            if (attacker.IsPet) return;
+
             OnDamaged?.Invoke(attacker.Name, -p.Change);
         }
 
@@ -268,6 +322,50 @@ namespace MirBot
         #endregion
 
         #region Inventory
+
+        /// <summary>
+        /// Sales the server threw out whole, this connection.
+        ///
+        /// Per-connection rather than persistent, because the thing it detects - the model and the
+        /// bag drifting apart - is itself cured by a relog. A non-zero count here means the page
+        /// should stop trusting the bag listing until the bot reconnects.
+        /// </summary>
+        public int SellRefusals;
+
+        /// <summary>What we last asked a shop to take, pending its answer.</summary>
+        private List<CellLinkInfo> _pendingSell;
+
+        /// <summary>
+        /// The server's verdict on a sale.
+        ///
+        /// Success carries the links it actually took - ParseLinks merges duplicate slots on the
+        /// way in, so these are authoritative in a way the request is not. A false Success means
+        /// the order was refused ENTIRELY, not partially: NPCSell returns out of its validation
+        /// loop on the first unacceptable link.
+        ///
+        /// The refusal is worth logging loudly. It is silent on the wire - no chat line, no error -
+        /// and when the bot used to assume success instead, the bag and the bot's idea of the bag
+        /// drifted apart permanently.
+        /// </summary>
+        public void Process(S.ItemsChanged p)
+        {
+            List<CellLinkInfo> pending = _pendingSell;
+            _pendingSell = null;
+
+            if (pending == null) return;      // not ours: repairs and other flows echo this too
+
+            if (p.Success)
+            {
+                Items.NoteSoldConfirmed(p.Links ?? pending);
+                return;
+            }
+
+            SellRefusals++;
+
+            Log($"Sell REFUSED by the server: {pending.Count} slot(s), nothing sold. The order is " +
+                "all-or-nothing, so one locked, worthless or already-gone item voids it. Keeping " +
+                "them in the model rather than guessing.");
+        }
 
         public void Process(S.ItemsGained p)
         {
@@ -386,22 +484,30 @@ namespace MirBot
                     AutoPathing = false;
                     break;
 
+                case BotAction.SetPetMode:
+                    // One mode for every pet we own - the server has no per-pet command. The echo
+                    // (S.ChangePetMode) is what updates our model, so nothing is assumed here.
+                    Enqueue(new C.ChangePetMode { Mode = decision.PetMode });
+                    break;
+
                 case BotAction.Deposit:
+                    // Parts have their own grid on the server; sending one to GridType.Storage is
+                    // refused in silence and the item simply stays in the bag.
                     Enqueue(new C.ItemMove
                     {
                         FromGrid = GridType.Inventory,
-                        ToGrid = GridType.Storage,
+                        ToGrid = decision.PartsGrid ? GridType.PartsStorage : GridType.Storage,
                         FromSlot = decision.FromSlot,
                         ToSlot = decision.ToSlot,
                         MergeItem = false
                     });
-                    Items.NoteDeposited(decision.FromSlot, decision.ToSlot);
+                    Items.NoteDeposited(decision.FromSlot, decision.ToSlot, decision.PartsGrid);
                     break;
 
                 case BotAction.Withdraw:
                     Enqueue(new C.ItemMove
                     {
-                        FromGrid = GridType.Storage,
+                        FromGrid = decision.PartsGrid ? GridType.PartsStorage : GridType.Storage,
                         ToGrid = GridType.Inventory,
                         FromSlot = decision.FromSlot,
                         ToSlot = decision.ToSlot,
@@ -456,19 +562,34 @@ namespace MirBot
                     break;
 
                 case BotAction.NPCSell:
-                    Enqueue(new C.NPCSell
+                {
+                    // Skip anything we cannot state a real count for. The server voids the WHOLE
+                    // order on a single bad link, so one guessed count costs every other sale in
+                    // the same request.
+                    List<CellLinkInfo> links = decision.SellSlots
+                        .Select(slot => new CellLinkInfo
+                        {
+                            GridType = GridType.Inventory,
+                            Slot = slot,
+                            Count = Items.CountInSlot(slot)
+                        })
+                        .Where(link => link.Count > 0)
+                        .ToList();
+
+                    if (links.Count == 0)
                     {
-                        Links = decision.SellSlots
-                            .Select(slot => new CellLinkInfo
-                            {
-                                GridType = GridType.Inventory,
-                                Slot = slot,
-                                Count = Items.CountInSlot(slot)
-                            })
-                            .ToList()
-                    });
-                    Items.NoteSold(decision.SellSlots);
+                        Log($"Sell: nothing to send - none of the {decision.SellSlots.Count} " +
+                            "chosen slots holds anything we can count.");
+                        break;
+                    }
+
+                    // Remembered, not applied. The model changes only when S.ItemsChanged comes
+                    // back with Success set - see Process(S.ItemsChanged).
+                    _pendingSell = links;
+
+                    Enqueue(new C.NPCSell { Links = links });
                     break;
+                }
 
                 case BotAction.NPCBuy:
                     Enqueue(new C.NPCBuy

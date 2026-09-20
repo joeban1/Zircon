@@ -48,6 +48,9 @@ namespace MirBot
         public long Gold;
         public long GoldFloor;
 
+        /// <summary>Share of current gold a single fare may cost. See BotConfig.TeleportMaxGoldPercent.</summary>
+        public int MaxGoldPercent;
+
         public JourneyPhase Phase { get; private set; } = JourneyPhase.Idle;
         public string Status { get; private set; } = "";
         public int DestinationMapIndex { get; private set; } = -1;
@@ -82,7 +85,7 @@ namespace MirBot
             Gold = world.Gold;
 
             List<MapExit> route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class,
-                world.Level, Gold, GoldFloor);
+                world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent);
 
             if (route == null || route.Count == 0)
             {
@@ -274,10 +277,29 @@ namespace MirBot
             MapExit exit = _route[_leg];
             TeleportRoute route = exit.Teleport;
 
+            // Re-checked on arrival as well as during planning: the fare was affordable when the
+            // route was chosen, and a repair bill since then may have changed that.
+            if (world.Gold < route.RequiredStartingGold)
+            {
+                Abort($"{route.NPC?.NPCName} wants to see {route.RequiredStartingGold:N0} gold " +
+                      $"and we only have {world.Gold:N0}");
+                return null;
+            }
+
             if (world.Gold - route.Cost < GoldFloor)
             {
-                Abort($"{route.NPC?.NPCName} wants {route.Cost:N0} gold and we only have " +
+                Abort($"{route.NPC?.NPCName} charges {route.Cost:N0} gold and we only have " +
                       $"{world.Gold:N0}, keeping {GoldFloor:N0} back");
+                return null;
+            }
+
+            // Re-checked here as well as at planning time, because gold moves between the two: a
+            // journey planned while rich can reach the NPC after a death or a restock has changed
+            // the answer, and this is the last point at which refusing is still free.
+            if (MaxGoldPercent > 0 && route.Cost * 100L > world.Gold * (long)MaxGoldPercent)
+            {
+                Abort($"{route.NPC?.NPCName} charges {route.Cost:N0} gold, more than " +
+                      $"{MaxGoldPercent}% of the {world.Gold:N0} we hold - walking instead");
                 return null;
             }
 

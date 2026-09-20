@@ -49,10 +49,18 @@ namespace MirBot
         private bool _boughtPotions;
         private bool _boughtMana;
         private bool _boughtTorch;
+        private bool _boughtReagents;
         private bool _repaired;
         private bool _repairedSpecial;
         private bool _boughtBook;
         private bool _boughtGear;
+
+        /// <summary>
+        /// The book stop on this trip, while it is still AHEAD of us. Cleared on arrival, not on
+        /// purchase - a seller with nothing we can afford must not hold the purse shut for the rest
+        /// of the trip, which is the latch-gating-a-trigger shape this codebase keeps producing.
+        /// </summary>
+        private VendorEntry _bookSeller;
 
         /// <summary>Latched when no NPC in System.db repairs what we carry, so a broken item
         /// does not loop begin -> abort -> cooldown forever.</summary>
@@ -145,15 +153,32 @@ namespace MirBot
         private DateTime _retryAfter = DateTime.MinValue;
         private static readonly TimeSpan RetryDelay = TimeSpan.FromMinutes(2);
 
-        public TownTrip(BotConfig config, VendorDirectory directory, MagicBooks books)
+        public TownTrip(BotConfig config, VendorDirectory directory, MagicBooks books,
+            SafeZoneDirectory safeZones)
         {
             _config = config;
             _directory = directory;
             _books = books;
+            _safeZones = safeZones;
         }
+
+        private readonly SafeZoneDirectory _safeZones;
+
+        /// <summary>Which limit sent us to town, for the log.</summary>
+        private string _tripReason = "";
+
+        /// <summary>Where we are walking to bank, while outside a safe zone.</summary>
+        private Point _bankSpot = Point.Empty;
+        private DateTime _bankWalkDeadline = DateTime.MinValue;
 
         /// <summary>Why the last sale was the size it was - an empty sale is not a failure.</summary>
         public string SellDiagnostic = "";
+
+        /// <summary>Why a full bag did or did not send us to town.</summary>
+        public string WeightDiagnostic = "";
+
+        /// <summary>Why reagents were or were not bought.</summary>
+        public string ReagentDiagnostic = "";
 
         /// <summary>Why a book stop was or was not added.</summary>
         public string BookDiagnostic = "";
@@ -183,6 +208,25 @@ namespace MirBot
         public string SupplyDiagnostic = "";
 
         public bool Active => Phase != TownPhase.None;
+
+        /// <summary>
+        /// A scroll was spent elsewhere - by the escape branch - while this trip was running.
+        ///
+        /// The trip is not over: the scroll took it to a town, which is where it was going. What
+        /// is now worthless is the PLAN, because it was built for the map the bot has just left.
+        /// Putting the trip into Teleporting hands it to the same replan-on-arrival path a
+        /// deliberate scroll uses, rather than leaving it Travelling towards a vendor on another
+        /// map - which is the exact bug the plan-after-landing rework existed to remove.
+        /// </summary>
+        public void ScrolledOut(WorldModel world)
+        {
+            if (!Active) return;
+
+            ResetTripState();
+
+            _mapBeforeTeleport = world.MapIndex;
+            Enter(TownPhase.Teleporting, "scrolled out of danger - replanning on arrival");
+        }
         public bool OnCooldown => DateTime.Now < _retryAfter;
 
         private bool _forced;
@@ -196,6 +240,37 @@ namespace MirBot
             _forced = true;
             _retryAfter = DateTime.MinValue;
         }
+
+        /// <summary>
+        /// Go and try to repair, clearing the two latches that would otherwise refuse.
+        ///
+        /// Both latches exist for good reasons and neither is simply "the bill was too high".
+        /// _brokenUrgencySpent is spent when a broken-gear trip COMMITS, or on an explicit refusal
+        /// from the server, and it exists to stop the forty-three-second repair circuit this code
+        /// has already had once. _noRepairerKnown is set only after establishing that no repairer
+        /// exists ANYWHERE - hard-won evidence, gathered by walking.
+        ///
+        /// So the urgency latch is cleared outright, and the "nobody can repair this" latch is
+        /// cleared only far enough to allow ONE more look. If that look finds nothing again the
+        /// latch goes straight back on and RepairDiagnostic says so, rather than the button
+        /// becoming a way to repeat a known-impossible errand on demand.
+        /// </summary>
+        public void ForceRepair()
+        {
+            _brokenUrgencySpent = false;
+
+            if (_noRepairerKnown)
+            {
+                _noRepairerKnown = false;
+                _repairRescan = true;
+                RepairDiagnostic = "asked to look for a repairer again";
+            }
+
+            Force();
+        }
+
+        /// <summary>Set by ForceRepair: this trip gets one chance to find a repairer.</summary>
+        private bool _repairRescan;
         public VendorEntry Target => _target;
 
         /// <summary>Asked for explicitly, from the status page. Not to be second-guessed.</summary>
@@ -234,11 +309,16 @@ namespace MirBot
             _boughtPotions = false;
             _boughtMana = false;
             _boughtTorch = false;
+            _boughtReagents = false;
             _boughtGear = false;
             _boughtBook = false;
+            _bookSeller = null;
             _repaired = false;
             _repairedSpecial = false;
             _repairPendingUntil = DateTime.MinValue;
+
+            _bankSpot = Point.Empty;
+            _bankWalkDeadline = DateTime.MinValue;
         }
 
         public void Abort(string why)
@@ -272,8 +352,42 @@ namespace MirBot
 
         public Decision Next(WorldModel world, Backpack items)
         {
-            bool overweight = world.MaxBagWeight > 0 &&
-                              world.WeightPercent >= _config.TownAtWeightPercent;
+            // Heavy is not the same as heavy WITH SOMETHING TO PUT DOWN.
+            //
+            // The old test read the scales alone, so a bag full of reserved potions, scrolls and
+            // worn equipment counted as a reason to shop. It is not: the itinerary sells nothing,
+            // the bot comes home exactly as heavy, and the cooldown starts the same lap again. Two
+            // bots were found doing precisely that - a warrior at 242/242 twenty-four trips deep,
+            // an assassin at 109/120 walking a ten-stop lap - both reporting "0 sellable" at every
+            // single stop, both effectively unable to hunt at all.
+            //
+            // The condition that ends the loop is the same one that defines it: go only if selling
+            // what we may sell would actually put us back under the line. Anything less repeats.
+            // The other triggers below - slots, repair, supplies, the button - are untouched and
+            // still bring the bot to town when a trip can genuinely help.
+            bool heavy = world.MaxBagWeight > 0 &&
+                         world.WeightPercent >= _config.TownAtWeightPercent;
+
+            bool overweight = false;
+
+            if (heavy)
+            {
+                int limit = world.MaxBagWeight * _config.TownAtWeightPercent / 100;
+                int shed = world.BagWeight - limit + 1;
+
+                int disposable = items.DisposableWeight(world.Class, world.Gender, world.Level,
+                    world.PlayerStats, _config.HealthPotionTarget(world.MaxBagWeight),
+                    _config.ManaPotionTarget(world.MaxBagWeight), _config.TownScrollReserve,
+                    _books, world);
+
+                overweight = disposable >= shed;
+
+                WeightDiagnostic = overweight
+                    ? $"{world.WeightPercent}% full, {disposable} weight to sell"
+                    : $"{world.WeightPercent}% full but only {disposable} of {shed} weight is " +
+                      "sellable - a trip could not lighten us, so not going";
+            }
+            else WeightDiagnostic = "";
 
             // Broken gear gives no stats at all, so this is urgent enough to bypass the cooldown -
             // otherwise a break just after a trip locks the bot out of repair for two minutes while
@@ -339,7 +453,18 @@ namespace MirBot
                 // mismatch that made the supply trigger necessary in the first place. The latch now
                 // governs only the cooldown bypass, which is all it was ever meant to do: one
                 // trip that jumps the queue per problem, and after that the ordinary cadence.
-                bool reason = overweight || repairable || shortOfPotions || _forced;
+                // Out of SLOTS rather than out of carrying capacity. These are separate limits
+                // and only the weight one was ever checked: a bag of rings and crafting drops
+                // reaches 48 of 48 slots at a third of the weight cap, and a bot in that state
+                // silently stops looting - every drop it walks over is refused by the server and
+                // nothing in the bot notices, because the scales still say there is room.
+                //
+                // Deliberately NOT urgent. A bag full of things no vendor here buys is a problem
+                // the trip cannot fix, and letting it bypass the cooldown would be the repair-loop
+                // bug again in a different costume.
+                bool outOfSlots = items.FreeSlotCount <= Math.Max(0, _config.TownAtFreeSlots);
+
+                bool reason = overweight || outOfSlots || repairable || shortOfPotions || _forced;
                 bool urgent = brokenUrgent || supplyUrgent || _forced;
 
                 if (!reason) return null;
@@ -633,7 +758,11 @@ namespace MirBot
                             Backpack.CanEquipInfo(info, world.Class, world.Gender) &&
                             Backpack.MeetsRequirement(info, world.Level, world.PlayerStats));
 
-                        if (good != null && good.Item.Price <= world.Gold)
+                        // Affordable is not the same as worth affording. A torch must leave
+                        // enough behind to still buy a potion, or the light is being paid for
+                        // with the bot's life - see TorchGoldFloor.
+                        if (good != null &&
+                            world.Gold - good.Item.Price >= _config.TorchGoldFloor)
                             return new Decision
                             {
                                 Action = BotAction.NPCBuy,
@@ -641,6 +770,11 @@ namespace MirBot
                                 BuyIndex = good.Index,
                                 BuyAmount = 1
                             };
+
+                        if (good != null)
+                            SupplyDiagnostic = $"not replacing the torch at {good.Item.Price} " +
+                                               $"with {world.Gold:N0} gold - keeping " +
+                                               $"{_config.TorchGoldFloor:N0} back for potions";
                     }
 
                     if (!_boughtMana && _config.ManaPotionWeightPercent > 0)
@@ -665,37 +799,126 @@ namespace MirBot
                             };
                     }
 
+                    // Reagents: ammunition for the spells this character actually knows.
+                    //
+                    // Bought before books, because a spell we already own and cannot fire is worth
+                    // more than one we do not own yet. Only for characters whose magics consume
+                    // them, so a warrior never carries any.
+                    if (!_boughtReagents && _config.BuyReagents)
+                    {
+                        _boughtReagents = true;
+
+                        ItemType needed = ReagentNeeded(world, items);
+
+                        if (needed != ItemType.Nothing)
+                        {
+                            NPCGood good = CheapestOfType(needed);
+
+                            // Budgeted, not merely affordable. Buying every reagent the purse
+                            // can stretch to is how a bot arrives at the stock target in one
+                            // purchase and leaves itself unable to buy a potion - see
+                            // ReagentGoldPercent. The target is still the target; this only
+                            // paces the approach to it.
+                            long reagentBudget = _config.ReagentGoldPercent > 0
+                                ? world.Gold * _config.ReagentGoldPercent / 100
+                                : world.Gold;
+
+                            int wanted = good == null ? 0
+                                : Affordable(good, _config.ReagentReserve - items.CountReagent(needed),
+                                      reagentBudget);
+
+                            if (good != null && wanted > 0)
+                            {
+                                ReagentDiagnostic = $"{wanted} x {good.Item.ItemName} " +
+                                                    $"at {_target?.NPC?.NPCName}";
+
+                                return new Decision
+                                {
+                                    Action = BotAction.NPCBuy,
+                                    Reason = $"{wanted} x {good.Item.ItemName}",
+                                    BuyIndex = good.Index,
+                                    BuyAmount = wanted
+                                };
+                            }
+
+                            ReagentDiagnostic = good == null
+                                ? $"no {needed} on sale at {_target?.NPC?.NPCName}"
+                                : $"cannot afford {needed} at {_target?.NPC?.NPCName}";
+                        }
+                    }
+
                     // Books only once potions AND scrolls are at their reserves - evaluated NOW,
                     // after the restock steps above have run, not from the values at Begin.
                     //
                     // Every branch here records why, because the whole step is silent otherwise:
                     // the bot walks to the book seller, opens the page, buys nothing and closes,
                     // which is indistinguishable in the log from the step never running at all.
+                    // We are standing at the book stop, so it is no longer "still to come"
+                    // whatever happens next. Cleared here rather than on a purchase so that a
+                    // seller with nothing affordable cannot keep gear locked out for ever.
+                    if (_bookSeller != null && _target == _bookSeller) _bookSeller = null;
+
                     if (!_boughtBook && _config.BuyBooks)
                     {
                         int potions = items.CountHealthPotions();
                         int scrolls = items.CountTownScrolls();
 
-                        if (potions < _config.HealthPotionReserve ||
-                            scrolls < _config.TownScrollReserve)
+                        // Judged on whether we are SAFE, not on whether we are perfectly stocked.
+                        //
+                        // Demanding the full reserve looked equivalent and was not. The bot buys up
+                        // to the reserve early in the trip and then drinks on the way round, so it
+                        // arrives at the book seller one short of its own target and books are
+                        // refused - every trip, for ever. A level 14 Taoist sat at
+                        // "restock first (9/10 potions, 3/3 scrolls)" moments after buying ten.
+                        //
+                        // The gate is meant to stop books eating the survival budget, so it asks
+                        // the survival question: are we above the floor that would send us back to
+                        // town anyway? That floor is computed here exactly as the trip trigger
+                        // computes it (see shortOfPotions above), so the two can never disagree
+                        // about what "short of potions" means. Scrolls stay absolute - one is the
+                        // way home - so those still need the full reserve.
+                        int potionFloor = _config.RestockAtPotionPercent > 0 && world.MaxBagWeight > 0
+                            ? Math.Max(1, _config.HealthPotionTarget(world.MaxBagWeight) *
+                                          _config.RestockAtPotionPercent / 100)
+                            : _config.HealthPotionReserve;
+
+                        if (potions < potionFloor || scrolls < _config.TownScrollReserve)
                         {
                             BookDiagnostic =
                                 $"not buying at {_target?.NPC?.NPCName}: restock first " +
-                                $"({potions}/{_config.HealthPotionReserve} potions, " +
+                                $"({potions} potions, need {potionFloor}; " +
                                 $"{scrolls}/{_config.TownScrollReserve} scrolls)";
                         }
                         else
                         {
                             NPCGood good = FindGood(info => WantedBook(info, world));
 
-                            if (good != null)
+                            // Priced before it is asked for. An unaffordable C.NPCBuy is refused
+                            // whole, with nothing but a chat line the bot does not read - a level
+                            // 14 Taoist asked for a Heal book with 1,114 gold against a 1,710 price
+                            // and the only trace was the server saying "You need another -596 Gold"
+                            // into a channel nothing consumes. The bot has the price in NPCGood, so
+                            // there is no reason to find out from the server.
+                            //
+                            // Checked against raw gold rather than GoldReserve on purpose: the
+                            // restock gate above has already secured potions and scrolls, so the
+                            // survival spend is done, and a caster's first spell book is worth more
+                            // than the reserve it would otherwise sit behind.
+                            if (good != null && Affordable(good, 1, world.Gold) < 1)
                             {
-                                // Latched only on an actual purchase. Setting it merely because the
-                                // step RAN meant the first vendor past the restock gate consumed
-                                // the trip's one book - and on a Joeban/Lennard/Isaac itinerary
-                                // that was Lennard, who sells no books, so the block was already
-                                // marked done by the time the bot reached the actual book seller.
-                                // It closed Isaac's page in silence, without even a refusal line.
+                                BookDiagnostic =
+                                    $"{good.Item.ItemName} at {_target?.NPC?.NPCName} costs " +
+                                    $"{good.Item.Price:N0} and we have {world.Gold:N0}";
+                            }
+                            else if (good != null)
+                            {
+                                // Latched only on a purchase we can actually pay for. Setting it
+                                // merely because the step RAN meant the first vendor past the
+                                // restock gate consumed the trip's one book - and on a
+                                // Joeban/Lennard/Isaac itinerary that was Lennard, who sells no
+                                // books, so the block was already marked done by the time the bot
+                                // reached the real seller. Latching on an UNAFFORDABLE one has the
+                                // same effect, which is why the affordability test sits above this.
                                 _boughtBook = true;
 
                                 return new Decision
@@ -716,7 +939,23 @@ namespace MirBot
                     // Gear last of all: potions, scrolls, repairs and books are survival and
                     // progression, an upgrade is a luxury. It is also the only purchase that can
                     // empty the purse, so it spends what is left above the reserve.
-                    if (!_boughtGear && _config.BuyGear)
+                    // Gear waits while a book stop is still ahead of us.
+                    //
+                    // Books are checked before gear at each vendor, but that is per-vendor and the
+                    // damage is done across the itinerary: a level 14 Taoist with NO SPELLS AT ALL
+                    // walked Hardy -> Haylee -> Flora -> Melisa -> ... -> Gresham, bought potions
+                    // and a Scimitar on the way, and reached the one NPC selling skill books with
+                    // 333 gold against a 5,000 reserve. She had had 10,554 when the trip began.
+                    //
+                    // A spell is worth more than a marginal weapon to a character that cannot cast,
+                    // and the book seller is the stop most likely to be last, so the purse is held
+                    // until that stop has had its turn.
+                    if (!_boughtGear && _config.BuyGear && _bookSeller != null)
+                    {
+                        GearDiagnostic =
+                            $"holding gold for {_bookSeller.NPC?.NPCName}, who sells books we want";
+                    }
+                    else if (!_boughtGear && _config.BuyGear)
                     {
                         _boughtGear = true;
 
@@ -758,11 +997,64 @@ namespace MirBot
                     // Storage is only reachable inside a safe zone (PlayerObject.cs:7421). Vendors
                     // normally stand in one; if this vendor does not, skip banking rather than
                     // sending moves the server will refuse.
-                    if (!world.InSafeZone || StuckIn(TimeSpan.FromSeconds(20)))
+                    // Outside the safe zone, so walk into it rather than giving up.
+                    //
+                    // This used to skip banking entirely on the assumption that vendors stand in
+                    // safe zones. They do not: a trip ending at Henry in Banya Village finishes
+                    // outside the zone, and across an entire log the bots had made ZERO Deposit
+                    // and ZERO Withdraw decisions. Because DisposableSlots deliberately refuses to
+                    // sell anything WorthStoring - on the promise it will be banked instead - the
+                    // unkept promise meant that gear accumulated in the bag permanently.
+                    if (!world.InSafeZone)
                     {
-                        Enter(TownPhase.Returning, world.InSafeZone
-                            ? "banking done"
-                            : "not in a safe zone, skipping the bank");
+                        if (_bankWalkDeadline == DateTime.MinValue)
+                        {
+                            _bankSpot = _safeZones?.Nearest(world.MapIndex, world.Location)
+                                        ?? Point.Empty;
+                            _bankWalkDeadline = DateTime.UtcNow.AddSeconds(
+                                Math.Max(5, _config.BankWalkSeconds));
+                        }
+
+                        if (_bankSpot == Point.Empty)
+                        {
+                            BankDiagnostic = "no safe zone on this map to bank in";
+                            Enter(TownPhase.Returning, "nowhere to bank");
+                            return null;
+                        }
+
+                        if (DateTime.UtcNow > _bankWalkDeadline)
+                        {
+                            BankDiagnostic = $"could not reach the safe zone at " +
+                                             $"{_bankSpot.X},{_bankSpot.Y} in time";
+                            Enter(TownPhase.Returning, "gave up walking to the bank");
+                            return null;
+                        }
+
+                        int away = WorldModel.Distance(world.Location, _bankSpot);
+
+                        BankDiagnostic = $"walking {away} tiles to the safe zone to bank";
+
+                        return new Decision
+                        {
+                            Action = BotAction.WalkTo,
+                            Reason = $"safe zone to bank ({away} tiles)",
+                            Subject = "walking to the bank",
+                            Destination = _bankSpot
+                        };
+                    }
+
+                    // Arrived. Restart the phase clock, or the walk we just made would count
+                    // against the twenty seconds banking itself is allowed.
+                    if (_bankWalkDeadline != DateTime.MinValue)
+                    {
+                        _bankWalkDeadline = DateTime.MinValue;
+                        _bankSpot = Point.Empty;
+                        Enter(TownPhase.Banking, "reached the safe zone");
+                    }
+
+                    if (StuckIn(TimeSpan.FromSeconds(20)))
+                    {
+                        Enter(TownPhase.Returning, "banking done");
                         return null;
                     }
 
@@ -803,15 +1095,24 @@ namespace MirBot
                         if (!Backpack.WorthStoring(carried.Value, world.Class, world.Gender,
                                 world.Level, world.PlayerStats, _books, world)) continue;
 
-                        int free = items.FirstFreeStorageSlot(_config.StorageSize);
+                        // Parts go to their own grid. The server keeps PartsStorage separate from
+                        // Storage and refuses a mismatch without a word, which is why every part
+                        // deposit had silently failed while the bot recorded it as done.
+                        bool parts = Backpack.StoresInPartsGrid(carried.Value);
+
+                        int free = parts
+                            ? items.FirstFreePartsStorageSlot(_config.StorageSize)
+                            : items.FirstFreeStorageSlot(_config.StorageSize);
 
                         if (free < 0)
                         {
-                            BankDiagnostic = $"storage is full at {_config.StorageSize} slots";
+                            BankDiagnostic = (parts ? "parts storage" : "storage") +
+                                             $" is full at {_config.StorageSize} slots";
                             break;
                         }
 
-                        BankDiagnostic = $"storing {carried.Value.Info.ItemName} for later";
+                        BankDiagnostic = $"storing {carried.Value.Info.ItemName} for later" +
+                                         (parts ? " (parts grid)" : "");
 
                         return new Decision
                         {
@@ -819,7 +1120,8 @@ namespace MirBot
                             Reason = $"{carried.Value.Info.ItemName} for later",
                             Subject = carried.Value.Info.ItemName,
                             FromSlot = carried.Key,
-                            ToSlot = free
+                            ToSlot = free,
+                            PartsGrid = parts
                         };
                     }
 
@@ -979,6 +1281,26 @@ namespace MirBot
             foreach (VendorEntry extra in extraBuyers)
                 if (!_itinerary.Contains(extra)) _itinerary.Enqueue(extra);
 
+            // A reagent seller, if this character's spells eat reagents and we are short.
+            //
+            // Routed rather than merely bought-if-present. The buy step only ever sees the page
+            // that happens to be open, so without a stop of its own a Taoist can walk an entire
+            // itinerary past no poison vendor and carry on casting Poison Dust into an empty
+            // equipment slot - the server consumes nothing, reports nothing, and the spell simply
+            // does not happen.
+            ItemType reagent = ReagentNeeded(world, items);
+
+            if (_config.BuyReagents && reagent != ItemType.Nothing)
+            {
+                VendorEntry seller = _directory.BestSellerOf(reagent, mapIndex);
+
+                if (seller != null && !_itinerary.Contains(seller)) _itinerary.Enqueue(seller);
+
+                ReagentDiagnostic = seller == null
+                    ? $"short of {reagent} and nobody here sells it"
+                    : $"short of {reagent}, calling at {seller.NPC?.NPCName}";
+            }
+
             foreach (VendorEntry restocker in restockers)
             {
                 if (buyer != null && restocker.Page == buyer.Page) continue;
@@ -1006,6 +1328,16 @@ namespace MirBot
                         // of the session because one town lacked the right NPC.
                         _noRepairerKnown = true;
                         Status = "no repair NPC found for the damaged gear";
+
+                        // A forced re-scan that comes back empty is worth saying out loud. The
+                        // operator pressed a button expecting a repair; silence would read as the
+                        // button not working, when in fact the answer is a definite no.
+                        if (_repairRescan)
+                        {
+                            _repairRescan = false;
+                            RepairDiagnostic = "looked again on request - still no repairer " +
+                                               "anywhere for this gear";
+                        }
                     }
                 }
             }
@@ -1073,6 +1405,8 @@ namespace MirBot
 
                 if (bookSeller != null) _itinerary.Enqueue(bookSeller);
 
+                _bookSeller = bookSeller;
+
                 BookDiagnostic = $"{wanted.Count} skills wanted at level {world.Level}, " +
                                  $"seller: {bookSeller?.NPC.NPCName ?? "none"}";
             }
@@ -1138,6 +1472,13 @@ namespace MirBot
             _huntingMap = world.MapIndex;
             _huntingSpot = world.Location;
 
+            // Say which limit sent us. Weight and slots are separate and either can be the cause,
+            // and a trip that reports "bag 73% full" while the real reason was 48 of 48 slots is
+            // a log line that actively misleads whoever reads it next.
+            _tripReason = items.FreeSlotCount <= Math.Max(0, _config.TownAtFreeSlots)
+                ? $"{items.InventoryCount}/{Globals.InventorySize} slots used"
+                : $"bag {world.WeightPercent}% full";
+
             // Spent at commitment, not on success. A trip interrupted mid-teleport by the low
             // health branch leaves an unspent latch, and an unspent latch bypasses the cooldown -
             // which is the forty-three-second circuit this codebase has already had once.
@@ -1152,12 +1493,39 @@ namespace MirBot
 
                 case PlanOutcome.Travelling:
                     Enter(TownPhase.Travelling, $"walking to {Itinerary}");
-                    return WalkStep(world, $"bag {world.WeightPercent}% full");
+                    return WalkStep(world, _tripReason);
             }
 
             // Nothing to do where we stand. A scroll is now the only way to reach a town that can
             // serve us - and it is spent WITHOUT a plan, because where it lands decides the plan.
             int scroll = items.FindTownTeleportSlot();
+
+            // A scroll is only worth spending if it lands somewhere that can serve the trip.
+            //
+            // Two separate ways it cannot. The first is the map forbidding town teleport outright
+            // (PlayerObject.cs:5662 checks CurrentMap.Info.AllowTT and answers with a chat line);
+            // four Phantom Ship maps do that.
+            //
+            // The second is the one that actually bit us. A scroll goes to the character's BIND
+            // POINT, and the server re-binds to whatever safe zone the character last stood in.
+            // Bot 1 walked through Sabuk Keep's safe zone, bound there, and then scrolled itself
+            // back to Sabuk Keep with a completely full bag - a map with a safe zone and not one
+            // vendor. The scroll was gone, the trip aborted, and only the travel system getting it
+            // to Bichon on foot saved it. Letting the journey do the work from the start is both
+            // cheaper and correct.
+            if (scroll >= 0 && !AllowsTownScroll(world.MapIndex))
+            {
+                Abort($"{world.MapName} does not allow town teleport - walking out instead");
+                return null;
+            }
+
+            if (scroll >= 0 && world.BindMapIndex > 0 &&
+                !_directory.HasVendorsOn(world.BindMapIndex))
+            {
+                Abort($"a scroll would only take us back to {MapNameOf(world.BindMapIndex)}, " +
+                      "which has no vendors - walking instead");
+                return null;
+            }
 
             if (scroll >= 0)
             {
@@ -1167,7 +1535,7 @@ namespace MirBot
                 return new Decision
                 {
                     Action = BotAction.TownTeleport,
-                    Reason = $"bag {world.WeightPercent}% full",
+                    Reason = _tripReason,
                     PotionSlot = scroll
                 };
             }
@@ -1181,6 +1549,21 @@ namespace MirBot
         /// distance stops shrinking we are wedged against geometry this crude navigation cannot
         /// solve, and the trip is abandoned rather than looping forever.
         /// </summary>
+        private static string MapNameOf(int mapIndex) =>
+            Globals.MapInfoList?.Binding?.FirstOrDefault(x => x.Index == mapIndex)?.Description
+            ?? $"map {mapIndex}";
+
+        /// <summary>Does this map permit a Scroll Of Town Portal at all?</summary>
+        private static bool AllowsTownScroll(int mapIndex)
+        {
+            MapInfo info = Globals.MapInfoList?.Binding?
+                .FirstOrDefault(x => x.Index == mapIndex);
+
+            // Unknown map: assume it works. Refusing on missing data would ground the bot
+            // permanently, and the cost of being wrong is one wasted packet.
+            return info == null || info.AllowTT;
+        }
+
         private Decision WalkStep(WorldModel world, string why)
         {
             Point destination = Destination;
@@ -1264,6 +1647,7 @@ namespace MirBot
                 // a vendor, so it fires once per stop rather than once per dialogue page.
                 _sold = _boughtScrolls = _boughtPotions = _boughtGear = _boughtMana = false;
                 _boughtTorch = false;
+                _boughtReagents = false;
                 _repaired = _repairedSpecial = false;
             }
         }
@@ -1429,6 +1813,61 @@ namespace MirBot
         /// The tier was already chosen against a budget inside BestPotion; this is the quantity,
         /// which was not checked against anything at all.
         /// </summary>
+        /// <summary>
+        /// The reagent this character is short of, or Nothing.
+        ///
+        /// Driven by what it KNOWS, not by its class: a Taoist who has not learnt a summon or a
+        /// poison yet has no use for either, and buying speculatively wastes gold a low-level
+        /// caster does not have. Amulets come first because far more spells consume them.
+        /// </summary>
+        private ItemType ReagentNeeded(WorldModel world, Backpack items)
+        {
+            if (NeedsAmulet(world) && items.CountReagent(ItemType.Amulet) < _config.ReagentReserve)
+                return ItemType.Amulet;
+
+            if (NeedsPoison(world) && items.CountReagent(ItemType.Poison) < _config.ReagentReserve)
+                return ItemType.Poison;
+
+            return ItemType.Nothing;
+        }
+
+        /// <summary>
+        /// Magics that consume an amulet inside MagicCast, per the server's Taoist sources. The
+        /// consumption happens BEFORE most other validation, so a missing amulet is a silently
+        /// failed cast rather than an error - which is exactly why these are bought rather than
+        /// discovered.
+        /// </summary>
+        private static bool NeedsAmulet(WorldModel world) =>
+            world.CanUseMagic(MagicType.SummonSkeleton) ||
+            world.CanUseMagic(MagicType.MagicResistance) ||
+            world.CanUseMagic(MagicType.Resilience) ||
+            world.CanUseMagic(MagicType.StrengthOfFaith) ||
+            world.CanUseMagic(MagicType.Invisibility);
+
+        /// <summary>PoisonDust reads the equipped POISON item and takes its Shape to decide green or
+        /// red (PoisonDust.cs:64) - the amulet does not choose.</summary>
+        private static bool NeedsPoison(WorldModel world) =>
+            world.CanUseMagic(MagicType.PoisonDust);
+
+        /// <summary>
+        /// The cheapest thing of this type on the open page. Reagents are interchangeable as far as
+        /// the bot is concerned, so price is the only sensible tie-break.
+        /// </summary>
+        private NPCGood CheapestOfType(ItemType type)
+        {
+            if (_currentPage?.Goods == null) return null;
+
+            NPCGood best = null;
+
+            foreach (NPCGood good in _currentPage.Goods)
+            {
+                if (good?.Item == null || good.Item.ItemType != type) continue;
+                if (best == null || good.Item.Price < best.Item.Price) best = good;
+            }
+
+            return best;
+        }
+
         private static int Affordable(NPCGood good, int wanted, long gold)
         {
             if (good?.Item == null || wanted <= 0) return 0;
@@ -1458,7 +1897,30 @@ namespace MirBot
             int Restores(NPCGood g) =>
                 healing ? g.Item.Stats[Stat.Health] : g.Item.Stats[Stat.Mana];
 
-            candidates.Sort((a, b) => Restores(b).CompareTo(Restores(a)));
+            // Biggest FIRST, but capped to what the character can actually absorb.
+            //
+            // Buying the largest potion on the shelf looks obviously right and is not. Drinking
+            // starts at HealAtPercent, so the gap a potion has to fill is at most
+            // MaxHealth * (100 - HealAtPercent)%: for a 216 HP wizard at 60% that is 86, and a
+            // Healing Potion (V) restores 250. Most of it hits the health cap and is thrown away,
+            // and with the no-overheal rule in the brain the bot would rather not drink it at all -
+            // so it would carry expensive potions it never used and still run dry.
+            //
+            // Tiers on this server heal 30 / 70 / 110 / 170 / 250, so there is almost always one
+            // that fits. If none does - a very low-level character where even the smallest
+            // overshoots - take the smallest and accept the waste.
+            int gap = world.MaxHealth > 0
+                ? world.MaxHealth * Math.Max(1, 100 - _config.HealAtPercent) / 100
+                : int.MaxValue;
+
+            candidates.Sort((a, b) =>
+            {
+                bool aFits = Restores(a) <= gap, bFits = Restores(b) <= gap;
+
+                if (aFits != bFits) return aFits ? -1 : 1;            // anything that fits wins
+                if (aFits) return Restores(b).CompareTo(Restores(a)); // then the biggest that fits
+                return Restores(a).CompareTo(Restores(b));            // none fit: least waste
+            });
 
             int want = healing
                 ? _config.HealthPotionTarget(world.MaxBagWeight) - items.CountHealthPotions()
@@ -1475,26 +1937,28 @@ namespace MirBot
             // while broke, which is exactly when it needs one.
             long spendable = Math.Max(0, world.Gold);
 
-            // A potion that barely dents the pool is mostly bag weight; prefer one that does real
-            // work, but never refuse the only thing on sale.
-            int pool = healing ? world.MaxHealth : world.MaxMana;
-            int meaningful = pool * _config.PotionHealPercentTarget / 100;
-
-            NPCGood affordable = null;
-
+            // The candidates are already in preference order - biggest that fits the health gap
+            // first - so this only has to find the first one we can pay for.
+            //
+            // There used to be a second rule here, a FLOOR: skip anything restoring less than
+            // PotionHealPercentTarget of the pool. That was written before the sort understood
+            // tiers, and once the sort gained a CEILING the two could disagree - a floor wanting a
+            // bigger potion and a ceiling wanting a smaller one, with the outcome decided by which
+            // happened to run last. One rule about potion size is enough, and the ceiling is the
+            // one that keeps the no-overheal promise.
             foreach (NPCGood good in candidates)
             {
-                long cost = (long)good.Item.Price * want;
-
-                if (cost > spendable) continue;
-
-                affordable ??= good;
-
-                if (Restores(good) >= meaningful) return good;
+                if ((long)good.Item.Price * want <= spendable) return good;
             }
 
-            // Nothing reaches the target share: take the biggest we can actually pay for.
-            return affordable ?? candidates[candidates.Count - 1];
+            // Cannot afford even one at the wanted quantity: take the cheapest on the page and let
+            // Affordable() trim the count.
+            NPCGood cheapest = candidates[0];
+
+            foreach (NPCGood good in candidates)
+                if (good.Item.Price < cheapest.Item.Price) cheapest = good;
+
+            return cheapest;
         }
 
         private static bool IsManaPotion(ItemInfo info) =>

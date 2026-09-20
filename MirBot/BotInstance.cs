@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using Library;
@@ -20,7 +21,7 @@ namespace MirBot
         Banned        // the server IP-banned us; do not retry until it expires
     }
 
-    public enum BotCommandKind { Start, Stop, ForceTownTrip, Revive, Travel }
+    public enum BotCommandKind { Start, Stop, ForceTownTrip, Revive, Travel, SetConfig, ForceRepair }
 
     /// <summary>A queued command and, for Travel, the map it names.</summary>
     public readonly struct BotCommand
@@ -71,6 +72,18 @@ namespace MirBot
         private bool _stopRequested;
         private DateTime _stopDeadline = DateTime.MinValue;
         private DateTime _startedAt;
+
+        /// <summary>
+        /// When the character actually entered the world, as distinct from when the instance began
+        /// connecting.
+        ///
+        /// This is the clock the "last kill" counter falls back to before the first kill. A bot
+        /// that has been in game for a quarter of an hour and killed nothing is in exactly the
+        /// same trouble as one that stopped killing a quarter of an hour ago, and hiding the
+        /// first case behind a dash only means the one bot that never got started is the one the
+        /// page says nothing about.
+        /// </summary>
+        private DateTime _inGameAt = DateTime.MinValue;
         private DateTime _retryAt = DateTime.MinValue;
         private int _attempts;
 
@@ -212,6 +225,20 @@ namespace MirBot
                         StartTravel(queued.Argument);
                         break;
 
+                    case BotCommandKind.SetConfig:
+                        ApplyConfigChange(queued.Argument);
+                        break;
+
+                    case BotCommandKind.ForceRepair:
+                        if (_town == null) _log.Write("Repair forced, but there is no trip to force.");
+                        else
+                        {
+                            _log.Write("Repair forced.");
+                            _history.Note("Repair", "forced");
+                            _town.ForceRepair();
+                        }
+                        break;
+
                     case BotCommandKind.Revive:
                         if (_connection != null && _connection.Stage == BotStage.InGame)
                         {
@@ -288,6 +315,7 @@ namespace MirBot
             {
                 _state = BotRunState.Playing;
                 _attempts = 0;
+                _inGameAt = DateTime.UtcNow;
             }
 
             WatchForDeath();
@@ -352,14 +380,16 @@ namespace MirBot
                 Books = _host.Books,
                 Maps = _host.Maps,
                 Danger = _host.Danger,
-                Nav = _host.Nav
+                Nav = _host.Nav,
+                Exits = _host.World
             };
             _brain.Travel = new Journey(_host.World)
             {
                 TalkRange = Config.VendorTalkRange,
-                GoldFloor = Config.TeleportGoldFloor
+                GoldFloor = Config.TeleportGoldFloor,
+                MaxGoldPercent = Config.TeleportMaxGoldPercent
             };
-            _town = new TownTrip(Config, _host.Vendors, _host.Books);
+            _town = new TownTrip(Config, _host.Vendors, _host.Books, _host.SafeZones);
             _brain.Town = _town;
 
             _connection.OnNPCPage = page =>
@@ -410,6 +440,12 @@ namespace MirBot
             _connection.OnMagicCooldown = (infoIndex, delay) =>
                 _brain?.Spells.Cooldown(infoIndex, delay);
 
+            _connection.OnObjectGone = id =>
+            {
+                _brain?.Spells.ForgetPoison(id);
+                _brain?.ForgetObject(id);
+            };
+
             _connection.OnDamaged = (monster, damage) =>
             {
                 _lastAttacker = monster;
@@ -425,9 +461,39 @@ namespace MirBot
             _log.Write($"Connecting to {Config.ServerAddress}:{Config.ServerPort} (attempt {_attempts}).");
         }
 
+        private string _lastTripStatus = "";
+
+        /// <summary>Say what the town trip is doing, or why it is not, but only when it changes.</summary>
+        private void LogTripStatus()
+        {
+            if (_town == null) return;
+
+            string line = $"{_town.Phase} {_town.Status}".Trim();
+
+            if (!string.IsNullOrEmpty(_town.WeightDiagnostic))
+                line += $" | {_town.WeightDiagnostic}";
+
+            if (line == _lastTripStatus) return;
+
+            _lastTripStatus = line;
+
+            if (line.Length > 0) _log.Write($"Trip: {line}");
+        }
+
         private void RunBrain()
         {
             Decision decision = _brain.Decide(_connection.World, _connection.Items);
+
+            // Deliberately ABOVE the early return, because the interesting case is the tick that
+            // decides to do nothing.
+            //
+            // TownTrip.Status was previously only ever written out when an NPC page arrived, so
+            // every abort and every declined trip was invisible. A wizard was watched hunting at
+            // 6% health with an empty bag for 111 seconds before a trip finally started, and the
+            // log had nothing whatsoever to say about the delay - which is how this went unnoticed
+            // long enough to be observed by eye rather than read.
+            LogTripStatus();
+
             if (decision == null || decision.Action == BotAction.Idle) return;
 
             _connection.Act(decision);
@@ -578,7 +644,8 @@ namespace MirBot
             // Where we could get to, and what each would cost in map transitions. One
             // breadth-first pass prices every candidate at once.
             Dictionary<int, int> hops = _host.World.HopCounts(world.MapIndex, world.Class,
-                world.Level, world.Gold, Config.TeleportGoldFloor);
+                world.Level, world.Gold, Config.TeleportGoldFloor, world.PKPoints,
+                             Config.TeleportMaxGoldPercent);
 
             // Too poor to be anywhere but home.
             //
@@ -695,13 +762,19 @@ namespace MirBot
             HashSet<int> measured = new HashSet<int>(
                 _host.Hunting.Best(mirClass, world.Level, 500).Select(x => x.MapIndex));
 
+            // "Measured" and "been there" are not the same thing, and the difference is where a
+            // map that kills us on arrival hides. Best() has nothing to say about a map we never
+            // survived long enough to measure, so without this it reads as unexplored for ever.
+            HashSet<int> lethal = _host.Hunting.Lethal(mirClass, world.Level);
+
             List<int> options = new List<int>();
-            int tooStrong = 0, tooFar = 0;
+            int tooStrong = 0, tooFar = 0, killers = 0;
 
             foreach (int mapIndex in hops.Keys)
             {
                 if (mapIndex == world.MapIndex) continue;
                 if (measured.Contains(mapIndex)) continue;
+                if (lethal.Contains(mapIndex)) { killers++; continue; }
                 if (!permitted(mapIndex)) continue;
                 if (_host.Danger.TooDangerous(mapIndex, world.MaxHealth)) continue;
 
@@ -720,8 +793,8 @@ namespace MirBot
             if (options.Count == 0)
             {
                 _log.Write($"Travel: nothing new worth exploring - {hops.Count} reachable, " +
-                           $"{measured.Count} already measured, {tooStrong} too strong, " +
-                           $"{tooFar} too far to afford.");
+                           $"{measured.Count} already measured, {killers} killed us before, " +
+                           $"{tooStrong} too strong, {tooFar} too far to afford.");
                 return false;
             }
 
@@ -825,7 +898,8 @@ namespace MirBot
                 best[town] = 0;
 
                 foreach (KeyValuePair<int, int> pair in _host.World.HopCounts(town, world.Class,
-                             world.Level, world.Gold, Config.TeleportGoldFloor))
+                             world.Level, world.Gold, Config.TeleportGoldFloor, world.PKPoints,
+                             Config.TeleportMaxGoldPercent))
                 {
                     if (!best.TryGetValue(pair.Key, out int known) || pair.Value < known)
                         best[pair.Key] = pair.Value;
@@ -1011,6 +1085,23 @@ namespace MirBot
 
             _host.Hunting.RecordDeath(world.MapIndex, world.MapName,
                 world.Class.ToString(), world.Level);
+
+            // The count above ranks the map; this remembers the event. Which monster, at what
+            // level, carrying how much - the questions a bare count cannot answer.
+            _host.Deaths.Record(new DeathEntry
+            {
+                Bot = Id,
+                Character = world.Name,
+                Class = world.Class.ToString(),
+                Level = world.Level,
+                MapIndex = world.MapIndex,
+                MapName = world.MapName,
+                Killer = killer,
+                Gold = world.Gold.ToString(),
+                X = world.Location.X,
+                Y = world.Location.Y,
+                Utc = DateTime.UtcNow
+            });
 
             // The window is void: time spent dead and running back is not hunting.
             ResetExperienceSample();
@@ -1210,25 +1301,244 @@ namespace MirBot
 
         #region Snapshot
 
+        private DateTime _nextGoldSample = DateTime.MinValue;
+        private long _lastGoldSampled = long.MinValue;
+
+        /// <summary>
+        /// One point on the gold curve, on the ordinary cadence or whenever the balance jumps.
+        ///
+        /// Called from the bot thread BEFORE the snapshot's staleness check, deliberately: a bot
+        /// that has wedged still has gold worth plotting, and hanging this off snapshot rebuilds
+        /// would stop sampling at the moment the chart became interesting.
+        /// </summary>
+        private void SampleGold()
+        {
+            if (_connection == null || _connection.World.SelfID == 0) return;
+
+            long gold = _connection.World.Gold;
+            DateTime now = DateTime.UtcNow;
+
+            bool due = now >= _nextGoldSample;
+            bool jumped = _lastGoldSampled != long.MinValue &&
+                          Math.Abs(gold - _lastGoldSampled) >= GoldLog.NotableChange;
+
+            if (!due && !jumped) return;
+
+            _nextGoldSample = now + GoldLog.SampleInterval;
+            _lastGoldSampled = gold;
+            _host.Gold.Append(Id, gold, now);
+        }
+
+        /// <summary>How long a snapshot may sit unrebuilt while the world is not moving.</summary>
+        private static readonly TimeSpan StaleSnapshotAfter = TimeSpan.FromSeconds(1);
+
+        private DateTime _lastSnapshotAt = DateTime.MinValue;
+
         private void PublishIfDue()
         {
+            SampleGold();
+
             DateTime now = DateTime.UtcNow;
             if (now < _nextSnapshot) return;
 
-            // Skip the rebuild when nothing has changed. WorldModel.Version increments on every
-            // mutation and was, until now, read by nothing.
+            // Skip the rebuild when nothing has changed AND nothing time-based is going stale.
+            //
+            // The version check alone was a trap. It suppresses the rebuild whenever WorldModel
+            // stops mutating - which is precisely what a wedged bot looks like. Anything derived
+            // from the clock rather than from world state (uptime, seconds since the last
+            // experience gain, the ten-minute stuck threshold) would therefore freeze at the exact
+            // moment it became worth reading, and the status dot would show green on a bot that
+            // had done nothing for an hour.
+            //
+            // So: rebuild on change, or once a second regardless. The version check survives as
+            // what it always really was - a way to avoid rebuilding faster than the page polls,
+            // not a reason to stop rebuilding at all.
             long worldVersion = _connection?.World.Version ?? -1;
 
             bool changed = worldVersion != _snapshotWorldVersion ||
                            _history.Version != _snapshotHistoryVersion;
 
+            bool stale = _status == null || now - _lastSnapshotAt >= StaleSnapshotAfter;
+
             _nextSnapshot = now.AddSeconds(1);   // the page polls at 1Hz
-            if (!changed && _status != null) return;
+            if (!changed && !stale) return;
+
+            _lastSnapshotAt = now;
 
             _snapshotWorldVersion = worldVersion;
             _snapshotHistoryVersion = _history.Version;
 
             System.Threading.Volatile.Write(ref _status, Build());
+        }
+
+        /// <summary>
+        /// What the bot is busy with, in one word, for the status dot.
+        ///
+        /// Computed here because only the bot thread may look at TownTrip and Journey. Order
+        /// matters: a town trip that is itself travelling between maps still counts as town, since
+        /// the errand is the reason for the journey.
+        /// </summary>
+        /// <summary>What happened to the last config change, for the snapshot.</summary>
+        private string _configResult = "";
+
+        /// <summary>
+        /// Change one setting, on the bot thread, then make it stick.
+        ///
+        /// Three steps, and skipping any of them leaves a setting that half works:
+        ///   1. apply it to the shared BotConfig, which most code reads every tick;
+        ///   2. re-push the values that were COPIED elsewhere at connect time, or the edit is
+        ///      invisible until the next reconnect;
+        ///   3. write it back to the ini, or it is forgotten at the next restart.
+        ///
+        /// The value has already been validated against ConfigSchema in the HTTP endpoint - this
+        /// re-checks anyway, because the queue is reachable from anywhere in the process and a
+        /// method that trusts its caller is a method that will eventually be called by someone
+        /// else.
+        /// </summary>
+        private void ApplyConfigChange(string argument)
+        {
+            int split = argument?.IndexOf('=') ?? -1;
+
+            if (split <= 0)
+            {
+                _configResult = "malformed config change";
+                _log.Write("Config: malformed change request.");
+                return;
+            }
+
+            string key = argument.Substring(0, split).Trim();
+            string value = argument.Substring(split + 1).Trim();
+
+            if (!ConfigSchema.Validate(key, value, out string why))
+            {
+                _configResult = why;
+                _log.Write($"Config: refused {key}={value} - {why}");
+                return;
+            }
+
+            if (!BotConfig.Apply(Config, key, value, out string error))
+            {
+                _configResult = error ?? $"{key} is not a known setting";
+                _log.Write($"Config: could not apply {key}={value} - {_configResult}");
+                return;
+            }
+
+            ReapplyConfig();
+
+            string saved = PersistConfig(key, value);
+
+            _configResult = $"{key} = {value}" + (saved == null ? "" : $" ({saved})");
+            _history.Note("Config", $"{key} = {value}");
+            _log.Write($"Config: {key} = {value}." + (saved == null ? " Saved to the ini." : $" {saved}"));
+        }
+
+        /// <summary>
+        /// Push the settings that other objects took COPIES of at connect time.
+        ///
+        /// Journey snapshots three of them and ScriptedBrain's loot rule five more. Without this an
+        /// edit to, say, TeleportMaxGoldPercent would sit in BotConfig looking correct while the
+        /// Journey that actually decides fares carried on using the value it read at login.
+        /// </summary>
+        private void ReapplyConfig()
+        {
+            if (_brain?.Travel != null)
+            {
+                _brain.Travel.TalkRange = Config.VendorTalkRange;
+                _brain.Travel.GoldFloor = Config.TeleportGoldFloor;
+                _brain.Travel.MaxGoldPercent = Config.TeleportMaxGoldPercent;
+            }
+
+            _brain?.ReapplyLootRule();
+        }
+
+        /// <summary>
+        /// Write one key back to the ini, preserving everything else in it.
+        ///
+        /// Rewritten rather than appended: the file is hand-edited and full of comments explaining
+        /// why each number is what it is, and losing those would be losing most of the value of the
+        /// file. Written beside and renamed, so an interrupted save cannot leave a bot with a
+        /// truncated config it will refuse to start from.
+        ///
+        /// Returns null on success, or a human-readable reason. Never throws: a setting that
+        /// applied but could not be saved is still better than a dead bot thread.
+        /// </summary>
+        private string PersistConfig(string key, string value)
+        {
+            string path = Config.SourcePath;
+
+            if (string.IsNullOrWhiteSpace(path)) return "not saved - no ini path known";
+
+            try
+            {
+                List<string> lines = new List<string>(File.ReadAllLines(path));
+                bool replaced = false;
+
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    string line = lines[i];
+                    string trimmed = line.TrimStart();
+
+                    if (trimmed.Length == 0 || trimmed.StartsWith("#") || trimmed.StartsWith(";") ||
+                        trimmed.StartsWith("["))
+                        continue;
+
+                    int split = line.IndexOf('=');
+                    if (split <= 0) continue;
+
+                    if (!string.Equals(line.Substring(0, split).Trim(), key,
+                            StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    lines[i] = $"{key}={value}";
+                    replaced = true;
+                    break;
+                }
+
+                if (!replaced) lines.Add($"{key}={value}");
+
+                string temporary = path + ".tmp";
+                File.WriteAllLines(temporary, lines);
+
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"not saved - {ex.Message}";
+            }
+        }
+
+        /// <summary>The editable settings with their current values, for the snapshot.</summary>
+        private List<ConfigField> ConfigView()
+        {
+            List<ConfigField> view = new List<ConfigField>();
+
+            foreach (ConfigField field in ConfigSchema.All)
+                view.Add(field with { Value = ConfigValueOf(field.Key) });
+
+            return view;
+        }
+
+        private string ConfigValueOf(string key)
+        {
+            System.Reflection.FieldInfo info = typeof(BotConfig).GetField(key,
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.IgnoreCase);
+
+            object value = info?.GetValue(Config);
+
+            return value is bool flag ? (flag ? "true" : "false") : value?.ToString() ?? "";
+        }
+
+        private string DescribeActivity()
+        {
+            if (_state != BotRunState.Playing) return "offline";
+            if (_town != null && _town.Active) return "town";
+            if (_brain?.Travel != null && _brain.Travel.Active) return "travel";
+
+            return "hunting";
         }
 
         private BotStatus Build()
@@ -1240,11 +1550,25 @@ namespace MirBot
                 {
                     ExitReason = _connection?.ExitReason,
                     LastError = LastError,
-                    History = BuildHistory()
+                    History = BuildHistory(),
+
+                    // Settings belong to the ini, not to the game session. Leaving them out while
+                    // a bot was offline meant the host-wide view simply could not see that bot's
+                    // values - so two bots could disagree about a setting and nothing would say
+                    // so, because one of them happened to be reconnecting at the time.
+                    Config = ConfigView(),
+                    ConfigResult = _configResult
                 };
 
             WorldModel world = _connection.World;
             Backpack items = _connection.Items;
+
+            // The live step first, the wander target second. A town errand or a travel leg sets
+            // Destination on the decision; ordinary roaming does not, and only the brain knows
+            // where it drifted off to.
+            System.Drawing.Point destination = _lastDecision != null && _lastDecision.Destination != System.Drawing.Point.Empty
+                ? _lastDecision.Destination
+                : _brain?.RoamTarget ?? System.Drawing.Point.Empty;
 
             double? percent = null;
             if (world.MaxExperienceKnown && world.MaxExperience > 0)
@@ -1262,39 +1586,203 @@ namespace MirBot
                     item.CurrentDurability / Backpack.DurabilityScale,
                     item.MaxDurability / Backpack.DurabilityScale,
                     Backpack.IsBroken(item),
-                    Backpack.IsWorn(item, Config.RepairAtDurability)));
+                    Backpack.IsWorn(item, Config.RepairAtDurability))
+                {
+                    // Slot -1: a worn item has no inventory slot, and pretending otherwise would
+                    // put "slot 3" on a tooltip for something in the helmet position.
+                    Item = DescribeItem(-1, item)
+                });
             }
 
             List<ItemStatus> inventory = new List<ItemStatus>();
 
             foreach (KeyValuePair<int, ClientUserItem> pair in items.Carried)
-                inventory.Add(new ItemStatus(pair.Key, pair.Value.Info.ItemName,
-                    pair.Value.Count, pair.Value.Info.ItemType.ToString(),
-                    pair.Value.Flags == 0 ? "" : pair.Value.Flags.ToString(),
-                    pair.Value.Info.CanSell));
+                inventory.Add(DescribeItem(pair.Key, pair.Value));
 
             inventory.Sort((a, b) => a.Slot.CompareTo(b.Slot));
 
-            return new BotStatus(
-                Id, _state.ToString(),
-                _lastDecision?.Action.ToString() ?? "", _lastDecision?.Subject ?? "",
-                _lastDecision?.Reason ?? "",
-                _connection.ExitReason, LastError,
-                world.Name, world.Class.ToString(), world.Level, world.Dead,
-                world.Health, world.MaxHealth, world.HealthPercent,
-                world.Mana, world.MaxMana, world.ManaPercent,
-                world.Experience.ToString("0"), world.MaxExperience.ToString("0"),
-                percent, world.AtMaxLevel, world.Gold.ToString(),
-                world.MapIndex, world.MapName, world.Location.X, world.Location.Y, world.InSafeZone,
-                world.BagWeight, world.MaxBagWeight, world.WeightPercent,
-                _town?.Phase.ToString() ?? "", _town?.Status ?? "",
-                (int)(DateTime.UtcNow - _startedAt).TotalSeconds,
-                _decisions, _connection.ResyncCount, _brain?.DetoursTaken ?? 0,
-                _connection.DroppedPackets, world.KnownMagicCount,
-                _brain?.Spells.CastsIssued ?? 0, _brain?.FightsAbandoned ?? 0,
-                _brain?.AvoidedDangerous ?? 0, _brain?.LearnedBlockedCells ?? 0,
-                _town?.BankDiagnostic ?? "",
-                equipment, inventory, BuildHistory());
+            // Storage was invisible everywhere - status page, API, logs - which is part of why
+            // banking being completely broken went unnoticed for so long. What the bot deposits
+            // should be as readable as what it carries.
+            List<ItemStatus> storage = new List<ItemStatus>();
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in items.Stored)
+                storage.Add(DescribeItem(pair.Key, pair.Value));
+
+            // Parts live in their own grid; shown with the server's own offset so the two cannot
+            // be confused and a part that failed to bank is obvious at a glance.
+            foreach (KeyValuePair<int, ClientUserItem> pair in items.PartsStored)
+                storage.Add(DescribeItem(Globals.PartsStorageOffset + pair.Key, pair.Value));
+
+            storage.Sort((a, b) => a.Slot.CompareTo(b.Slot));
+
+            return new BotStatus
+            {
+                Id = Id,
+                State = _state.ToString(),
+                CurrentAction = _lastDecision?.Action.ToString() ?? "",
+                CurrentSubject = _lastDecision?.Subject ?? "",
+                CurrentDetail = _lastDecision?.Reason ?? "",
+                ExitReason = _connection.ExitReason,
+                LastError = LastError,
+
+                CharacterName = world.Name,
+                Class = world.Class.ToString(),
+                Level = world.Level,
+                Dead = world.Dead,
+
+                Health = world.Health,
+                MaxHealth = world.MaxHealth,
+                HealthPercent = world.HealthPercent,
+                Mana = world.Mana,
+                MaxMana = world.MaxMana,
+                ManaPercent = world.ManaPercent,
+
+                Experience = world.Experience.ToString("0"),
+                MaxExperience = world.MaxExperience.ToString("0"),
+                ExperiencePercent = percent,
+                AtMaxLevel = world.AtMaxLevel,
+                Gold = world.Gold.ToString(),
+
+                MapIndex = world.MapIndex,
+                MapName = world.MapName,
+                X = world.Location.X,
+                Y = world.Location.Y,
+                InSafeZone = world.InSafeZone,
+                DestX = destination == System.Drawing.Point.Empty ? (int?)null : destination.X,
+                DestY = destination == System.Drawing.Point.Empty ? (int?)null : destination.Y,
+
+                BagWeight = world.BagWeight,
+                MaxBagWeight = world.MaxBagWeight,
+                BagPercent = world.WeightPercent,
+
+                TripPhase = _town?.Phase.ToString() ?? "",
+                TripStatus = _town?.Status ?? "",
+                TripSequence = _town?.TripSequence ?? 0,
+                Activity = DescribeActivity(),
+                SecondsSinceGain = world.LastExperienceGainUtc == DateTime.MinValue
+                    ? (int?)null
+                    : (int)(DateTime.UtcNow - world.LastExperienceGainUtc).TotalSeconds,
+                SecondsInGame = _inGameAt == DateTime.MinValue
+                    ? (int?)null
+                    : (int)(DateTime.UtcNow - _inGameAt).TotalSeconds,
+                SellRefusals = _connection.SellRefusals,
+                Config = ConfigView(),
+                ConfigResult = _configResult,
+
+                UptimeSeconds = (int)(DateTime.UtcNow - _startedAt).TotalSeconds,
+                Decisions = _decisions,
+                Resyncs = _connection.ResyncCount,
+                Detours = _brain?.DetoursTaken ?? 0,
+                DroppedPackets = _connection.DroppedPackets,
+                KnownMagics = world.KnownMagicCount,
+
+                Casts = _brain?.Spells.CastsIssued ?? 0,
+                FightsAbandoned = _brain?.FightsAbandoned ?? 0,
+                DangerAvoided = _brain?.AvoidedDangerous ?? 0,
+                LearnedBlockedCells = _brain?.LearnedBlockedCells ?? 0,
+                DoorwaysCleared = _brain?.DoorwaysCleared ?? 0,
+                BankStatus = _town?.BankDiagnostic ?? "",
+
+                SellDiagnostic = _town?.SellDiagnostic ?? "",
+                WeightDiagnostic = _town?.WeightDiagnostic ?? "",
+                ReagentDiagnostic = _town?.ReagentDiagnostic ?? "",
+                BookDiagnostic = _town?.BookDiagnostic ?? "",
+                GearDiagnostic = _town?.GearDiagnostic ?? "",
+                SupplyDiagnostic = _town?.SupplyDiagnostic ?? "",
+                RepairDiagnostic = _town?.RepairDiagnostic ?? "",
+
+                Equipment = equipment,
+                Inventory = inventory,
+                Storage = storage,
+                History = BuildHistory()
+            };
+        }
+
+        /// <summary>
+        /// Flatten one item for the snapshot.
+        ///
+        /// Every collection is COPIED here, on the bot thread. ItemInfo.Stats belongs to the shared
+        /// game database and ClientUserItem.AddedStats is rewritten in place whenever the server
+        /// re-sends the item, so handing either to the web thread would be the "collection was
+        /// modified" crash the rule at the top of BotStatus.cs exists to prevent.
+        /// </summary>
+        private static ItemStatus DescribeItem(int slot, ClientUserItem item)
+        {
+            ItemInfo info = item.Info;
+
+            // An item PART carries its own near-useless ItemInfo - every one of them is called
+            // "[Part]" and shares one generic icon, so a storage grid full of them is four
+            // identical cells that say nothing. The real identity is on the instance, in
+            // AddedStats[Stat.ItemIndex], and Backpack already knows how to follow it.
+            //
+            // Name and image come from the target; weight, price, durability and flags stay the
+            // PART's own, because those are facts about the thing actually being carried.
+            ItemInfo part = Backpack.PartTarget(item);
+
+            return new ItemStatus
+            {
+                Slot = slot,
+                Name = Backpack.Describe(item),
+                Count = item.Count,
+                Type = info.ItemType.ToString(),
+                Flags = item.Flags == 0 ? "" : item.Flags.ToString(),
+                CanSell = info.CanSell,
+
+                Image = part?.Image ?? info.Image,
+                Durability = item.CurrentDurability / Backpack.DurabilityScale,
+                MaxDurability = item.MaxDurability / Backpack.DurabilityScale,
+                Weight = item.Weight,
+                Price = info.Price,
+
+                // RequiredType and RequiredAmount, not a level: the server has no single "required
+                // level" field, and the same pair expresses a level, an AC, an attack power or any
+                // of the other RequiredType cases.
+                //
+                // There is no RequiredType.None either - the enum starts at Level, so an item with
+                // no requirement is Level 0 and the amount is what actually says "none".
+                Requirement = info.RequiredAmount <= 0
+                    ? ""
+                    : $"{info.RequiredType} {info.RequiredAmount}",
+
+                Description = info.Description ?? "",
+                Stats = FlattenStats(info.Stats),
+                Added = FlattenStats(item.AddedStats),
+                Sockets = FlattenSockets(item)
+            };
+        }
+
+        private static List<ItemStat> FlattenStats(Stats stats)
+        {
+            List<ItemStat> flat = new List<ItemStat>();
+
+            if (stats?.Values == null) return flat;
+
+            foreach (KeyValuePair<Stat, int> pair in stats.Values)
+            {
+                if (pair.Value == 0) continue;
+
+                // ItemIndex is plumbing, not a stat: it is how an item PART points at the thing it
+                // builds towards, and the name already says "(part 2/25) Wooden Shield". Printing
+                // "ItemIndex +1112" beneath that is a database row leaking into a tooltip.
+                if (pair.Key == Stat.ItemIndex) continue;
+
+                flat.Add(new ItemStat(pair.Key.ToString(), pair.Value));
+            }
+
+            return flat;
+        }
+
+        private static List<string> FlattenSockets(ClientUserItem item)
+        {
+            List<string> gems = new List<string>();
+
+            if (item.Sockets == null) return gems;
+
+            foreach (ClientUserItemSocket socket in item.Sockets)
+                if (socket?.Gem?.Info != null) gems.Add(socket.Gem.Info.ItemName);
+
+            return gems;
         }
 
         private List<HistoryStatus> BuildHistory()

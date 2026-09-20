@@ -91,10 +91,20 @@ namespace MirBot
             if (_nextSave == DateTime.MinValue) _nextSave = DateTime.UtcNow + SaveInterval;
         }
 
-        /// <summary>Write if enough has changed and enough time has passed. Cheap to call often.</summary>
+        /// <summary>
+        /// Write if enough has changed and enough time has passed. Cheap to call often.
+        ///
+        /// The due check reads under the lock. It used to read _dirty and _nextSave without one
+        /// while bot threads wrote them holding it - benign in practice with three banks and a
+        /// thirty-second interval, but it is a torn read waiting for a busier bank, and Flush
+        /// re-checks under the lock anyway so the cost here is a single uncontended acquire.
+        /// </summary>
         public void FlushIfDue()
         {
-            if (!_dirty || DateTime.UtcNow < _nextSave) return;
+            lock (Sync)
+            {
+                if (!_dirty || DateTime.UtcNow < _nextSave) return;
+            }
 
             Flush();
         }

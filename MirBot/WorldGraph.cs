@@ -42,12 +42,24 @@ namespace MirBot
         /// its last coin cannot buy potions and cannot buy a way back, which is worse than the walk
         /// it was trying to avoid.
         /// </summary>
-        public bool Allows(MirClass mirClass, int level, long gold, long goldFloor)
+        public bool Allows(MirClass mirClass, int level, long gold, long goldFloor, int pkPoints,
+            int maxGoldPercent = 0)
         {
             if (Teleport != null)
             {
-                if (!Teleport.Allows(mirClass, level)) return false;
+                if (!Teleport.Allows(mirClass, level, pkPoints)) return false;
+                // Two separate tests, because a dialogue asks two separate questions. A Gold
+                // CHECK wants a balance and takes nothing; TakeGold is what actually charges. A
+                // route that wants you to hold 50,000 and charges 5,000 must be judged on both,
+                // not on a single invented 55,000 figure.
+                if (gold < Teleport.RequiredStartingGold) return false;
                 if (gold - Teleport.Cost < goldFloor) return false;
+
+                // Proportion as well as remainder. See TeleportMaxGoldPercent: the floor is a fixed
+                // line and a rich-ish bot can clear it over and over while spending half of
+                // everything it has on getting about.
+                if (maxGoldPercent > 0 && gold < long.MaxValue &&
+                    Teleport.Cost * 100L > gold * maxGoldPercent) return false;
             }
 
             return Allows(mirClass, level);
@@ -90,6 +102,9 @@ namespace MirBot
     {
         private readonly Dictionary<int, List<MapExit>> _exits = new Dictionary<int, List<MapExit>>();
 
+        /// <summary>Built on demand by ExitCellsOn and thrown away whenever the graph is rebuilt.</summary>
+        private readonly Dictionary<int, HashSet<Point>> _exitCells = new Dictionary<int, HashSet<Point>>();
+
         public int MapCount => _exits.Count;
         public int ExitCount { get; private set; }
         public int SkippedCount { get; private set; }
@@ -101,6 +116,7 @@ namespace MirBot
         public void Build(MapLibrary maps)
         {
             _exits.Clear();
+            _exitCells.Clear();
             ExitCount = 0;
             SkippedCount = 0;
 
@@ -201,6 +217,7 @@ namespace MirBot
                     _exits[exit.FromMapIndex] = list = new List<MapExit>();
 
                 list.Add(exit);
+                _exitCells.Remove(exit.FromMapIndex);
                 ExitCount++;
                 TeleportCount++;
             }
@@ -240,6 +257,38 @@ namespace MirBot
                 : (IReadOnlyList<MapExit>)Array.Empty<MapExit>();
 
         /// <summary>
+        /// Every cell on this map that will move the character to another one.
+        ///
+        /// Walking onto one of these is how a map change happens, which makes them doors when the
+        /// bot means to travel and traps the rest of the time. The server drops an arriving
+        /// character at a random point of the destination region, and that region is the paired one
+        /// for the exit coming back - so a bot begins its stay on a map standing on or beside the
+        /// way out, and a wander that does not know about these walks straight back through one.
+        /// That is not hypothetical: bot 1 oscillated between Sabuk Keep and Banya Village until
+        /// monsters happened to block the cell.
+        ///
+        /// Teleport exits are excluded deliberately. Their Cells hold the NPC's own tile rather
+        /// than a trigger, so nothing happens by standing there - and treating it as an obstacle
+        /// would make the teleporter unapproachable on the one journey that needs it.
+        /// </summary>
+        public HashSet<Point> ExitCellsOn(int mapIndex)
+        {
+            if (_exitCells.TryGetValue(mapIndex, out HashSet<Point> cached)) return cached;
+
+            HashSet<Point> cells = new HashSet<Point>();
+
+            foreach (MapExit exit in ExitsFrom(mapIndex))
+            {
+                if (exit.IsTeleport) continue;
+
+                foreach (Point cell in exit.Cells) cells.Add(cell);
+            }
+
+            _exitCells[mapIndex] = cells;
+            return cells;
+        }
+
+        /// <summary>
         /// Fewest map changes from one map to another, or null when there is no usable route.
         ///
         /// Breadth-first over maps rather than a weighted search over cells: the cost of a journey
@@ -249,7 +298,8 @@ namespace MirBot
         /// walking into them.
         /// </summary>
         public List<MapExit> Route(int fromMapIndex, int toMapIndex, MirClass mirClass, int level,
-            long gold = long.MaxValue, long goldFloor = 0)
+            long gold = long.MaxValue, long goldFloor = 0, int pkPoints = 0,
+            int maxGoldPercent = 0)
         {
             if (fromMapIndex == toMapIndex) return new List<MapExit>();
 
@@ -266,7 +316,7 @@ namespace MirBot
                 foreach (MapExit exit in ExitsFrom(map))
                 {
                     if (seen.Contains(exit.ToMapIndex)) continue;
-                    if (!exit.Allows(mirClass, level, gold, goldFloor)) continue;
+                    if (!exit.Allows(mirClass, level, gold, goldFloor, pkPoints, maxGoldPercent)) continue;
 
                     seen.Add(exit.ToMapIndex);
                     cameBy[exit.ToMapIndex] = exit;
@@ -307,7 +357,8 @@ namespace MirBot
         /// vendor. Routing each candidate separately would be a BFS per map; this is one.
         /// </summary>
         public Dictionary<int, int> HopCounts(int fromMapIndex, MirClass mirClass, int level,
-            long gold = long.MaxValue, long goldFloor = 0)
+            long gold = long.MaxValue, long goldFloor = 0, int pkPoints = 0,
+            int maxGoldPercent = 0)
         {
             Dictionary<int, int> hops = new Dictionary<int, int> { [fromMapIndex] = 0 };
             Queue<int> queue = new Queue<int>();
@@ -322,7 +373,7 @@ namespace MirBot
                 foreach (MapExit exit in ExitsFrom(map))
                 {
                     if (hops.ContainsKey(exit.ToMapIndex)) continue;
-                    if (!exit.Allows(mirClass, level, gold, goldFloor)) continue;
+                    if (!exit.Allows(mirClass, level, gold, goldFloor, pkPoints, maxGoldPercent)) continue;
 
                     hops[exit.ToMapIndex] = next;
                     queue.Enqueue(exit.ToMapIndex);
@@ -335,7 +386,8 @@ namespace MirBot
 
         /// <summary>Every map reachable from here, for reporting and for choosing where to hunt.</summary>
         public List<int> Reachable(int fromMapIndex, MirClass mirClass, int level,
-            long gold = long.MaxValue, long goldFloor = 0)
+            long gold = long.MaxValue, long goldFloor = 0, int pkPoints = 0,
+            int maxGoldPercent = 0)
         {
             List<int> found = new List<int>();
             Queue<int> queue = new Queue<int>();
@@ -348,7 +400,7 @@ namespace MirBot
                 foreach (MapExit exit in ExitsFrom(queue.Dequeue()))
                 {
                     if (seen.Contains(exit.ToMapIndex)) continue;
-                    if (!exit.Allows(mirClass, level, gold, goldFloor)) continue;
+                    if (!exit.Allows(mirClass, level, gold, goldFloor, pkPoints, maxGoldPercent)) continue;
 
                     seen.Add(exit.ToMapIndex);
                     found.Add(exit.ToMapIndex);

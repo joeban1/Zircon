@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -32,10 +33,21 @@ namespace MirBot
         public MapProfile Profiles { get; } = new MapProfile();
         public MonsterIndex Monsters { get; } = new MonsterIndex();
         public MapLibrary Maps { get; private set; }
+
+        /// <summary>A map's display name, or a readable fallback when the database has none.</summary>
+        private static string MapNameOf(int mapIndex) =>
+            Globals.MapInfoList?.Binding?.FirstOrDefault(x => x.Index == mapIndex)?.Description
+            ?? $"map {mapIndex}";
         public HuntingMemory Hunting { get; private set; }
         public MonsterMemory Danger { get; private set; }
         public NavCorrections Nav { get; private set; }
+        public DeathMemory Deaths { get; private set; }
+        public GoldLog Gold { get; private set; }
+
+        /// <summary>Where the memory banks and the extracted item icons live.</summary>
+        public string MemoryFolder { get; private set; } = "";
         public WorldGraph World { get; } = new WorldGraph();
+        public SafeZoneDirectory SafeZones { get; } = new SafeZoneDirectory();
 
         /// <summary>
         /// Every map the travel graph can name, for the status page's destination list. Not
@@ -180,7 +192,14 @@ namespace MirBot
                     entry.MapName.IndexOf(mapFilter, StringComparison.OrdinalIgnoreCase) < 0)
                     continue;
 
-                Log.Write("  " + entry);
+                MapInfo info = Globals.MapInfoList.Binding
+                    .FirstOrDefault(x => x.Index == entry.MapIndex);
+
+                // AllowTT decides whether a town scroll works here at all. A scroll spent on a map
+                // that forbids it is answered with a chat line and nothing else, so the bot has to
+                // know before it spends one.
+                Log.Write("  " + entry +
+                          (info != null && !info.AllowTT ? "  [NO TOWN SCROLL]" : ""));
                 shown++;
             }
 
@@ -195,6 +214,125 @@ namespace MirBot
         /// vendor SELECTION code found no bug, and dumping the vendor DATA found two in two
         /// attempts. Whether paying an NPC is even an option is a question about the data.
         /// </summary>
+        /// <summary>
+        /// What the doorway avoidance is actually working from: how many cells on each map move
+        /// the character somewhere else, and how much of the map they cover. A huge exit region
+        /// would mean the avoidance walls the bot in, which is the one way this can do harm.
+        /// </summary>
+        public void DumpExits(string mapFilter)
+        {
+            int shown = 0, worst = 0;
+            string worstMap = "";
+
+            foreach (MapInfo info in Globals.MapInfoList.Binding
+                .OrderBy(x => x.Description, StringComparer.OrdinalIgnoreCase))
+            {
+                IReadOnlyList<MapExit> exits = World.ExitsFrom(info.Index);
+
+                if (exits.Count == 0) continue;
+
+                if (!string.IsNullOrWhiteSpace(mapFilter) &&
+                    (info.Description ?? "").IndexOf(mapFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                HashSet<Point> cells = World.ExitCellsOn(info.Index);
+                MapGrid grid = Maps?.For(info.Index);
+                int walkable = grid?.WalkableCount ?? 0;
+
+                double share = walkable > 0 ? cells.Count * 100.0 / walkable : 0;
+
+                if (cells.Count > worst) { worst = cells.Count; worstMap = info.Description; }
+
+                Console.WriteLine($"{info.Description} (map {info.Index}): {exits.Count} exit(s), " +
+                                  $"{cells.Count} cell(s)" +
+                                  (walkable > 0 ? $" of {walkable:N0} walkable ({share:N2}%)" : "") +
+                                  (info.AllowTT ? "" : "  [NO TOWN SCROLL]") +
+                                  $" -> {string.Join(", ", exits.Select(x => x.ToMapName).Distinct())}");
+
+                // Coordinates only when a map was actually named, or this buries the summary.
+                if (!string.IsNullOrWhiteSpace(mapFilter))
+                    foreach (MapExit exit in exits)
+                        Console.WriteLine($"    -> {exit.ToMapName}{(exit.IsTeleport ? " (NPC)" : "")}: " +
+                                          string.Join(" ", exit.Cells.Select(c => $"{c.X},{c.Y}")));
+
+                shown++;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"{shown} map(s). Largest exit footprint: {worstMap} at {worst} cell(s).");
+        }
+
+        /// <summary>
+        /// Where the safe zones are, and which vendors actually stand in one.
+        ///
+        /// Banking is only possible inside a safe zone (PlayerObject.cs:7421), and the town trip
+        /// used to attempt it wherever the itinerary happened to end. Whether that was ever a safe
+        /// zone was an assumption nobody had checked - this checks it.
+        /// </summary>
+        public void DumpSafeZones(string mapFilter)
+        {
+            foreach (MapInfo map in Globals.MapInfoList.Binding
+                .OrderBy(x => x.Description, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!SafeZones.Has(map.Index)) continue;
+
+                if (!string.IsNullOrWhiteSpace(mapFilter) &&
+                    (map.Description ?? "").IndexOf(mapFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                HashSet<Point> cells = new HashSet<Point>(SafeZones.On(map.Index));
+
+                Console.WriteLine($"{map.Description} (map {map.Index}): " +
+                                  $"{cells.Count} walkable safe cell(s)");
+
+                foreach (NPCInfo npc in Globals.NPCInfoList.Binding)
+                {
+                    if (npc.Region?.Map != map) continue;
+                    if (npc.Region.PointRegion == null || npc.Region.PointRegion.Length == 0) continue;
+
+                    Point spot = npc.Region.PointRegion[0];
+
+                    Console.WriteLine($"    {(cells.Contains(spot) ? "SAFE  " : "unsafe")} " +
+                                      $"{npc.NPCName} at {spot.X},{spot.Y}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Item stats straight out of System.db - weight, what it restores, price.
+        ///
+        /// Added because a potion's WEIGHT drives how many the bot can budget for, and its HEAL
+        /// drives when drinking one is worth it, and both were being estimated from bag deltas in a
+        /// log. Tiers do not weigh the same, so a guess that fits one tier is wrong for the next.
+        /// </summary>
+        public void DumpItems(string filter)
+        {
+            int shown = 0;
+
+            foreach (ItemInfo info in Globals.ItemInfoList.Binding
+                .OrderBy(x => x.ItemType.ToString(), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.ItemName, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(filter) &&
+                    (info.ItemName ?? "").IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                int health = info.Stats[Stat.Health];
+                int mana = info.Stats[Stat.Mana];
+
+                Log.Write($"  {info.ItemName} ({info.ItemType}) shape {info.Shape}: " +
+                          $"weight {info.Weight}, price {info.Price:N0}" +
+                          (health > 0 ? $", heals {health} HP" : "") +
+                          (mana > 0 ? $", restores {mana} MP" : "") +
+                          (health > 0 && info.Weight > 0
+                              ? $"  [{health / (double)info.Weight:N1} HP per weight]" : ""));
+                shown++;
+            }
+
+            Log.Write($"{shown} item(s)" +
+                      (string.IsNullOrWhiteSpace(filter) ? "." : $" matching '{filter}'."));
+        }
+
         public void DumpTeleports(string mapFilter)
         {
             int shown = 0;
@@ -215,6 +353,13 @@ namespace MirBot
             Log.Write($"{shown} teleport route(s)" +
                       (string.IsNullOrWhiteSpace(mapFilter) ? "." : $" matching '{mapFilter}'.") +
                       " " + Teleports.Describe());
+
+            // Which teleporters we could NOT read, and why. The routes above only say what was
+            // found; this says what was missed, which is the half that used to be silent.
+            Log.Write("Coverage:");
+
+            foreach (string line in Teleports.DescribeCoverage(mapFilter))
+                Log.Write(line);
         }
 
         /// <summary>
@@ -238,7 +383,14 @@ namespace MirBot
                     entry.MapName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
                     continue;
 
-                Log.Write("  " + entry);
+                MapInfo info = Globals.MapInfoList.Binding
+                    .FirstOrDefault(x => x.Index == entry.MapIndex);
+
+                // AllowTT decides whether a town scroll works here at all. A scroll spent on a map
+                // that forbids it is answered with a chat line and nothing else, so the bot has to
+                // know before it spends one.
+                Log.Write("  " + entry +
+                          (info != null && !info.AllowTT ? "  [NO TOWN SCROLL]" : ""));
                 shown++;
             }
 
@@ -330,6 +482,11 @@ namespace MirBot
             Vendors.Build(Books);
             Teleports.Build();
             Profiles.Build();
+            // TownMaps is a HOST-WIDE setting that happens to be read off the first bot's config.
+            // Taking a fleet-wide rule from whichever bot sorted first is a trap, so say so here:
+            // the other bots' TownMaps values are parsed and deliberately ignored. The resolved
+            // names are logged below, and they must be checked - SetTownMaps drops a name it cannot
+            // match silently, and an empty whitelist then FAILS OPEN and shops anywhere.
             Vendors.SetTownMaps(first.TownMaps.Split(','));
             Monsters.Build();
             BotConnection.Monsters = Monsters;
@@ -342,12 +499,22 @@ namespace MirBot
                 ? first.MemoryPath
                 : Path.Combine(AppContext.BaseDirectory, first.MemoryPath);
 
+            // Kept, because Run needs it too - the icon folder lives beside the memory banks and
+            // resolving the same relative path twice invites the two to disagree.
+            MemoryFolder = memory;
+
             Hunting = new HuntingMemory(Path.Combine(memory, "hunting.json"), first.LevelBandSize);
             Danger = new MonsterMemory(Path.Combine(memory, "monsters.json"));
             Nav = new NavCorrections(Path.Combine(memory, "navdata.json"));
+            Deaths = new DeathMemory(Path.Combine(memory, "deaths.json"));
+            Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));
 
             // Needs the grids: a map region is a bitmap whose width is the map's own.
             World.Build(Maps);
+
+            // Same reason, and needed before the first town trip: banking cannot happen outside a
+            // safe zone, so the trip has to know where to stand.
+            SafeZones.Build(Maps);
 
 
             // Teleport NPCs become extra edges in the same graph, so one search weighs a paid hop
@@ -356,12 +523,15 @@ namespace MirBot
             Log.Write("Teleports: " + Teleports.Describe() +
                       (first.UseTeleportNPCs ? "." : " - disabled by config."));
             Log.Write("Maps: " + Profiles.Describe() + ".");
+            Log.Write($"Safe zones: {SafeZones.CellCount:N0} cell(s) across " +
+                      $"{SafeZones.MapCount} map(s).");
             ClientHash = first.ResolveClientHash();
 
             Log.Write($"Database {GameDatabase.Version}: {Books.Count} skills, " +
                       $"{Monsters.Count} monsters, {Vendors.Count} trading pages.");
 
-            Log.Write($"Memory: {Hunting.Describe()}, {Danger.Describe()}, {Nav.Describe()}.");
+            Log.Write($"Memory: {Hunting.Describe()}, {Danger.Describe()}, {Nav.Describe()}, " +
+                      $"{Deaths.Describe()}, {Gold.Describe()}.");
             Log.Write(World.Describe() + ".");
             Log.Write("Vendors: " + Vendors.DescribeTownMaps() + ".");
 
@@ -395,6 +565,61 @@ namespace MirBot
         public BotInstance Find(string id) =>
             _instances.FirstOrDefault(x => string.Equals(x.Id, id, StringComparison.OrdinalIgnoreCase));
 
+        /// <summary>
+        /// One map's walkability, or null if we have no grid for it.
+        ///
+        /// Safe from the web thread: MapLibrary.For is locked, and a MapGrid is immutable once
+        /// built, so nothing here can be mutated underneath a response. The encoding is cached on
+        /// the grid itself, so only the first request for a map pays for it.
+        /// </summary>
+        private MapMask MapMaskFor(int mapIndex)
+        {
+            MapGrid grid = Maps?.For(mapIndex);
+            if (grid == null) return null;
+
+            return new MapMask
+            {
+                Index = mapIndex,
+                Name = MapNameOf(mapIndex),
+                Width = grid.Width,
+                Height = grid.Height,
+
+                // Derived from the file, not from a constant: a re-exported map must not keep
+                // serving last week's shape out of the browser cache.
+                Version = grid.Version,
+                Mask = grid.PackedMask
+            };
+        }
+
+        /// <summary>
+        /// The hunting table, with the lethal maps marked.
+        ///
+        /// Lethal() is evaluated per class and level from the bots that are actually running, so
+        /// the page can show WHY a map with a good-looking rate is nevertheless being skipped.
+        /// Built on the web thread, but only from copies - see HuntingMemory.Snapshot.
+        /// </summary>
+        private List<HuntingRow> HuntingRows()
+        {
+            List<HuntingRow> rows = Hunting.Snapshot();
+
+            HashSet<(string, int)> lethal = new HashSet<(string, int)>();
+
+            foreach (BotInstance instance in _instances)
+            {
+                BotStatus status = instance.Status;
+                if (string.IsNullOrEmpty(status?.Class)) continue;
+
+                foreach (int mapIndex in Hunting.Lethal(status.Class, status.Level))
+                    lethal.Add((status.Class, mapIndex));
+            }
+
+            for (int i = 0; i < rows.Count; i++)
+                if (lethal.Contains((rows[i].Class, rows[i].MapIndex)))
+                    rows[i] = rows[i] with { Lethal = true };
+
+            return rows;
+        }
+
         /// <summary>Built on the web thread from published snapshots - never from live state.</summary>
         public HostStatus Snapshot()
         {
@@ -416,6 +641,77 @@ namespace MirBot
         {
             BotInstance instance = Find(id);
             return instance != null && instance.TryEnqueue(kind, argument);
+        }
+
+        /// <summary>
+        /// Send one command to every bot, and report how many took it.
+        ///
+        /// Used for settings, which are a statement about how the operator wants the bots to play
+        /// rather than about one character. Each bot still applies it on its own thread and writes
+        /// its own ini - the fan-out is only about where the instruction comes from.
+        ///
+        /// A bot whose queue is full is counted as a miss rather than retried: the queue is bounded
+        /// precisely so a wedged bot cannot accumulate work, and silently waiting on one here would
+        /// block the web thread.
+        /// </summary>
+        public int CommandAll(BotCommandKind kind, string argument = null)
+        {
+            int taken = 0;
+
+            foreach (BotInstance instance in _instances)
+                if (instance.TryEnqueue(kind, argument)) taken++;
+
+            return taken;
+        }
+
+        /// <summary>
+        /// The editable settings as they stand across every bot.
+        ///
+        /// Built from the PUBLISHED SNAPSHOTS, never from the live BotConfig objects: those are now
+        /// written by bot threads, so reading them here would be the data race the whole snapshot
+        /// discipline exists to avoid.
+        /// </summary>
+        private List<HostConfigField> HostConfig()
+        {
+            List<HostConfigField> rows = new List<HostConfigField>();
+
+            List<BotStatus> statuses = new List<BotStatus>();
+
+            foreach (BotInstance instance in _instances)
+            {
+                BotStatus status = instance.Status;
+                if (status?.Config != null && status.Config.Count > 0) statuses.Add(status);
+            }
+
+            foreach (ConfigField field in ConfigSchema.All)
+            {
+                List<string> values = new List<string>();
+
+                foreach (BotStatus status in statuses)
+                    foreach (ConfigField owned in status.Config)
+                        if (owned.Key == field.Key) { values.Add(owned.Value); break; }
+
+                bool mixed = false;
+
+                for (int i = 1; i < values.Count; i++)
+                    if (values[i] != values[0]) { mixed = true; break; }
+
+                rows.Add(new HostConfigField
+                {
+                    Key = field.Key,
+                    Kind = field.Kind,
+                    Min = field.Min,
+                    Max = field.Max,
+                    Group = field.Group,
+                    Note = field.Note,
+                    Reach = field.Reach,
+                    Value = values.Count > 0 ? values[0] : "",
+                    Mixed = mixed,
+                    PerBot = mixed ? values : Array.Empty<string>()
+                });
+            }
+
+            return rows;
         }
 
         public string[] BotLogTail(string id, int lines) => Find(id)?.LogTail(lines);
@@ -447,7 +743,15 @@ namespace MirBot
                 }
             }
 
-            _status = new StatusServer(StatusPort, Log, Snapshot, Command, TravelChoices, BotLogTail);
+            _status = new StatusServer(StatusPort, Log, Snapshot, Command, TravelChoices, BotLogTail,
+                HuntingRows, Deaths.Snapshot, Gold.Read, MapMaskFor,
+                HostConfig, CommandAll,
+                _instances.FirstOrDefault()?.Config?.StatusExtraHosts ?? "");
+
+            // Icons are optional: the folder is normally absent, and the page falls back to
+            // coloured tiles. Set here rather than in the constructor so the server needs no
+            // opinion about where the bot keeps its memory.
+            _status.IconPath = Path.Combine(MemoryFolder, "icons");
             _status.Start();
 
             Log.Write($"Host running with {_instances.Count} bot(s). Ctrl+C to stop.");
@@ -458,6 +762,7 @@ namespace MirBot
                 Hunting.FlushIfDue();
                 Danger.FlushIfDue();
                 Nav.FlushIfDue();
+                Deaths.FlushIfDue();
                 Thread.Sleep(500);
             }
 
@@ -465,6 +770,7 @@ namespace MirBot
             Hunting.Flush();
             Danger.Flush();
             Nav.Flush();
+            Deaths.Flush();
 
             // Ask every bot to log out properly FIRST. Going straight to RequestShutdown tears the
             // socket down without a C.Logout, so characters linger in the world until the server

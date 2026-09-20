@@ -20,6 +20,9 @@ namespace MirBot
             string checkVendors = null;
             string checkTeleports = null;
             string checkProfiles = null;
+            string checkExits = null;
+            string checkSafe = null;
+            string checkItems = null;
             int seconds = 0;   // 0 = run until Ctrl+C; bounded runs are for testing
 
             for (int i = 0; i < args.Length; i++)
@@ -36,6 +39,12 @@ namespace MirBot
                 { checkTeleports = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
                 if (args[i] == "--maps")
                 { checkProfiles = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
+                if (args[i] == "--exits")
+                { checkExits = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
+                if (args[i] == "--safezones")
+                { checkSafe = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
+                if (args[i] == "--items")
+                { checkItems = i + 1 < args.Length ? args[i + 1] : ""; console = true; }
                 if (args[i] == "--seconds" && i + 1 < args.Length &&
                     int.TryParse(args[i + 1], out int parsed)) seconds = parsed;
             }
@@ -67,6 +76,12 @@ namespace MirBot
                 if (checkTeleports != null) { host.DumpTeleports(checkTeleports); return 0; }
 
                 if (checkProfiles != null) { host.DumpMapProfiles(checkProfiles); return 0; }
+
+                if (checkExits != null) { host.DumpExits(checkExits); return 0; }
+
+                if (checkSafe != null) { host.DumpSafeZones(checkSafe); return 0; }
+
+                if (checkItems != null) { host.DumpItems(checkItems); return 0; }
 
                 Console.CancelKeyPress += (s, e) =>
                 {

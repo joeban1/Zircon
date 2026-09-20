@@ -28,6 +28,15 @@ namespace MirBot
 
         public string FileName { get; }
 
+        /// <summary>
+        /// Identifies this exact file, for cache validation.
+        ///
+        /// Size and last-write time rather than a hash: the mask is served with a long max-age, so
+        /// something has to change when the map does, and hashing a 30 MB file to answer a web
+        /// request would be absurd when the filesystem already knows.
+        /// </summary>
+        public string Version { get; private set; } = "";
+
         private MapGrid(string fileName, int width, int height, bool[] walkable)
         {
             FileName = fileName;
@@ -45,10 +54,73 @@ namespace MirBot
 
         public bool Walkable(Point point) => Walkable(point.X, point.Y);
 
+        /// <summary>How much of this map can be stood on. Counted once, on first use.</summary>
+        public int WalkableCount
+        {
+            get
+            {
+                if (_walkableCount >= 0) return _walkableCount;
+
+                int count = 0;
+
+                foreach (bool cell in _walkable)
+                    if (cell) count++;
+
+                return _walkableCount = count;
+            }
+        }
+
+        private int _walkableCount = -1;
+
+        /// <summary>
+        /// The whole grid as one bit per cell, row-major (y outer, x inner) for the page's canvas.
+        ///
+        /// Built once and kept, because a grid never changes after Load and the largest map here is
+        /// 1360x1500 - two million cells, which is 250 KB packed but several megabytes as JSON
+        /// booleans. Row-major deliberately, even though the internal array is column-major: it is
+        /// the order ImageData wants, so the page can walk it straight into a bitmap instead of
+        /// transposing two million times in JavaScript.
+        ///
+        /// Encoded on first request and cached. The HTTP loop is single-threaded, so paying this
+        /// once is fine and paying it per request would stall every other poll behind it.
+        /// </summary>
+        public string PackedMask
+        {
+            get
+            {
+                if (_packed != null) return _packed;
+
+                lock (_packLock)
+                {
+                    if (_packed != null) return _packed;
+
+                    byte[] bits = new byte[(Width * Height + 7) / 8];
+
+                    for (int y = 0, i = 0; y < Height; y++)
+                        for (int x = 0; x < Width; x++, i++)
+                            if (_walkable[x * Height + y]) bits[i >> 3] |= (byte)(1 << (i & 7));
+
+                    return _packed = Convert.ToBase64String(bits);
+                }
+            }
+        }
+
+        private string _packed;
+        private readonly object _packLock = new object();
+
         /// <summary>Loads a .map file, or returns null if it is missing or malformed.</summary>
         public static MapGrid Load(string path)
         {
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
+
+            string version;
+
+            try
+            {
+                FileInfo info = new FileInfo(path);
+                version = $"{info.Length:x}-{info.LastWriteTimeUtc.Ticks:x}";
+            }
+            catch (Exception) { version = ""; }
 
             byte[] bytes;
 
@@ -89,7 +161,10 @@ namespace MirBot
                     walkable[x * height + y] = (flag & 0x01) == 0x01 && (flag & 0x02) == 0x02;
                 }
 
-            return new MapGrid(Path.GetFileNameWithoutExtension(path), width, height, walkable);
+            return new MapGrid(Path.GetFileNameWithoutExtension(path), width, height, walkable)
+            {
+                Version = version
+            };
         }
     }
 }

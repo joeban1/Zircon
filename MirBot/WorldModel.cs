@@ -25,6 +25,28 @@ namespace MirBot
         /// <summary>MonsterInfo.AI. -1 is a town Guard; 1 and 2 are passive harvestable animals.</summary>
         public int AI;
 
+        /// <summary>MonsterInfo.Index, so a summon can be told from any other monster of the same
+        /// owner. Ownership alone cannot say WHICH pet this is.</summary>
+        public int MonsterIndex = -1;
+
+        /// <summary>
+        /// The owning character's NAME, or null/empty for a wild monster.
+        ///
+        /// This is the only ownership signal the protocol carries: S.ObjectMonster.PetOwner and
+        /// S.ObjectPetOwnerChanged, both plain strings. The reference client compares it against the
+        /// player's own name too (Client/Models/MonsterObject.cs:2674). Without it a summoned pet is
+        /// an ordinary monster, which means a valid target and a counted threat - to its own owner.
+        /// </summary>
+        public string PetOwner;
+
+        /// <summary>
+        /// The aggregate poison flags on this object, from S.ObjectPoison and the spawn packet.
+        ///
+        /// Broadcast ONLY when the mask changes (MapObject.cs:405), and it carries presence alone -
+        /// no stack value, no remaining ticks, no owner. Enough to know not to re-apply.
+        /// </summary>
+        public PoisonType Poison;
+
         /// <summary>For ObjectKind.Item: what is lying there, so loot can be judged before walking to it.</summary>
         public ItemInfo ItemInfo;
 
@@ -42,7 +64,15 @@ namespace MirBot
         /// </summary>
         public bool IsGuard => AI == -1;
 
-        public bool IsValidTarget => IsLiveMonster && !IsGuard;
+        /// <summary>Somebody's pet - ours or another player's.</summary>
+        public bool IsPet => !string.IsNullOrEmpty(PetOwner);
+
+        /// <summary>
+        /// Attackable at all. Pets are excluded outright: under the ordinary attack mode the server
+        /// silently refuses attacks on an owned monster, so swinging at one is a decision that can
+        /// never succeed and produces no error to learn from.
+        /// </summary>
+        public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet;
 
         public override string ToString() => $"{Kind}:{Name}#{ObjectID}@{Location.X},{Location.Y}" +
                                              (Dead ? " (dead)" : "");
@@ -105,6 +135,97 @@ namespace MirBot
         /// <summary>Our own stats, needed to test an item's RequiredType/RequiredAmount.</summary>
         public Stats PlayerStats = new Stats();
 
+        /// <summary>
+        /// PK points, which several NPC dialogues gate on (NPCObject.cs:573). Zero for every bot we
+        /// run - they never attack players - but read rather than assumed, because the whole Hexa
+        /// Holy Stone network hangs off this check and an assumption here would be invisible.
+        /// </summary>
+        public int PKPoints => PlayerStats[Stat.PKPoint];
+
+        /// <summary>
+        /// Our own buffs, keyed by Index because that is what the server identifies them by.
+        ///
+        /// S.BuffRemove, S.BuffChanged and S.BuffTime all carry an Index and nothing else, so a
+        /// dictionary keyed by BuffType cannot service them. Type lookup goes over this.
+        ///
+        /// Nothing here is ever assumed: S.BuffAdd carries RemainingTime, expiry arrives as an
+        /// ordinary S.BuffRemove, and the full list comes down in StartInformation at login. There
+        /// is no re-cast timer anywhere in this bot for exactly that reason.
+        /// </summary>
+        private readonly Dictionary<int, ClientBuffInfo> _buffs = new Dictionary<int, ClientBuffInfo>();
+
+        public int BuffCount => _buffs.Count;
+
+        public IEnumerable<ClientBuffInfo> Buffs => _buffs.Values;
+
+        public bool HasBuff(BuffType type)
+        {
+            foreach (ClientBuffInfo buff in _buffs.Values)
+                if (buff.Type == type) return true;
+
+            return false;
+        }
+
+        public void ResetBuffs(IEnumerable<ClientBuffInfo> buffs)
+        {
+            _buffs.Clear();
+
+            if (buffs != null)
+                foreach (ClientBuffInfo buff in buffs)
+                    if (buff != null) _buffs[buff.Index] = buff;
+
+            Touch();
+        }
+
+        public void AddBuff(ClientBuffInfo buff)
+        {
+            if (buff == null) return;
+
+            _buffs[buff.Index] = buff;
+            Touch();
+        }
+
+        public void RemoveBuff(int index)
+        {
+            if (_buffs.Remove(index)) Touch();
+        }
+
+        public void ChangeBuff(int index, Stats stats)
+        {
+            if (!_buffs.TryGetValue(index, out ClientBuffInfo buff)) return;
+
+            buff.Stats = stats;
+            Touch();
+        }
+
+        public void SetBuffTime(int index, TimeSpan time)
+        {
+            if (!_buffs.TryGetValue(index, out ClientBuffInfo buff)) return;
+
+            buff.RemainingTime = time;
+            Touch();
+        }
+
+        public void SetBuffPaused(int index, bool paused)
+        {
+            if (!_buffs.TryGetValue(index, out ClientBuffInfo buff)) return;
+
+            buff.Pause = paused;
+            Touch();
+        }
+
+        /// <summary>
+        /// How our pets are told to behave. ONE setting for all of them - the server has no
+        /// per-pet command, only C.ChangePetMode (SConnection.cs:983).
+        /// </summary>
+        public PetMode PetMode = PetMode.Both;
+
+        public void ApplyPetMode(PetMode mode)
+        {
+            PetMode = mode;
+            Touch();
+        }
+
         public decimal Experience;
         public decimal MaxExperience;
 
@@ -117,6 +238,17 @@ namespace MirBot
 
         /// <summary>Every point of experience gained this session, never reset by a level-up.</summary>
         public decimal TotalExperienceGained;
+
+        /// <summary>
+        /// When experience last arrived. MinValue until the first gain of the session.
+        ///
+        /// Read as "productive combat", NOT strictly "last kill" - the server also grants
+        /// experience from items and other rewards (PlayerObject.GainExperience has several
+        /// callers). For a bot that only fights it is a kill in practice, and it is the cheapest
+        /// honest signal that the character is achieving anything at all: a bot can look busy for
+        /// an hour, deciding and moving and walking to vendors, while this does not move once.
+        /// </summary>
+        public DateTime LastExperienceGainUtc = DateTime.MinValue;
 
         public bool AtMaxLevel => MaxExperienceKnown && MaxExperience == 0;
 
@@ -143,7 +275,12 @@ namespace MirBot
             // Separate running total. Experience itself is overwritten by LevelChanged, so it
             // cannot be differenced across a level-up - and a sampling window that happens to
             // contain one is exactly the window worth measuring.
-            if (amount > 0) TotalExperienceGained += amount;
+            if (amount > 0)
+            {
+                TotalExperienceGained += amount;
+                LastExperienceGainUtc = DateTime.UtcNow;
+            }
+
             Touch();
         }
 
@@ -196,6 +333,24 @@ namespace MirBot
 
         /// <summary>Every learned skill. Read-only use on the bot thread only.</summary>
         public IEnumerable<ClientUserMagic> Magics => _magics.Values;
+
+        /// <summary>
+        /// A learned skill by its MagicType. The dictionary is keyed by MagicInfo.Index, so callers
+        /// wanting a named spell would otherwise each write their own scan.
+        /// </summary>
+        public bool TryGetMagic(MagicType magic, out ClientUserMagic found)
+        {
+            foreach (ClientUserMagic known in _magics.Values)
+            {
+                if (known.Info == null || known.Info.Magic != magic) continue;
+
+                found = known;
+                return true;
+            }
+
+            found = null;
+            return false;
+        }
 
         /// <summary>
         /// Do we know this skill and is our level high enough to use it?
@@ -293,6 +448,10 @@ namespace MirBot
                 if (ob.ObjectID == except || ob.ObjectID == SelfID) continue;
 
                 // Items lie on the floor and are walked over, not around.
+                //
+                // Pets are deliberately NOT excluded here. They are not targets and not threats,
+                // but they are bodies: a summon standing in a doorway blocks it exactly as any
+                // other monster does, and pathing that pretended otherwise would walk into it.
                 if (ob.Kind == ObjectKind.Item) continue;
                 if (ob.Kind == ObjectKind.Monster && ob.Dead) continue;
 
@@ -392,7 +551,13 @@ namespace MirBot
             Gender = start.Gender;
             Level = start.Level;
             InSafeZone = start.InSafeZone;
+            if (start.InSafeZone) BindMapIndex = MapIndex;
             ApplyMagics(start.Magics);
+
+            // Authoritative seeds for the two things the server owns and we must never guess:
+            // the buffs already running, and how our pets are currently told to behave.
+            ResetBuffs(start.Buffs);
+            PetMode = start.PetMode;
 
             Experience = start.Experience;
             MaxExperience = 0;
@@ -438,7 +603,8 @@ namespace MirBot
             return ob;
         }
 
-        public void AddMonster(uint objectID, string name, int ai, Point location, MirDirection direction, bool dead)
+        public void AddMonster(uint objectID, string name, int ai, Point location, MirDirection direction,
+            bool dead, string petOwner = null, int monsterIndex = -1, PoisonType? poison = null)
         {
             if (objectID == SelfID) return;
 
@@ -448,8 +614,51 @@ namespace MirBot
             ob.Location = location;
             ob.Direction = direction;
             ob.Dead = dead;
+            ob.PetOwner = petOwner;
+
+            // Null means "this packet does not carry poison" - S.DataObjectMonster has no such
+            // field. Writing None for it would erase a state the server has already told us about
+            // and only tells us about again when it CHANGES.
+            if (poison.HasValue) ob.Poison = poison.Value;
+
+            if (monsterIndex >= 0) ob.MonsterIndex = monsterIndex;
+
             Touch();
         }
+
+        /// <summary>A monster was tamed, released, or its summon expired.</summary>
+        public void ApplyPetOwner(uint objectID, string petOwner)
+        {
+            if (!_objects.TryGetValue(objectID, out WorldObject ob)) return;
+
+            ob.PetOwner = petOwner;
+            Touch();
+        }
+
+        public void ApplyPoison(uint objectID, PoisonType poison)
+        {
+            if (!_objects.TryGetValue(objectID, out WorldObject ob)) return;
+
+            ob.Poison = poison;
+            Touch();
+        }
+
+        /// <summary>Our own pets, by the only signal the protocol gives: the owner's name.</summary>
+        public IEnumerable<WorldObject> OwnPets
+        {
+            get
+            {
+                foreach (WorldObject ob in _objects.Values)
+                    if (ob.Kind == ObjectKind.Monster && !ob.Dead &&
+                        !string.IsNullOrEmpty(ob.PetOwner) &&
+                        string.Equals(ob.PetOwner, Name, StringComparison.Ordinal))
+                        yield return ob;
+            }
+        }
+
+        public bool IsOwnPet(WorldObject ob) =>
+            ob != null && !string.IsNullOrEmpty(ob.PetOwner) &&
+            string.Equals(ob.PetOwner, Name, StringComparison.Ordinal);
 
         public void AddPlayer(uint objectID, string name, Point location, MirDirection direction)
         {
@@ -489,8 +698,21 @@ namespace MirBot
         public void ApplySafeZone(bool inSafeZone)
         {
             InSafeZone = inSafeZone;
+
+            // The server re-binds the character to whatever safe zone it is standing in
+            // (PlayerObject.cs:1454, UpdateBindPoint(CurrentCell.SafeZone)), and a town scroll goes
+            // to that bind point - NOT to a town of the bot's choosing. So walking through Sabuk
+            // Keep's safe zone on the way somewhere re-binds there, and the next scroll returns the
+            // bot to Sabuk Keep, which has a safe zone and no vendors at all. One wasted scroll and
+            // an abandoned trip. Watching the flag is enough to know where a scroll would land.
+            if (inSafeZone) BindMapIndex = MapIndex;
+
             Touch();
         }
+
+        /// <summary>Where a town scroll would put us, learned by watching safe zones. -1 until
+        /// the character has stood in one since logging in.</summary>
+        public int BindMapIndex = -1;
 
         public void ApplyStats(Stats stats)
         {
@@ -676,11 +898,13 @@ namespace MirBot
         {
             int monsters = _objects.Values.Count(x => x.IsValidTarget);
             int players = _objects.Values.Count(x => x.Kind == ObjectKind.Player);
+            int pets = _objects.Values.Count(x => x.IsLiveMonster && x.IsPet);
 
             return $"{Name} L{Level} {Class} @ {Location.X},{Location.Y} map {MapIndex} | " +
                    $"HP {Health}/{MaxHealth} ({HealthPercent}%) MP {Mana}/{MaxMana} | " +
                    $"bag {BagWeight}/{MaxBagWeight} ({WeightPercent}%) | " +
-                   $"{monsters} live monsters, {players} players, {_objects.Count} objects | " +
+                   $"{monsters} live monsters, {players} players, " +
+                   (pets > 0 ? $"{pets} pets, " : "") + $"{_objects.Count} objects | " +
                    $"{KnownMagicCount} magics";
         }
     }

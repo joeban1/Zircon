@@ -101,6 +101,10 @@ DrinkManaAtPercent=40
 # somewhere far from home unable to buy potions or a way back is worse than the walk.
 UseTeleportNPCs=true
 TeleportGoldFloor=20000
+# And a proportional cap on top of it. The floor is a fixed line, so a bot holding 75,000
+# can pay 35,000 in fares without ever crossing it - which is how one wizard travelled
+# itself broke. At 25% a 5,000 hop needs 20,000 and a 10,000 hop needs 40,000. 0 disables.
+TeleportMaxGoldPercent=25
 
 # --- Overnight resilience ---------------------------------------------------------
 # Revive automatically this many seconds after dying; 0 leaves it to the status page
@@ -127,6 +131,17 @@ BlockedCellEvidence=3
 # health with a half-full bag, no potions and no reason to go anywhere. With
 # auto-revive on, that is a death loop that lasts all night.
 RestockAtPotionPercent=25
+
+# Reagents (Taoist amulets and poisons) are bought toward a stock target, but no single
+# trip may spend more than this share of gold on them. The target is the destination;
+# this is the pace. One level 14 Taoist put 10,000 of its 11,165 gold into a single
+# 300-unit poison order and spent the rest of the session unable to buy a potion.
+ReagentGoldPercent=15
+
+# Gold that must survive replacing a burnt-out torch. Buy a Candle for 10, sell the dead
+# one back for 1, every few minutes: harmless when rich, and the thing that took two
+# broke bots down to single figures while a healing potion cost 80.
+TorchGoldFloor=500
 
 # --- Choosing where to hunt -------------------------------------------------------
 # Pick at random from this many of the best-scoring maps rather than always the top
@@ -172,4 +187,4 @@ TravelGoldPerHop=3000
 # Deliberately well above "can afford one potion". The bar is being able to absorb the
 # ordinary costs of being away from home - a repair bill, a full restock and a way back -
 # not merely surviving the next ten minutes. A single broken ring cost 611 gold.
-PoorGold=20000
+PoorGold=10000

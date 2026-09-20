@@ -196,6 +196,44 @@ namespace MirBot
         }
 
         /// <summary>
+        /// Every record, copied, for the status page.
+        ///
+        /// COPIED, and copied while holding the lock. Best() hands out the live HuntingEntry
+        /// objects and releases the lock before returning them, which is fine for the bot thread
+        /// that asked - it owns the decision it is about to make - but serialising them on the web
+        /// thread would race every other bot's Record() and RecordDeath(). The rule at the top of
+        /// BotStatus.cs applies here too: nothing mutable leaves the bot threads.
+        /// </summary>
+        public List<HuntingRow> Snapshot(double deathPenalty = DefaultDeathPenalty)
+        {
+            List<HuntingRow> rows = new List<HuntingRow>();
+
+            lock (Sync)
+            {
+                foreach (HuntingEntry entry in Entries)
+                    rows.Add(new HuntingRow
+                    {
+                        MapIndex = entry.MapIndex,
+                        MapName = entry.MapName,
+                        Class = entry.Class,
+                        LevelBand = entry.LevelBand,
+                        Level = entry.Level,
+                        AveragePerHour = entry.AverageExperiencePerHour,
+                        BestPerHour = entry.BestExperiencePerHour,
+                        LastPerHour = entry.LastExperiencePerHour,
+                        Samples = entry.Samples,
+                        HoursSampled = entry.HoursSampled,
+                        Deaths = entry.Deaths,
+                        Score = entry.Score(deathPenalty),
+                        UpdatedUtc = entry.UpdatedUtc.ToString("o")
+                    });
+            }
+
+            rows.Sort((a, b) => b.Score.CompareTo(a.Score));
+            return rows;
+        }
+
+        /// <summary>
         /// Best known maps for this class and level, best first, ranked on mean rate discounted by
         /// deaths. Empty until something is measured.
         /// </summary>
@@ -222,6 +260,54 @@ namespace MirBot
             if (found.Count > take) found.RemoveRange(take, found.Count - take);
 
             return found;
+        }
+
+        /// <summary>
+        /// Maps that have killed us repeatedly without ever yielding a measurement.
+        ///
+        /// These fall through every other guard, and the gap is not obvious until it bites. Best()
+        /// drops any entry with no measured rate, so a map lethal enough that no sample window ever
+        /// completed is absent from the ranking - and TryExplore builds its "already measured" set
+        /// from Best(), so the same map looks brand new and gets chosen again. The worse a map is,
+        /// the more attractive it becomes.
+        ///
+        /// Phantom Forest did exactly this: a level 18-19 wizard was sent there eight times, died
+        /// eight times, banked no experience at all, and paid a 5,000-10,000 gold teleport fare
+        /// each way. Between the fares and re-equipping after each death it went from 75,000 gold
+        /// to almost nothing, and the record of all nineteen deaths sat in memory the whole time
+        /// being read by nothing.
+        ///
+        /// Deaths are counted from this band and every band below it. Dying at level 18 is still
+        /// worth knowing at level 19; it stops mattering once the bot has genuinely outgrown the
+        /// place, which is what forgetAfterBands expresses. Nothing is struck off permanently, and
+        /// a map with any measured rate is left to Score() and its death discount instead - this
+        /// is only about the maps we know nothing about except that they killed us.
+        /// </summary>
+        public HashSet<int> Lethal(string mirClass, int level, int minDeaths = 3,
+            int forgetAfterBands = 2)
+        {
+            HashSet<int> lethal = new HashSet<int>();
+
+            lock (Sync)
+            {
+                int band = BandOf(level);
+
+                foreach (HuntingEntry entry in Entries)
+                {
+                    if (entry.Class != mirClass) continue;
+                    if (entry.AverageExperiencePerHour > 0) continue;
+                    if (entry.Deaths < minDeaths) continue;
+
+                    // Only our own band and the ones beneath it, and not from so far below that
+                    // the character it happened to is no longer recognisably this one.
+                    if (entry.LevelBand > band) continue;
+                    if (band - entry.LevelBand >= forgetAfterBands) continue;
+
+                    lethal.Add(entry.MapIndex);
+                }
+            }
+
+            return lethal;
         }
 
         /// <summary>

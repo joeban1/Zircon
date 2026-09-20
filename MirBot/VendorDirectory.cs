@@ -91,6 +91,43 @@ namespace MirBot
         public int Count => _entries.Count;
         public IEnumerable<VendorEntry> Entries => _entries;
 
+        /// <summary>
+        /// Somebody on this map who sells this item type.
+        ///
+        /// Needed because buying reagents where they happen to be on offer is not the same as
+        /// GOING somewhere that sells them. A Taoist who knows Poison Dust but whose itinerary
+        /// never passes a poison seller casts the spell over and over with an empty Poison slot,
+        /// and the server fails each cast in silence - which is exactly what was observed.
+        ///
+        /// Cheapest wins: reagents are interchangeable, so there is nothing else to prefer.
+        /// </summary>
+        public VendorEntry BestSellerOf(ItemType type, int onlyMap)
+        {
+            VendorEntry best = null;
+            long bestPrice = long.MaxValue;
+
+            foreach (VendorEntry entry in ShoppableOn(onlyMap))
+            {
+                if (entry.Page?.Goods == null) continue;
+
+                foreach (NPCGood good in entry.Page.Goods)
+                {
+                    if (good?.Item == null || good.Item.ItemType != type) continue;
+                    if (good.Item.Price >= bestPrice) continue;
+
+                    bestPrice = good.Item.Price;
+                    best = entry;
+                }
+            }
+
+            return best;
+        }
+
+        /// <summary>Is there anyone to trade with on this map? A town scroll that lands somewhere
+        /// with no vendors has bought nothing.</summary>
+        public bool HasVendorsOn(int mapIndex) =>
+            mapIndex > 0 && _entries.Any(x => x.MapIndex == mapIndex);
+
         private readonly HashSet<int> _townMaps = new HashSet<int>();
 
         public IReadOnlyCollection<int> TownMaps => _townMaps;
