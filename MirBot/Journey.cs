@@ -45,8 +45,24 @@ namespace MirBot
         /// <summary>How close we have to be to talk, and how much gold to keep back. Set by the
         /// owner from config; the journey itself has no opinion about either.</summary>
         public int TalkRange = 5;
+
+        /// <summary>Set when a journey had to cross a map we would rather have gone around.</summary>
+        public string Detour = "";
         public long Gold;
         public long GoldFloor;
+
+        /// <summary>
+        /// Maps not to cross on the way, set fresh by BotInstance from HuntingMemory.Lethal before
+        /// each journey begins. Not config: it is a measurement, and it changes as the bot levels.
+        ///
+        /// Lethal() was consulted for where to GO and never for how to GET there, which is a gap
+        /// with teeth: a level 18 assassin picked Deserted Mine - a perfectly sensible destination
+        /// it had never measured - and the route planner sent it through Phantom Forest, a map that
+        /// had already killed the wizard twelve times and the assassin seven. It walked in at full
+        /// health, met twenty-eight monsters, and was dead seventy seconds later. The destination
+        /// was never the problem.
+        /// </summary>
+        public HashSet<int> Avoid;
 
         /// <summary>Share of current gold a single fare may cost. See BotConfig.TeleportMaxGoldPercent.</summary>
         public int MaxGoldPercent;
@@ -85,7 +101,21 @@ namespace MirBot
             Gold = world.Gold;
 
             List<MapExit> route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class,
-                world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent);
+                world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent, Avoid);
+
+            // Stranded beats dead, but not always: if the only way there is through somewhere that
+            // has killed us, going the long way round is not an option that exists. Say so out loud
+            // and take it, rather than silently refusing to travel and leaving the operator to work
+            // out why a bot never moves.
+            if ((route == null || route.Count == 0) && Avoid != null && Avoid.Count > 0)
+            {
+                route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class,
+                    world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent);
+
+                if (route != null && route.Count > 0)
+                    Detour = $"no route to {destinationName} avoiding {Avoid.Count} map(s) " +
+                             "that have killed us - going through anyway";
+            }
 
             if (route == null || route.Count == 0)
             {
@@ -102,17 +132,31 @@ namespace MirBot
             return true;
         }
 
+        /// <summary>
+        /// Told why a journey ended badly. Set by the host so the reason reaches the log.
+        ///
+        /// Both Abort and Fail used to end a journey in total silence, and the effect was a bot
+        /// that looked like it was ignoring its own decisions. A level 24 assassin correctly
+        /// identified Bichon Town as outgrown, correctly chose Deserted Mine, logged "heading for
+        /// Deserted Mine Lv 1. leg 1/1", and then butchered pigs where it stood - the journey had
+        /// already failed and nothing said so, so every diagnosis started from the false premise
+        /// that travel had never been attempted. Twice, two minutes apart, all afternoon.
+        /// </summary>
+        public Action<string> OnFailed;
+
         public void Abort(string why)
         {
             Reset();
             Phase = JourneyPhase.Failed;
             Status = why;
+            OnFailed?.Invoke($"journey abandoned - {why}");
         }
 
         private void Fail(string why)
         {
             Phase = JourneyPhase.Failed;
             Status = why;
+            OnFailed?.Invoke($"journey failed - {why}");
         }
 
         private void Reset()

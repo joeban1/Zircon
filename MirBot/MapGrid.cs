@@ -45,6 +45,18 @@ namespace MirBot
             _walkable = walkable;
         }
 
+        /// <summary>Build an in-memory grid for deterministic navigation-memory tests.</summary>
+        internal static MapGrid ForTests(int width, int height, Func<int, int, bool> walkable)
+        {
+            bool[] cells = new bool[width * height];
+
+            for (int x = 0; x < width; x++)
+                for (int y = 0; y < height; y++)
+                    cells[x * height + y] = walkable(x, y);
+
+            return new MapGrid("test", width, height, cells);
+        }
+
         public bool Walkable(int x, int y)
         {
             if (x < 0 || y < 0 || x >= Width || y >= Height) return false;

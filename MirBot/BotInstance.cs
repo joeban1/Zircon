@@ -21,7 +21,7 @@ namespace MirBot
         Banned        // the server IP-banned us; do not retry until it expires
     }
 
-    public enum BotCommandKind { Start, Stop, ForceTownTrip, Revive, Travel, SetConfig, ForceRepair }
+    public enum BotCommandKind { Start, Stop, ForceTownTrip, Revive, Travel, SetConfig, ForceRepair, NextTarget }
 
     /// <summary>A queued command and, for Travel, the map it names.</summary>
     public readonly struct BotCommand
@@ -63,6 +63,8 @@ namespace MirBot
         private BotConnection _connection;
         private ScriptedBrain _brain;
         private TownTrip _town;
+        private readonly RecoveryPolicy _recovery = new RecoveryPolicy();
+        private bool _lastFrugalRecoveryCombat;
         /// <summary>
         /// Explicit desired state. Inferring "should I be running" from AutoStart and the
         /// attempt count does not work: a Start command resets those very fields, so an
@@ -229,6 +231,16 @@ namespace MirBot
                         ApplyConfigChange(queued.Argument);
                         break;
 
+                    case BotCommandKind.NextTarget:
+                        if (_brain == null || !_brain.ForceNextTarget())
+                            _log.Write("Next target requested, but nothing is targeted.");
+                        else
+                        {
+                            _log.Write("Next target forced - current one parked for 20s.");
+                            _history.Note("Target", "skipped on request");
+                        }
+                        break;
+
                     case BotCommandKind.ForceRepair:
                         if (_town == null) _log.Write("Repair forced, but there is no trip to force.");
                         else
@@ -375,16 +387,37 @@ namespace MirBot
             // Always a FRESH connection. Disconnect() tears down BaseConnection state and
             // ExitReason is set-once, so a reused instance carries the previous run's failure.
             _connection = new BotConnection(client, Config, _host.ClientHash, _log);
+            _recovery.Reset();
+            _lastFrugalRecoveryCombat = false;
+            _tripWasActive = false;
             _brain = new ScriptedBrain(Config)
             {
                 Books = _host.Books,
                 Maps = _host.Maps,
                 Danger = _host.Danger,
                 Nav = _host.Nav,
-                Exits = _host.World
+                Exits = _host.World,
+                Butcher = _host.Butcher
             };
+            _brain.BrainLog = message => _log.Write(message);
+            _brain.IsDropPending = () => _connection != null && _connection.DropPending;
+            _connection.OnDropRefused = slot => _brain?.NoteDropRefused(slot);
+            _connection.OnSellRefused = slot => _brain?.Town?.NoteSellRefused(slot);
+            _connection.OnSellOrderRefused = () =>
+            {
+                _brain?.Town?.NoteSellOrderRefused();
+                NoteDivergence();
+            };
+            _connection.OnHarvested = id => _brain?.NoteHarvested(id);
+            _connection.OnItemUseVerdict = (slot, accepted) =>
+                _brain?.Town?.NoteScrollOutcome(slot, accepted);
             _brain.Travel = new Journey(_host.World)
             {
+                OnFailed = message =>
+                {
+                    _log.Write($"Travel: {message}");
+                    EscapeOnScroll(message);
+                },
                 TalkRange = Config.VendorTalkRange,
                 GoldFloor = Config.TeleportGoldFloor,
                 MaxGoldPercent = Config.TeleportMaxGoldPercent
@@ -480,9 +513,46 @@ namespace MirBot
             if (line.Length > 0) _log.Write($"Trip: {line}");
         }
 
+        private DateTime _idleSince = DateTime.MinValue;
+        private DateTime _idleSaid = DateTime.MinValue;
+
         private void RunBrain()
         {
-            Decision decision = _brain.Decide(_connection.World, _connection.Items);
+            _connection.CheckPendingItemUse();
+
+            UpdateRecoveryState(false);
+
+            bool frugalRecovery = _recovery.Active &&
+                                   RecoveryMapIndexes(Config.RecoveryMaps)
+                                       .Contains(_connection.World.MapIndex);
+
+            _brain.FrugalRecoveryCombat = frugalRecovery;
+
+            if (frugalRecovery != _lastFrugalRecoveryCombat)
+            {
+                _lastFrugalRecoveryCombat = frugalRecovery;
+                _log.Write(frugalRecovery
+                    ? $"Recovery: frugal melee on {_connection.World.MapName}; spells, skills, " +
+                      "summons and poison are reserved for stronger ground."
+                    : "Recovery: ordinary combat spending restored.");
+            }
+
+            // PENDING **OR** ON COOLDOWN.
+            //
+            // TryItemUse refuses to send while the server's one-second UseItemTime is still
+            // running, which is correct - but a silently dropped send is worse than a refused one
+            // if the caller has already committed. The town trip enters TownPhase.Teleporting the
+            // moment it decides to scroll, so a dropped scroll left it waiting six seconds and
+            // then concluding "the scroll did not move us" - every time, deterministically, where
+            // before the fix it merely failed sometimes.
+            //
+            // Telling the brain about the cooldown as well means the trip does not choose to
+            // scroll until the scroll can actually be sent. TownTrip.Next already turns this into
+            // "no scroll slot this tick" and simply tries again.
+            Decision decision = _brain.Decide(
+                _connection.World,
+                _connection.Items,
+                _connection.ItemUsePending || _connection.ItemUseOnCooldown);
 
             // Deliberately ABOVE the early return, because the interesting case is the tick that
             // decides to do nothing.
@@ -494,7 +564,32 @@ namespace MirBot
             // long enough to be observed by eye rather than read.
             LogTripStatus();
 
-            if (decision == null || decision.Action == BotAction.Idle) return;
+            if (decision == null || decision.Action == BotAction.Idle)
+            {
+                // Silence is a state, and an unlogged one is unfindable. Only after it has gone
+                // on long enough to matter, and at most once every few seconds, so an ordinary
+                // sub-second action gate never reaches the log.
+                if (_idleSince == DateTime.MinValue) _idleSince = DateTime.UtcNow;
+
+                // Being dead is a legitimate idle state with its own handling, and saying so
+                // every four seconds until the revive timer fires is pure noise.
+                bool worthSaying = !_connection.World.Dead;
+
+                if (worthSaying &&
+                    DateTime.UtcNow - _idleSince > TimeSpan.FromSeconds(4) &&
+                    DateTime.UtcNow - _idleSaid > TimeSpan.FromSeconds(4))
+                {
+                    _idleSaid = DateTime.UtcNow;
+
+                    _log.Write($"Deciding NOTHING for " +
+                               $"{(int)(DateTime.UtcNow - _idleSince).TotalSeconds}s - " +
+                               $"{_brain.IdleReason ?? decision?.Reason ?? "no reason recorded"}");
+                }
+
+                return;
+            }
+
+            _idleSince = DateTime.MinValue;
 
             _connection.Act(decision);
             _brain.Issued(decision, _connection.World);
@@ -516,6 +611,9 @@ namespace MirBot
                 _lastMagicCount = magics;
                 _log.Write("Spells: " + _brain.Spells.Describe(_connection.World));
             }
+
+            _connection.CheckPendingBuy();
+            CheckPendingLearn(decision);
 
             SampleExperience();
             ConsiderTravel();
@@ -643,9 +741,23 @@ namespace MirBot
 
             // Where we could get to, and what each would cost in map transitions. One
             // breadth-first pass prices every candidate at once.
+            // Anywhere that has killed this character and never paid is not a place to cross, so
+            // it is excluded from the reachability question itself. A map only reachable THROUGH
+            // such a place is not really reachable: costing it as though the crossing were free is
+            // how a bot talks itself into a journey it does not survive.
+            HashSet<int> deadly = _host.Hunting.Lethal(mirClass, world.Level);
+
             Dictionary<int, int> hops = _host.World.HopCounts(world.MapIndex, world.Class,
                 world.Level, world.Gold, Config.TeleportGoldFloor, world.PKPoints,
-                             Config.TeleportMaxGoldPercent);
+                             Config.TeleportMaxGoldPercent, avoid: deadly);
+
+            // The same question again with the paid exits removed: where could we get to without
+            // spending anything? Used to price a journey honestly below, and to decide what a poor
+            // bot is allowed to consider at all. One more breadth-first pass over a graph we have
+            // already loaded - it is cheaper than the decision it informs.
+            Dictionary<int, int> freeHops = _host.World.HopCounts(world.MapIndex, world.Class,
+                world.Level, world.Gold, Config.TeleportGoldFloor, world.PKPoints,
+                             Config.TeleportMaxGoldPercent, freeOnly: true, avoid: deadly);
 
             // Too poor to be anywhere but home.
             //
@@ -654,6 +766,48 @@ namespace MirBot
             // meets is permanent. Restricting it to the named town maps is the same whitelist
             // reasoning that fixed vendor selection - a list cannot be outsmarted by the next
             // clever ranking rule.
+            // SHORT OF SUPPLIES: the only acceptable destination is somewhere that sells them.
+            //
+            // Travel runs when a town trip ends - including when one ABORTS, which is exactly the
+            // moment the bot is least ready to hunt. A scroll that silently did nothing dropped
+            // Sindo out of its restock trip and the very next decision was "heading for Banya
+            // Village", nine healing potions in the bag, through the corner of Bichon Town that
+            // has killed three bots. It died ninety seconds later.
+            //
+            // So when the reason for a trip is still true, travel goes to the nearest town that
+            // has vendors, and nowhere else. Affordability and danger still apply - this narrows
+            // the choice, it does not force a journey the bot cannot make.
+            if (_brain.Town != null &&
+                (_brain.Town.ShortOfSupplies || _brain.Town.NeedsStorage) &&
+                !_host.Vendors.TownMaps.Contains(world.MapIndex))
+            {
+                int best = -1, bestHops = int.MaxValue;
+
+                foreach (int townMap in _host.Vendors.TownMaps)
+                {
+                    if (!hops.TryGetValue(townMap, out int distance)) continue;
+                    if (distance >= bestHops) continue;
+                    if (!Affordable(townMap, out _)) continue;
+
+                    best = townMap;
+                    bestHops = distance;
+                }
+
+                if (best > 0)
+                {
+                    string why = _brain.Town.ShortOfSupplies
+                        ? "out of supplies - going to town, not hunting"
+                        : "banked item ready - going to a safe town";
+                    Begin(best, _host.Profiles.For(best)?.MapName ?? $"map {best}", why);
+                    return;
+                }
+
+                _log.Write(_brain.Town.ShortOfSupplies
+                    ? "Travel: out of supplies and no town reachable - staying put rather than hunting on empty."
+                    : "Travel: storage work is ready but no safe town is reachable - staying put.");
+                return;
+            }
+
             bool poor = world.Gold < Config.PoorGold;
 
             HashSet<int> allowed = null;
@@ -668,11 +822,25 @@ namespace MirBot
                     return;
                 }
 
-                // Said out loud rather than silently endured. "Cannot leave until rich, cannot get
-                // rich because home is poor" is exactly the deadlock shape that has bitten this
-                // codebase repeatedly, and the log is what makes it visible if it ever happens.
+                // Plus anywhere we can WALK to.
+                //
+                // The previous comment said the deadlock shape - "cannot leave until rich, cannot
+                // get rich because home is poor" - was worth logging so it would be visible if it
+                // ever happened. It happened. A level 18 assassin sat between Bichon Town and Banya
+                // Village for over an hour at 42k and 49k exp/hour with Ant Cave and Deserted Mine
+                // two free steps away, because the whitelist is the whole of the world when you are
+                // broke, and the towns are where the gold is worst.
+                //
+                // Being broke is a reason not to SPEND, not a reason not to move. Everything the
+                // whitelist was actually protecting against is a cost: the fare out is priced by
+                // HopCounts and by Affordable, both of which still apply, and the way home is a
+                // town scroll the bot already carries. So the restriction is now the honest one -
+                // no paid teleports while poor - and a free walk to a better hunting ground, which
+                // is the only thing that ends the deadlock, is allowed.
+                foreach (int mapIndex in freeHops.Keys) allowed.Add(mapIndex);
+
                 _log.Write($"Travel: only {world.Gold} gold (poor below {Config.PoorGold}) - " +
-                           "restricted to the town maps until that improves.");
+                           $"no paid teleports, {allowed.Count} map(s) reachable on foot.");
             }
 
             bool Affordable(int mapIndex, out string why)
@@ -685,11 +853,42 @@ namespace MirBot
                     return false;
                 }
 
-                long needed = distance * Config.TravelGoldPerHop;
+                // What a journey needs in hand depends on whether any of it is BOUGHT.
+                //
+                // One flat rate per hop was the whole test, and at 3,000 it is sized for a trip
+                // whose legs come from a teleport NPC - fare out, fare home, and enough left over
+                // to be a long way from a vendor. Applied to a walk it is nonsense: the leg costs
+                // nothing, the way back is the same leg, and the bot is carrying a town scroll.
+                //
+                // This is where the poverty deadlock really lived. The whitelist above got the
+                // blame and the log line, but even with the whitelist lifted a bot with 907 gold
+                // was refused a single free step to a better hunting ground because it could not
+                // afford 3,000 - so it stayed on its two worst measured maps and stayed poor.
+                //
+                // Note hops was already built under the gold constraints, so a poor bot's routes
+                // are mostly free ones anyway; charging them the paid rate taxed a fare it was
+                // never going to be asked for.
+                bool onFoot = freeHops.TryGetValue(mapIndex, out int walked);
+
+                if (onFoot) distance = walked;
+
+                long rate = onFoot ? Config.TravelGoldPerFreeHop : Config.TravelGoldPerHop;
+                long needed = distance * rate;
+
+                // A single walked map is always affordable, because it genuinely costs nothing.
+                //
+                // TravelGoldPerFreeHop is a risk float - each map crossed is another to fight back
+                // across - not a price, and charging any float at all recreates the deadlock this
+                // whole branch exists to remove, just with a smaller number. An assassin reduced to
+                // 39 gold could not afford 250 to step one map to a better hunting ground, which is
+                // "cannot leave until rich, cannot get rich because home is poor" wearing its third
+                // disguise tonight. One hop has a guaranteed way back: the way it came.
+                if (onFoot && distance <= 1) return true;
 
                 if (world.Gold < needed)
                 {
-                    why = $"{distance} hops needs {needed:N0} gold, we have {world.Gold:N0}";
+                    why = $"{distance} {(onFoot ? "walked" : "paid")} hop(s) needs {needed:N0} " +
+                          $"gold, we have {world.Gold:N0}";
                     return false;
                 }
 
@@ -697,6 +896,60 @@ namespace MirBot
             }
 
             bool Permitted(int mapIndex) => allowed == null || allowed.Contains(mapIndex);
+
+            // BROKE: the beginner ground and nowhere else, until we can afford to leave.
+            //
+            // Placed above every other choice - exploration, the experience ranking, the book
+            // bonus - because all of them are about earning MORE, and none of them is any use to
+            // a character that cannot buy a potion. See BotConfig.RecoveryGold.
+            //
+            // Already standing on one? Then stay: returning without travelling is what keeps the
+            // bot farming rather than walking, and the whole failure being fixed here was a bot
+            // that walked instead of fighting.
+            if (_recovery.Active)
+            {
+                bool caveReady;
+                HashSet<int> recovery = RecoveryTargetMapIndexes(out caveReady);
+
+                if (recovery.Count > 0)
+                {
+                    if (recovery.Contains(world.MapIndex)) return;
+
+                    int best = -1, bestHops = int.MaxValue;
+
+                    foreach (int mapIndex in recovery)
+                    {
+                        if (!hops.TryGetValue(mapIndex, out int distance)) continue;
+                        if (distance >= bestHops) continue;
+                        if (!Affordable(mapIndex, out _)) continue;
+
+                        best = mapIndex;
+                        bestHops = distance;
+                    }
+
+                    if (best > 0)
+                    {
+                        string stage = caveReady ? "supplied recovery" : "undersupplied recovery";
+
+                        _log.Write($"Travel: recovery active at {world.Gold:N0} gold " +
+                                   $"({stage}) - going to " +
+                                   $"{_host.Profiles.For(best)?.MapName ?? $"map {best}"} to earn " +
+                                   $"until {Config.RecoveryExitGold:N0} survives a restock.");
+
+                        Begin(best, _host.Profiles.For(best)?.MapName ?? $"map {best}",
+                              caveReady
+                                  ? $"supplied but broke - money recovery until " +
+                                    $"{Config.RecoveryExitGold:N0} survives a restock"
+                                  : "broke and undersupplied - rebuilding on free beginner ground");
+                        return;
+                    }
+
+                    // Cannot reach one. Fall through rather than stand still - anywhere we can
+                    // fight beats nowhere, and the ordinary rules below still apply.
+                    _log.Write($"Travel: recovery active at {world.Gold:N0} gold but no recovery map is " +
+                               "reachable - falling back to the ordinary choice.");
+                }
+            }
 
             // Explore or exploit?
             //
@@ -717,35 +970,128 @@ namespace MirBot
             // which is precisely what happened - a freak 171,656 exp/hour window on Bichon Town
             // outranked everything for five hours and pulled the warrior back out of the only other
             // map it ever tried.
-            List<HuntingEntry> candidates = new List<HuntingEntry>();
+            // Skills that can only be got by killing something, that this character could learn
+            // today, and has not. Empty for a character with nothing left to want - at which point
+            // everything below is a no-op and the ranking is about experience again.
+            HashSet<int> wantedBooks = Config.BookHuntBonusPercent > 0
+                ? _host.BookDrops.Wanted(world.Class, world.Level, world.PlayerStats, world)
+                : new HashSet<int>();
 
-            foreach (HuntingEntry entry in _host.Hunting.Best(mirClass, world.Level,
-                         Math.Max(1, Config.HuntingChoices)))
+            List<HuntingEntry> candidates = new List<HuntingEntry>();
+            List<HuntingEntry> outgrown = new List<HuntingEntry>();
+
+            // EVERY MEASURED MAP WHEN BOOKS ARE WANTED.
+            //
+            // Best() ranks on experience and truncates. A merely wider shortlist still lets a weak
+            // but essential book map fall off the end as soon as enough faster grounds have been
+            // measured. While a drop-only skill is wanted, inspect every measured map so its source
+            // cannot disappear from consideration simply because the character is already strong
+            // enough to earn better experience elsewhere.
+            int shortlist = wantedBooks.Count > 0
+                ? int.MaxValue
+                : Math.Max(1, Config.HuntingChoices);
+
+            foreach (HuntingEntry entry in _host.Hunting.Best(mirClass, world.Level, shortlist))
             {
                 if (entry.MapIndex == world.MapIndex) continue;
                 if (!Permitted(entry.MapIndex)) continue;
                 if (_host.Danger.TooDangerous(entry.MapIndex, world.MaxHealth)) continue;
                 if (!Affordable(entry.MapIndex, out _)) continue;
 
+                // Outgrown maps are held back rather than dropped - see the fallback below.
+                //
+                // BEING BROKE SUSPENDS THIS ENTIRELY. The filter exists to stop a healthy
+                // character wasting its time on a tier it has left behind; it must not become a
+                // trap. A bot that keeps dying in caves loses gold each time, and the cheap safe
+                // ground it needs to earn its way back to potions and repairs is exactly the
+                // low-level map this rule would refuse it - "cannot afford to hunt, cannot hunt
+                // where it can afford to" is the same deadlock the travel pricing and the potion
+                // budget each produced in their own way earlier today. PoorGold is already the
+                // line the rest of the bot uses for "too broke to be choosy", so it is the line
+                // here too.
+                if (!poor && _host.Profiles.OutgrownBy(entry.MapIndex, world.Level,
+                        Config.HuntLevelsBelow, out string outgrownWhy))
+                {
+                    _log.Write($"Travel: skipping {entry.MapName} - {outgrownWhy}.");
+                    outgrown.Add(entry);
+                    continue;
+                }
+
                 candidates.Add(entry);
+            }
+
+            // A DROP-ONLY SKILL IS A REQUIREMENT, NOT A SOFT XP PREFERENCE.
+            //
+            // The old bonus only moved book maps upward before RANDOMLY choosing from the top
+            // three. Jill could therefore know that Bichon Cave supplied Summon Skeleton and still
+            // choose Flea Cave two times out of three. Worse, once a low real sample pushed the cave
+            // outside the enlarged XP shortlist, the bonus could no longer see it at all.
+            //
+            // If at least one measured, safe, affordable and reachable map supplies a wanted book,
+            // constrain the choice to those maps until the skill is learned. Randomness remains
+            // among valid book grounds, so the bot can vary its hunt without walking away from the
+            // progression goal. If none qualifies, the exploration path above remains responsible
+            // for finding and measuring one, and ordinary hunting remains the final fallback.
+            if (wantedBooks.Count > 0 && candidates.Count > 0)
+            {
+                List<HuntingEntry> bookCandidates = candidates
+                    .Where(x => _host.BookDrops.Supplies(x.MapIndex, wantedBooks) > 0)
+                    .ToList();
+
+                if (bookCandidates.Count > 0)
+                {
+                    candidates = bookCandidates;
+                    _log.Write($"Travel: {candidates.Count} measured map(s) supply a wanted " +
+                               "drop-only skill - restricting this hunt to those maps.");
+                }
+
+                candidates.Sort((a, b) => BookRanked(b, wantedBooks)
+                                              .CompareTo(BookRanked(a, wantedBooks)));
+
+                int keep = Math.Max(1, Config.HuntingChoices);
+                if (candidates.Count > keep) candidates.RemoveRange(keep, candidates.Count - keep);
             }
 
             if (candidates.Count > 0)
             {
                 HuntingEntry pick = candidates[_random.Next(candidates.Count)];
 
+                int supplies = _host.BookDrops.Supplies(pick.MapIndex, wantedBooks);
+
                 Begin(pick.MapIndex, pick.MapName,
                       $"{pick.AverageExperiencePerHour:N0} exp/hour average over " +
                       $"{pick.HoursSampled:N1}h, {pick.Deaths} death(s) - " +
-                      $"chosen from {candidates.Count} candidate(s)");
+                      $"chosen from {candidates.Count} candidate(s)" +
+                      (supplies > 0
+                          ? $"; drops {_host.BookDrops.Names(pick.MapIndex, wantedBooks)}"
+                          : ""));
                 return;
             }
 
             // Nothing worth exploiting. Explore even if the roll said otherwise.
             if (!wantExplore && TryExplore(world, mirClass, hops, Affordable, Permitted, known)) return;
 
+            // NEVER STRIKE OUT EVERYTHING - and only once everything else has been tried.
+            //
+            // A filter that can empty the list has to hand the list back when it does. This sits
+            // AFTER both exploration attempts on purpose: an outgrown map is better than standing
+            // in town, and worse than anywhere new, so it must not pre-empt the search for
+            // somewhere new the way it did when it was folded into the exploit block above.
+            if (outgrown.Count > 0)
+            {
+                HuntingEntry fallback = outgrown[_random.Next(outgrown.Count)];
+
+                _log.Write($"Travel: nothing else reachable, so taking {fallback.MapName} " +
+                           $"despite having outgrown it - {outgrown.Count} such map(s) known.");
+
+                Begin(fallback.MapIndex, fallback.MapName,
+                      $"{fallback.AverageExperiencePerHour:N0} exp/hour average, outgrown but " +
+                      "the only thing left");
+                return;
+            }
+
             _log.Write($"Travel: nowhere to go - {hops.Count} maps reachable, " +
-                       $"{known} measured, {(poor ? "restricted to town maps, " : "")}" +
+                       $"{known} measured, {(poor ? "poor so no paid teleports, " : "")}" +
                        "none affordable, safe and unmeasured.");
         }
 
@@ -756,6 +1102,65 @@ namespace MirBot
         /// that have already hurt us, so it is silent about anywhere new - which is exactly when the
         /// question is asked. MapProfile reads what actually spawns on a map before we go.
         /// </summary>
+        /// <summary>
+        /// A hunting entry's ranking score, lifted for each drop-only book the map supplies.
+        ///
+        /// Multiplicative so it scales with what the map is actually worth: doubling a good map
+        /// beats doubling a bad one, which is the behaviour wanted. An ADDITIVE bonus would have
+        /// let a worthless map outrank a good one simply by stocking a book.
+        /// </summary>
+        private double BookRanked(HuntingEntry entry, HashSet<int> wanted)
+        {
+            double score = entry.Score(HuntingMemory.DefaultDeathPenalty);
+            int supplies = _host.BookDrops.Supplies(entry.MapIndex, wanted);
+
+            if (supplies <= 0) return score;
+
+            return score * (1 + Config.BookHuntBonusPercent / 100.0 * supplies);
+        }
+
+        private string _learningBook;
+        private DateTime _learnAt;
+        private int _magicsBeforeLearn;
+
+        /// <summary>
+        /// Did a book we tried to read actually teach us anything?
+        ///
+        /// C.ItemUse on a book answers with S.NewMagic on success and NOTHING on refusal, so the
+        /// bot logged "LearnBook (learning from slot 6)" and moved on whether or not it worked.
+        /// Summon Skeleton was looted six times across the fleet and learnt none of them, and the
+        /// only evidence was a magic count that did not move - which nothing was comparing.
+        ///
+        /// The book is consumed either way as far as the bag is concerned, so a silent failure
+        /// destroys the drop. That is worth a line in the log even now the cause is fixed.
+        /// </summary>
+        private void CheckPendingLearn(Decision decision)
+        {
+            if (decision != null && decision.Action == BotAction.LearnBook)
+            {
+                _learningBook = _connection.Items.InSlot(decision.PotionSlot)?.Info?.ItemName
+                                ?? $"slot {decision.PotionSlot}";
+                _magicsBeforeLearn = _connection.World.KnownMagicCount;
+                _learnAt = DateTime.UtcNow;
+                return;
+            }
+
+            if (_learningBook == null) return;
+            if (DateTime.UtcNow - _learnAt < TimeSpan.FromSeconds(3)) return;
+
+            string book = _learningBook;
+            _learningBook = null;
+
+            if (_connection.World.KnownMagicCount > _magicsBeforeLearn)
+            {
+                _log.Write($"Learned {book} - now {_connection.World.KnownMagicCount} skills.");
+                return;
+            }
+
+            _log.Write($"LEARN REFUSED: {book} taught us nothing - still " +
+                       $"{_magicsBeforeLearn} skills. The book is gone and the skill is not.");
+        }
+
         private bool TryExplore(WorldModel world, string mirClass, Dictionary<int, int> hops,
             AffordableCheck affordable, Func<int, bool> permitted, int known)
         {
@@ -768,7 +1173,7 @@ namespace MirBot
             HashSet<int> lethal = _host.Hunting.Lethal(mirClass, world.Level);
 
             List<int> options = new List<int>();
-            int tooStrong = 0, tooFar = 0, killers = 0;
+            int tooStrong = 0, tooFar = 0, killers = 0, tooWeak = 0;
 
             foreach (int mapIndex in hops.Keys)
             {
@@ -785,6 +1190,15 @@ namespace MirBot
                     continue;
                 }
 
+                // And the other end of the same scale. Without this, exploration happily spends a
+                // journey measuring a map the character has already outgrown, then stores a rate
+                // that keeps pulling it back.
+                if (_host.Profiles.OutgrownBy(mapIndex, world.Level, Config.HuntLevelsBelow, out _))
+                {
+                    tooWeak++;
+                    continue;
+                }
+
                 if (!affordable(mapIndex, out _)) { tooFar++; continue; }
 
                 options.Add(mapIndex);
@@ -794,7 +1208,8 @@ namespace MirBot
             {
                 _log.Write($"Travel: nothing new worth exploring - {hops.Count} reachable, " +
                            $"{measured.Count} already measured, {killers} killed us before, " +
-                           $"{tooStrong} too strong, {tooFar} too far to afford.");
+                           $"{tooStrong} too strong, {tooWeak} outgrown, " +
+                           $"{tooFar} too far to afford.");
                 return false;
             }
 
@@ -844,6 +1259,32 @@ namespace MirBot
 
             int Distance(int mapIndex) =>
                 fromTown.TryGetValue(mapIndex, out int d) ? d : hops[mapIndex];
+
+            // A MAP THAT DROPS A SKILL WE CANNOT BUY JUMPS THE QUEUE.
+            //
+            // Applied before the distance ring, not after, because the whole point is to accept a
+            // longer walk for something the shops cannot supply. It only ever narrows the list to
+            // maps that already passed every safety, level and affordability test above, so this
+            // cannot send a character somewhere it was not already willing to go.
+            //
+            // Nothing to want means nothing changes - the list is untouched and exploration works
+            // exactly as it did.
+            HashSet<int> wantedHere = Config.BookHuntBonusPercent > 0
+                ? _host.BookDrops.Wanted(world.Class, world.Level, world.PlayerStats, world)
+                : new HashSet<int>();
+
+            if (wantedHere.Count > 0)
+            {
+                List<int> bookMaps = options
+                    .Where(x => _host.BookDrops.Supplies(x, wantedHere) > 0).ToList();
+
+                if (bookMaps.Count > 0)
+                {
+                    _log.Write($"Travel: {bookMaps.Count} unmeasured map(s) drop a skill book we " +
+                               "cannot buy - looking there first.");
+                    options = bookMaps;
+                }
+            }
 
             int nearest = options.Min(Distance);
             options.RemoveAll(x => Distance(x) > nearest);
@@ -916,6 +1357,66 @@ namespace MirBot
 
         private bool _tripWasActive;
         private DateTime _nextBarrenCheck = DateTime.MinValue;
+        private DateTime _nextOutgrownCheck = DateTime.MinValue;
+        private DateTime _nextUnproductiveCheck = DateTime.MinValue;
+        private DateTime _nextScrollEscape = DateTime.MinValue;
+
+        /// <summary>
+        /// Since when have we earned nothing: the last experience gain, or failing that, the
+        /// moment we entered the world.
+        ///
+        /// The first version of this required LastExperienceGainUtc to be set, which quietly
+        /// excluded the worst case it was written for. A bot that has killed NOTHING since login
+        /// has no gain timestamp at all, so "no experience for twelve minutes" could never become
+        /// true - and a relog into a dead pocket is exactly how a bot ends up with no kills. Two
+        /// bots sat in Bichon Cave reporting "last kill: never" while the check that should have
+        /// moved them was structurally unable to fire.
+        /// </summary>
+        private DateTime UnproductiveSince()
+        {
+            WorldModel world = _connection?.World;
+            DateTime since = _inGameAt;
+
+            if (world == null) return since;
+            if (world.MapEnteredUtc > since) since = world.MapEnteredUtc;
+            if (world.LastExperienceGainUtc > since) since = world.LastExperienceGainUtc;
+
+            return since;
+        }
+
+        /// <summary>
+        /// A journey gave up. If we are carrying a town scroll, use it instead of walking.
+        ///
+        /// Every observed journey failure has been "stuck N tiles from the exit" - the bot boxed
+        /// into part of a cave it cannot path out of. Walking is the only thing the travel system
+        /// knows how to do, so it re-plans the same walk, fails the same way, and the bot goes
+        /// back to roaming a pocket it has already exhausted. A level 24 Taoist did this for
+        /// eighteen minutes carrying EIGHT town scrolls, planning a five-leg walk to a town one
+        /// scroll would have reached instantly.
+        ///
+        /// The town trip is the only code that knows how to scroll, so forcing it is the escape:
+        /// it scrolls to the bind point, and a bind point without vendors is already handled
+        /// there by walking instead. From a town the travel graph is dense and the next journey
+        /// has a real chance.
+        ///
+        /// Rate-limited so a run of failures cannot burn the bag.
+        /// </summary>
+        private void EscapeOnScroll(string why)
+        {
+            if (_brain?.Town == null || _connection == null) return;
+            if (DateTime.UtcNow < _nextScrollEscape) return;
+            if (_connection.World.MapIndex <= 0 || _connection.World.Dead) return;
+
+            // Only when a scroll is actually carried; otherwise this is noise on every failure.
+            if (_connection.Items.FindTownTeleportSlot() < 0) return;
+
+            _nextScrollEscape = DateTime.UtcNow.AddMinutes(2);
+
+            _log.Write($"Travel gave up ({why}) but we are carrying a town scroll - " +
+                       "forcing a town trip to scroll out rather than walking it again.");
+
+            _brain.Town.Force();
+        }
 
         /// <summary>
         /// Look for somewhere better to hunt, but only at the end of a town trip.
@@ -931,6 +1432,21 @@ namespace MirBot
 
             bool tripJustFinished = _tripWasActive && !active;
             _tripWasActive = active;
+
+            UpdateRecoveryState(tripJustFinished);
+
+            bool recoveryRoute = !active && RecoveryRouteNeeded();
+
+            // A storage-only trip can begin and abort in the same tick when no town scroll is in
+            // the bag, so tripJustFinished never observes an active phase. Promote the published
+            // storage need directly into a journey to the nearest safe town instead.
+            bool storageTravel = !active &&
+                                 _connection != null &&
+                                 _connection.Stage == BotStage.InGame &&
+                                 !_connection.World.Dead &&
+                                 _town != null && _town.NeedsStorage &&
+                                 (_brain?.Travel == null || !_brain.Travel.Active) &&
+                                 !_host.Vendors.TownMaps.Contains(_connection.World.MapIndex);
 
             // Standing somewhere with nothing to kill.
             //
@@ -953,7 +1469,68 @@ namespace MirBot
                           (_brain?.Travel == null || !_brain.Travel.Active) &&
                           DateTime.UtcNow >= _nextBarrenCheck;
 
-            if (!tripJustFinished && !barren) return;
+            // STANDING SOMEWHERE WE HAVE OUTGROWN. The sibling of the barren check above, and
+            // needed for the same reason: the end of a town trip was the ONLY thing that ever
+            // reconsidered a hunting ground.
+            //
+            // The level filter added to the travel planner is consulted when the bot CHOOSES a
+            // map. It has nothing to say about the map the bot is already standing on, and a bot
+            // arrives on one without choosing it constantly - a trip walks it to town, a journey
+            // is abandoned partway, the host restarts. A level 27 warrior sat in Bichon Town
+            // killing scarecrows for as long as it was left there, because it had no trip to
+            // finish and killing scarecrows never fills a bag fast enough to start one.
+            //
+            // Not while poor, for the same reason the planner's filter lifts then: a cheap safe
+            // map is where a broke character rebuilds, and chasing it off one is the deadlock.
+            // Declared up here because the call below sits inside a short-circuiting && chain,
+            // where the compiler cannot prove the out parameter was ever reached.
+            string outgrownHereWhy = "";
+
+            bool outgrownHere = !active &&
+                                _connection != null && _connection.Stage == BotStage.InGame &&
+                                !_connection.World.Dead &&
+                                _connection.World.MapIndex > 0 &&
+                                _connection.World.Gold >= Config.PoorGold &&
+                                (_brain?.Travel == null || !_brain.Travel.Active) &&
+                                DateTime.UtcNow >= _nextOutgrownCheck &&
+                                _host.Profiles.OutgrownBy(_connection.World.MapIndex,
+                                    _connection.World.Level, Config.HuntLevelsBelow,
+                                    out outgrownHereWhy);
+
+            // EARNING NOTHING HERE. See BotConfig.UnproductiveMinutes.
+            //
+            // The last of the four "should I still be here?" checks, and the general one: barren
+            // asks whether the map has spawns, outgrown asks whether they are worth killing, and
+            // this asks whether any of it is actually happening. A map can pass both of the others
+            // and still yield nothing - walled into a pocket, every reachable monster already
+            // dead, a spawn region we cannot path to.
+            bool unproductive = !active &&
+                                Config.UnproductiveMinutes > 0 &&
+                                _connection != null && _connection.Stage == BotStage.InGame &&
+                                !_connection.World.Dead &&
+                                _connection.World.MapIndex > 0 &&
+                                (_brain?.Travel == null || !_brain.Travel.Active) &&
+                                DateTime.UtcNow >= _nextUnproductiveCheck &&
+                                UnproductiveSince() != DateTime.MinValue &&
+                                DateTime.UtcNow - UnproductiveSince() >
+                                    TimeSpan.FromMinutes(Config.UnproductiveMinutes);
+
+            if (!tripJustFinished && !barren && !outgrownHere && !storageTravel &&
+                !unproductive && !recoveryRoute)
+                return;
+
+            if (unproductive)
+            {
+                // Rate-limited like its siblings: if there is nowhere better we must not ask again
+                // every tick for the rest of the session.
+                _nextUnproductiveCheck = DateTime.UtcNow.AddMinutes(
+                    Math.Max(2, Config.UnproductiveMinutes / 2));
+
+                int minutes = (int)(DateTime.UtcNow - UnproductiveSince()).TotalMinutes;
+
+                _log.Write($"No experience at all on {_connection.World.MapName} for {minutes} " +
+                           "minutes - looking for somewhere that actually pays.");
+            }
 
             if (barren)
             {
@@ -963,8 +1540,24 @@ namespace MirBot
                 _log.Write($"Nothing spawns on {_connection.World.MapName} - looking for somewhere " +
                            "to hunt.");
             }
+
+            if (outgrownHere)
+            {
+                // Same rate limit, same reason: if there is nowhere better we must not ask again
+                // every tick for the rest of the session.
+                _nextOutgrownCheck = DateTime.UtcNow.AddMinutes(2);
+
+                _log.Write($"Hunting {_connection.World.MapName} but {outgrownHereWhy} - " +
+                           "looking for somewhere better.");
+            }
             if (_connection == null || _connection.Stage != BotStage.InGame) return;
             if (_connection.World.Dead) return;
+
+            if (storageTravel)
+            {
+                StartTravel();
+                return;
+            }
 
             // A journey already running wins. A town trip can pre-empt one mid-way, so the map the
             // trip started from may be a stopover rather than a hunting ground, and starting a
@@ -1006,6 +1599,90 @@ namespace MirBot
             StartTravel();
         }
 
+        private void UpdateRecoveryState(bool tripJustFinished)
+        {
+            if (_connection == null || _connection.Stage != BotStage.InGame) return;
+
+            bool before = _recovery.Active;
+            bool active = _recovery.Update(_connection.World.Gold, Config.RecoveryGold,
+                Config.RecoveryExitGold, tripJustFinished, _town?.ShortOfSupplies ?? false);
+
+            _recovery.UpdateMoneyCave(RecoveryCaveReady(), tripJustFinished);
+
+            if (before == active) return;
+
+            if (active)
+                _log.Write($"Recovery: entered at {_connection.World.Gold:N0} gold; staying in " +
+                           $"recovery until a stocked town trip leaves {Config.RecoveryExitGold:N0}.");
+            else
+                _log.Write($"Recovery: complete with {_connection.World.Gold:N0} gold after " +
+                           "restocking; ordinary hunting restored.");
+        }
+
+        private bool RecoveryCaveReady()
+        {
+            if (!_recovery.Active || _connection == null || _brain == null) return false;
+
+            WorldModel world = _connection.World;
+            Backpack items = _connection.Items;
+            bool spendsMana = _brain.Spells.UsesMana(world) || _brain.Skills.NeedsMana(world);
+
+            return RecoveryPolicy.SuppliesReady(world.Level, Config.RecoveryCaveMinimumLevel,
+                Config.RecoveryCaveSupplyPercent,
+                items.HealthPotionLoad(), Config.HealthPotionTarget(world.MaxBagWeight),
+                spendsMana, items.ManaPotionLoad(), Config.ManaPotionTarget(world.MaxBagWeight),
+                items.CountTownScrolls(), Config.TownScrollReserve);
+        }
+
+        private bool RecoveryRouteNeeded()
+        {
+            if (!_recovery.Active || _connection == null) return false;
+
+            HashSet<int> wanted = RecoveryTargetMapIndexes(out _);
+
+            return wanted.Count > 0 && !wanted.Contains(_connection.World.MapIndex);
+        }
+
+        private HashSet<int> RecoveryTargetMapIndexes(out bool caveStage)
+        {
+            caveStage = _recovery.MoneyCaveActive;
+            HashSet<int> wanted = RecoveryMapIndexes(caveStage
+                ? Config.RecoveryCaveMaps
+                : Config.RecoveryMaps);
+
+            // A typo or removed map in the optional cave list must not disable the proven
+            // beginner-ground fallback.
+            if (wanted.Count == 0 && caveStage)
+            {
+                caveStage = false;
+                wanted = RecoveryMapIndexes(Config.RecoveryMaps);
+            }
+
+            return wanted;
+        }
+
+        /// <summary>Configured map names resolved against the game's map list.</summary>
+        private HashSet<int> RecoveryMapIndexes(string configured)
+        {
+            HashSet<int> found = new HashSet<int>();
+
+            if (string.IsNullOrWhiteSpace(configured)) return found;
+
+            foreach (string part in configured.Split(','))
+            {
+                string wanted = part.Trim();
+                if (wanted.Length == 0) continue;
+
+                foreach (Library.SystemModels.MapInfo info in
+                         Library.Globals.MapInfoList?.Binding
+                         ?? System.Linq.Enumerable.Empty<Library.SystemModels.MapInfo>())
+                    if (string.Equals(info.Description, wanted, StringComparison.OrdinalIgnoreCase))
+                        found.Add(info.Index);
+            }
+
+            return found;
+        }
+
         /// <summary>Map names from config, in the order they were written.</summary>
         private IEnumerable<string> PreferredMapNames()
         {
@@ -1020,8 +1697,17 @@ namespace MirBot
 
         private void Begin(int mapIndex, string mapName, string why)
         {
+            // Refreshed per journey rather than held, because the set is a function of our level
+            // and of what has happened since - both of which move.
+            _brain.Travel.Avoid = _host.Hunting.Lethal(_connection.World.Class.ToString(),
+                _connection.World.Level);
+            _brain.Travel.Detour = "";
+
             if (_brain.Travel.Begin(_connection.World, mapIndex, mapName))
             {
+                if (!string.IsNullOrEmpty(_brain.Travel.Detour))
+                    _log.Write($"Travel: {_brain.Travel.Detour}");
+
                 _log.Write($"Travel: heading for {mapName} ({why}). {_brain.Travel.Status}");
                 _history.Note("Travel", mapName);
             }
@@ -1033,6 +1719,7 @@ namespace MirBot
 
         private string _lastAttacker;
         private DateTime _reviveAt = DateTime.MinValue;
+        private bool _tripAfterRevive;
 
         /// <summary>
         /// Notice a death, exactly once, and act on it.
@@ -1048,12 +1735,38 @@ namespace MirBot
 
             if (!_connection.World.Dead)
             {
+                // Back on our feet: go and sort ourselves out before hunting again.
+                //
+                // Dying costs gear durability, drops part of the bag on the floor and leaves the
+                // potion stock wherever it happened to be - and none of that trips the ordinary
+                // trip triggers, which watch bag weight and potion counts. An assassin revived at
+                // 74% bag, below the 90% weight trigger, and went straight back to the same cave
+                // that had just killed it with damaged gear and whatever potions were left.
+                //
+                // A death is the one event that reliably invalidates all three assumptions at
+                // once, so it earns a trip on its own account.
+                if (_wasDead && _tripAfterRevive)
+                {
+                    _tripAfterRevive = false;
+
+                    if (_brain?.Town != null)
+                    {
+                        _log.Write("Died - going to town to sell, repair and restock before " +
+                                   "hunting again.");
+                        _brain.Town.Force();
+                    }
+                }
+
                 _wasDead = false;
                 _reviveAt = DateTime.MinValue;
                 return;
             }
 
-            if (!_wasDead) PostMortem();
+            if (!_wasDead)
+            {
+                PostMortem();
+                _tripAfterRevive = true;
+            }
 
             AutoRevive();
         }
@@ -1266,6 +1979,39 @@ namespace MirBot
 
         /// <summary>A wait the server itself asked for, applied to the next backoff.</summary>
         private TimeSpan _minimumRetryWait = TimeSpan.Zero;
+
+        /// <summary>When each recent wholesale sell refusal happened. See ResyncAfterSellRefusals.</summary>
+        private readonly List<DateTime> _divergenceSignals = new List<DateTime>();
+
+        /// <summary>
+        /// A sell order was voided wholesale - the strongest available signal that our inventory
+        /// model no longer matches the server's. Enough of them and we relog to resynchronise.
+        ///
+        /// Blunt on purpose. There is no packet that asks the server for the current inventory,
+        /// so a login is the only thing that rebuilds the model from the truth. It costs a few
+        /// seconds of downtime against a bot that would otherwise keep failing every sale, keep
+        /// mis-addressing every slot, and keep the divergence for the rest of the session.
+        /// </summary>
+        private void NoteDivergence()
+        {
+            if (Config.ResyncAfterSellRefusals <= 0) return;
+
+            DateTime now = DateTime.UtcNow;
+            TimeSpan window = TimeSpan.FromMinutes(Math.Max(1, Config.ResyncWindowMinutes));
+
+            _divergenceSignals.Add(now);
+            _divergenceSignals.RemoveAll(x => now - x > window);
+
+            if (_divergenceSignals.Count < Config.ResyncAfterSellRefusals) return;
+
+            _divergenceSignals.Clear();
+
+            _log.Write($"Inventory looks out of step with the server - {Config.ResyncAfterSellRefusals} " +
+                       $"sell orders voided within {Config.ResyncWindowMinutes} minutes. " +
+                       "Relogging to rebuild the model from the server's own copy.");
+
+            try { _connection?.TryDisconnect(); } catch { }
+        }
 
         private void Fault(Exception ex)
         {
@@ -1583,8 +2329,8 @@ namespace MirBot
                 equipment.Add(new EquipmentStatus(
                     ((Library.EquipmentSlot)pair.Key).ToString(),
                     item.Info.ItemName,
-                    item.CurrentDurability / Backpack.DurabilityScale,
-                    item.MaxDurability / Backpack.DurabilityScale,
+                    Backpack.Displayed(item.CurrentDurability),
+                    Backpack.Displayed(item.MaxDurability),
                     Backpack.IsBroken(item),
                     Backpack.IsWorn(item, Config.RepairAtDurability))
                 {
@@ -1615,6 +2361,9 @@ namespace MirBot
                 storage.Add(DescribeItem(Globals.PartsStorageOffset + pair.Key, pair.Value));
 
             storage.Sort((a, b) => a.Slot.CompareTo(b.Slot));
+
+            ExplorationSnapshot exploration = _brain?.ExplorationStatus()
+                ?? new ExplorationSnapshot(0, 0);
 
             return new BotStatus
             {
@@ -1651,6 +2400,11 @@ namespace MirBot
                 InSafeZone = world.InSafeZone,
                 DestX = destination == System.Drawing.Point.Empty ? (int?)null : destination.X,
                 DestY = destination == System.Drawing.Point.Empty ? (int?)null : destination.Y,
+                ExplorationMode = _brain?.ExplorationMode ?? "none",
+                ExplorationVisitedSectors = exploration.VisitedSectors,
+                ExplorationTotalSectors = exploration.TotalSectors,
+                ExplorationTargetLastVisitedUtc = _brain?.ExplorationTargetLastVisitedUtc
+                    ?.ToString("o"),
 
                 BagWeight = world.BagWeight,
                 MaxBagWeight = world.MaxBagWeight,
@@ -1730,8 +2484,8 @@ namespace MirBot
                 CanSell = info.CanSell,
 
                 Image = part?.Image ?? info.Image,
-                Durability = item.CurrentDurability / Backpack.DurabilityScale,
-                MaxDurability = item.MaxDurability / Backpack.DurabilityScale,
+                Durability = Backpack.Displayed(item.CurrentDurability),
+                MaxDurability = Backpack.Displayed(item.MaxDurability),
                 Weight = item.Weight,
                 Price = info.Price,
 
@@ -1807,6 +2561,18 @@ namespace MirBot
             _log.Write($"Packets processed: {_connection.TotalPacketsProcessed}");
             _log.Write($"Decisions issued:  {_decisions}");
             _log.Write($"Server resyncs:    {_connection.ResyncCount}");
+            // WHAT WE THREW AWAY.
+            //
+            // The counter behind this has existed all along and UnhandledSummary() was never
+            // called from anywhere, so the one place that knew the bot was ignoring S.ItemDelete
+            // kept it to itself. An unhandled packet is a silent divergence between our model and
+            // the server's, which is the most expensive class of bug in this program.
+            string ignored = string.Join(", ",
+                _connection.UnhandledSummary().Take(12).Select(x => $"{x.Key} x{x.Value}"));
+
+            _log.Write($"Unhandled packets: {_connection.UnhandledCount}" +
+                       (string.IsNullOrEmpty(ignored) ? "" : $"   [{ignored}]"));
+
             _log.Write($"Packets dropped:   {_connection.DroppedPackets}" +
                        (_connection.DroppedPackets > 0
                            ? "   <-- the packet budget fired; something was looping"

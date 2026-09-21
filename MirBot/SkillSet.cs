@@ -29,9 +29,18 @@ namespace MirBot
         /// </summary>
         private static readonly HashSet<MagicType> Nameable = new HashSet<MagicType>
         {
+            // Warrior
             MagicType.Slaying, MagicType.Thrusting, MagicType.HalfMoon, MagicType.DestructiveSurge,
             MagicType.FlamingSword, MagicType.DragonRise, MagicType.BladeStorm,
-            MagicType.DefensiveBlow, MagicType.OffensiveBlow
+            MagicType.DefensiveBlow, MagicType.OffensiveBlow,
+
+            // Assassin. Absent until now, which is why an assassin swung a bare weapon for its
+            // whole life: every list in this bot was written for the warrior and the caster, and
+            // "no castable spells among 5 skills" in its own login line was the symptom nobody
+            // read. Both of these are AttackSkill on the server and both add their own Type in
+            // AttackCast, so the server will accept them as an AttackMagic - the test that rules
+            // Swordsmanship out above.
+            MagicType.VineTreeDance, MagicType.Discipline
         };
 
         /// <summary>
@@ -41,7 +50,8 @@ namespace MirBot
         /// </summary>
         private static readonly MagicType[] Sustained =
         {
-            MagicType.Thrusting, MagicType.HalfMoon, MagicType.DestructiveSurge, MagicType.FlameSplash
+            MagicType.Thrusting, MagicType.HalfMoon, MagicType.DestructiveSurge, MagicType.FlameSplash,
+            MagicType.VineTreeDance, MagicType.Discipline
         };
 
         private readonly HashSet<MagicType> _armed = new HashSet<MagicType>();
@@ -120,7 +130,70 @@ namespace MirBot
             return MagicType.None;
         }
 
-        private static bool Usable(WorldModel world, MagicType magic) =>
-            Nameable.Contains(magic) && world.CanUseMagic(magic);
+        /// <summary>
+        /// Can this skill ride along on a swing RIGHT NOW - including whether we can pay for it.
+        ///
+        /// WorldModel.CanUseMagic answers a weaker question than this one: it checks the skill is
+        /// known and the level is high enough, and says nothing about mana. The server's own
+        /// CanUseMagic does check the cost, and the consequence of the two disagreeing is not a
+        /// wasted skill but a LOST ATTACK - PlayerObject.cs:13419 compares the requested magic
+        /// against the one it found valid and, when they differ, logs
+        ///
+        ///     [ERROR] Mirbot requested Attack Skill 'HalfMoon' but valid magic was 'None'
+        ///
+        /// then returns having done nothing at all. No swing, no fallback. A level 27 warrior at
+        /// 0 of 117 mana stood in a crowd of thirty monsters requesting Half Moon over and over
+        /// and never hit anything.
+        ///
+        /// This is the same mistake as the caster one CanCastNow fixed - asking "do I know it"
+        /// where the server asks "can you use it" - left in the melee path because attack skills
+        /// arrive through C.Attack rather than C.Magic and did not look like casting.
+        ///
+        /// No mana floor here, unlike spells: an attack skill we cannot afford simply degrades to
+        /// an ordinary swing, which is a perfectly good outcome, so there is nothing to reserve.
+        /// </summary>
+        private static bool Usable(WorldModel world, MagicType magic)
+        {
+            if (!Nameable.Contains(magic)) return false;
+            if (!world.CanUseMagic(magic)) return false;
+
+            return world.Mana >= CostOf(world, magic);
+        }
+
+        /// <summary>
+        /// Does this character spend mana on ORDINARY SWINGS?
+        ///
+        /// The mana-drinking branch was gated on Spells.HasCastable, which asks whether there are
+        /// spells to cast. A warrior has none, so it never drank mana - and then could not afford
+        /// the attack skills that DO cost it. Mirbot sat at 2 of 117 mana holding nineteen Mana
+        /// Potion (II), requesting Half Moon it could not pay for, and the server threw every
+        /// attack away. The mana gate and the attack-skill gate were each half right.
+        ///
+        /// Asked of the known magics rather than the armed set, because the server disarms a skill
+        /// once it is unaffordable - so consulting _armed would answer "no mana needed" exactly
+        /// when mana is what is missing.
+        /// </summary>
+        public bool NeedsMana(WorldModel world)
+        {
+            foreach (ClientUserMagic known in world.Magics)
+            {
+                if (known?.Info == null) continue;
+                if (!Nameable.Contains(known.Info.Magic)) continue;
+                if (world.Level < known.Info.NeedLevel1) continue;
+
+                if (known.Cost > 0) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>What one use of this skill costs, or 0 if we somehow do not know it.</summary>
+        private static int CostOf(WorldModel world, MagicType magic)
+        {
+            foreach (ClientUserMagic known in world.Magics)
+                if (known?.Info != null && known.Info.Magic == magic) return known.Cost;
+
+            return 0;
+        }
     }
 }

@@ -371,6 +371,7 @@ namespace MirBot
                     case "revive": kind = BotCommandKind.Revive; break;
                     case "travel": kind = BotCommandKind.Travel; break;
                     case "forcerepair": kind = BotCommandKind.ForceRepair; break;
+                    case "nexttarget": kind = BotCommandKind.NextTarget; break;
                     case "setconfig": kind = BotCommandKind.SetConfig; break;
                     default: TryFail(context, 404, "unknown action"); return;
                 }

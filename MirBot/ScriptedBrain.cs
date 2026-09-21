@@ -10,8 +10,9 @@ namespace MirBot
     {
         Idle, Equip, Heal, Flee, Attack, Loot, Approach, Roam, SetPetMode,
         TownTeleport, AutoPath, AutoPathPoint, AutoPathCancel, WalkTo, Deposit, Withdraw,
+        MergeParts, AssemblePart,
         NPCRepair, LearnBook, Logout, NPCCall, NPCButton, NPCSell, NPCBuy, NPCClose,
-        MagicToggle, Unlock, Cast
+        MagicToggle, Unlock, Cast, DropItem, Butcher
     }
 
     public sealed class Decision
@@ -54,9 +55,18 @@ namespace MirBot
         /// <summary>Deposit/Withdraw against the parts grid rather than ordinary storage.</summary>
         public bool PartsGrid;
 
+        /// <summary>ItemMove: merge the source stack into an occupied destination.</summary>
+        public bool MergeItem;
+
         /// <summary>For SetPetMode.</summary>
         public PetMode PetMode;
         public System.Collections.Generic.List<int> SellSlots;
+
+        /// <summary>
+        /// Slot -> how many units to sell, where only PART of the stack is surplus. Slots missing
+        /// from here (or a null map) are sold whole, which is every non-consumable.
+        /// </summary>
+        public System.Collections.Generic.Dictionary<int, long> SellCounts;
         public System.Collections.Generic.List<int> RepairSlots;
 
         public override string ToString() =>
@@ -84,6 +94,11 @@ namespace MirBot
         private readonly BotConfig _config;
         private readonly Random _random = new Random();
         private LootValueRule _lootValue;
+
+        /// <summary>Which monsters are worth butchering. Set by the host; null disables it.</summary>
+        private ButcherIndex _butcher;
+
+        public ButcherIndex Butcher { set => _butcher = value; }
 
         private DateTime _nextAction = DateTime.MinValue;
         private DateTime _nextPotion = DateTime.MinValue;
@@ -231,6 +246,9 @@ namespace MirBot
 
         public bool Ready => DateTime.Now >= _nextAction;
 
+        /// <summary>Set whenever Decide returns nothing, so the caller can say why.</summary>
+        public string IdleReason;
+
         /// <summary>
         /// Decide what to do now. Returns null when the action cooldown has not elapsed - the caller
         /// simply does nothing this tick rather than queueing up commands the server will reject.
@@ -258,11 +276,41 @@ namespace MirBot
         /// <summary>Set by BotInstance when a Stop has been requested.</summary>
         public bool StopRequested;
 
-        public Decision Decide(WorldModel world, Backpack items)
+        /// <summary>
+        /// RecoveryMaps contain deliberately trivial enemies. While there, preserve mana and
+        /// reagents: ordinary melee, looting, butchering and every emergency survival branch stay
+        /// active, but optional combat magic does not turn free recovery into another expense.
+        /// </summary>
+        public bool FrugalRecoveryCombat;
+
+        public Decision Decide(WorldModel world, Backpack items, bool itemUsePending)
         {
-            if (!Ready) return null;
+            // Why this tick produced nothing, for the caller to surface. A bot that decides
+            // NOTHING is invisible in the log - there is no line to print - and that is exactly
+            // the state worth seeing: an assassin arrived in Deserted Mine at 45% health, made
+            // one Heal, then produced not a single decision for fifteen seconds while it was
+            // killed. The other three bots were busy throughout, so it was not a host stall; its
+            // own Decide simply kept returning null and nothing recorded which branch did it.
+            IdleReason = null;
+
+            // Coverage is observation, not an action, so it must keep learning while an action
+            // cooldown or a fight prevents Wander from running. World.Location is authoritative:
+            // it is updated only from server packets, never optimistically when a move is sent.
+            ObserveExploration(world);
+
+            if (!Ready)
+            {
+                IdleReason = $"action gate until {_nextAction:HH:mm:ss.fff}";
+                return null;
+            }
+
             if (world.Dead) return new Decision { Action = BotAction.Idle, Reason = "dead" };
-            if (world.SelfID == 0) return null;
+
+            if (world.SelfID == 0)
+            {
+                IdleReason = "no self object yet";
+                return null;
+            }
 
             _items = items;
             UpdateBlockage(world);
@@ -307,6 +355,7 @@ namespace MirBot
                 world.HealthPercent <= escapeAt &&
                 !world.InSafeZone &&
                 !items.HasHealthPotion() &&
+                !itemUsePending &&
                 (Town == null || Town.Phase != TownPhase.Teleporting))
             {
                 int escape = items.FindTownTeleportSlot();
@@ -328,7 +377,7 @@ namespace MirBot
                     // it has been completed by it. Aborting would throw away the plan and, worse,
                     // set the retry cooldown. Let it replan on arrival as a scrolled trip always
                     // does.
-                    if (headingToTown) Town.ScrolledOut(world);
+                    if (headingToTown) Town.ScrolledOut(world, escape);
                     else Town?.Abort("escaped on a scroll");
 
                     return new Decision
@@ -362,7 +411,20 @@ namespace MirBot
             {
                 // Under pressure mid-trip: abandon travel and let normal survival behaviour run.
                 // Auto-path movement is the server's, so it is told to stop too.
-                if (Town.Phase == TownPhase.Travelling || Town.Phase == TownPhase.Teleporting)
+                //
+                // TELEPORTING IS NOT TRAVELLING AND MUST NOT BE INTERRUPTED.
+                //
+                // The rule exists to stop a bot walking across a map when it should be standing
+                // still and drinking. A scroll is the opposite of that walk: it is instant, it is
+                // the fastest possible way out of the danger, and it has already been paid for.
+                // Cancelling it throws the scroll away and leaves the bot exactly where it was,
+                // in danger, now on foot.
+                //
+                // An assassin in Deserted Mine did precisely this - "Teleporting scrolling to town
+                // to shop" at 09:42:54, "interrupted at 57% HP" five seconds later - and then set
+                // off walking to Bichon Town with three unused scrolls in its bag. The same rule
+                // had already cancelled its escape at the mine doorway while it was being killed.
+                if (Town.Phase == TownPhase.Travelling)
                 {
                     Town.Abort($"interrupted at {world.HealthPercent}% HP");
                     return new Decision { Action = BotAction.AutoPathCancel, Reason = "in danger" };
@@ -375,7 +437,7 @@ namespace MirBot
 
             // 0. Switch on any sustained attack toggle we have learnt but not enabled. Once per
             //    session per skill; the server keeps them on from there.
-            MagicType pending = Skills.PendingToggle(world);
+            MagicType pending = FrugalRecoveryCombat ? MagicType.None : Skills.PendingToggle(world);
 
             if (pending != MagicType.None)
             {
@@ -394,7 +456,25 @@ namespace MirBot
             //     looted books are learnt too, and so it happens before the next DisposableSlots is
             //     computed - learning changes what is sellable. Held off while a fight is on,
             //     because the server gates item use behind UseItemTime.
-            if (_config.LearnBooks && Books != null &&
+            // LEARNING IS A DICE ROLL, and the book is consumed either way.
+            //
+            // A gate on InCombat was added here and removed again within the hour, which is worth
+            // recording. The reasoning looked sound - the server refuses item use for ten seconds
+            // after combat, that rule had already been found behind the dud town scrolls, and Jill
+            // failed to learn a Summon Skeleton with two monsters on her. But the log says
+            // otherwise: across 24 attempts with a measurable outcome, 21 succeeded. An 88% rate
+            // is a per-book chance, not a combat block, because these bots are in combat for most
+            // of the time they are looting.
+            //
+            // Worse, the gate was dangerous. Delaying a learn until the bot is out of combat means
+            // carrying the book to town, where the disposal rules can decide it is surplus and
+            // sell it. Reading it the instant it is picked up is the safest thing to do with
+            // something that rare, and a failed roll costs exactly the same as a delayed sale.
+            //
+            // What survives from the episode is the outcome check in CheckPendingLearn: the bot
+            // used to assume every learn worked, so six looted Summon Skeletons and zero learnt
+            // skills looked identical to success in the log.
+            if (!itemUsePending && _config.LearnBooks && Books != null &&
                 world.NearestLiveMonster(2, _unreachable.Keys) == null)
             {
                 int slot = items.FindLearnableBookSlot(Books, world);
@@ -408,9 +488,44 @@ namespace MirBot
                     };
             }
 
+            // 0a. Throw away starter kit we have already replaced.
+            //
+            //     It cannot be sold - the instance is flagged Worthless whatever the database says
+            //     - so carrying it is permanent bag weight on bots that live near the cap. Done
+            //     here, beside dressing, because that is where the bag's gear is already being
+            //     reasoned about, and gated on being out of combat so a drop never costs a swing.
+            if (_config.DropReplacedStarterKit && !DropPending &&
+                world.NearestLiveMonster(2, _unreachable.Keys) == null)
+            {
+                int junk = items.FirstReplacedStarterSlot();
+
+                if (junk >= 0 && DropRefusedRecently(junk)) junk = -1;
+
+                if (junk >= 0)
+                    return new Decision
+                    {
+                        Action = BotAction.DropItem,
+                        Reason = $"replaced starter kit, and no vendor will take it",
+                        Subject = items.InSlot(junk)?.Info?.ItemName ?? "starter kit",
+                        PotionSlot = junk
+                    };
+            }
+
             // 0. Get dressed. Starter gear sits in the bag until something equips it, and a bare
             //    character fights considerably worse. One item per tick so the server's item
             //    handling is never flooded.
+            EquipRequest unlockForEquip = items.PendingEquipUnlock(world.Class, world.Gender);
+
+            if (unlockForEquip != null)
+                return new Decision
+                {
+                    Action = BotAction.Unlock,
+                    Reason = $"unlocking {unlockForEquip.ItemName} to equip in " +
+                             $"{unlockForEquip.Slot}",
+                    Subject = unlockForEquip.ItemName,
+                    FromSlot = unlockForEquip.FromSlot
+                };
+
             foreach (EquipRequest request in items.PendingEquips(world.Class, world.Gender))
                 return new Decision
                 {
@@ -420,8 +535,59 @@ namespace MirBot
                     Equip = request
                 };
 
+            // 0b. Pinned on one cell for too long. See BotConfig.StuckSeconds.
+            //
+            //     Deliberately AFTER healing is chosen below? No - before, because the thing that
+            //     makes this state so durable is that healing always has something to do. The bot
+            //     drinks, gets hit, drinks again, and every tick looks purposeful.
+            NoteWhereWeAre(world);
+
+            if (StuckTooLong(world))
+            {
+                ClearStuck();
+                _stuckStrikes++;
+
+                // Whatever it was chasing or walking to, it is not working. Park both, so the next
+                // SelectTarget is free to pick the thing actually standing on us.
+                ForceNextTarget();
+                if (IsCoverageTarget)
+                    AbandonExploration(world, "stationary watchdog", SweepSentence);
+                else
+                    ClearRoamTarget();
+
+                // And if a town trip is already running, stop it cancelling itself. The abort rule
+                // is "in danger, and able to heal, and not forced" - which is exactly true of a bot
+                // pinned at a doorway with a bag full of potions, so it aborted its own escape and
+                // re-approached, over and over. Forcing the trip removes the last clause.
+                // ESCALATE. Retargeting is the right first answer and a useless second one.
+                //
+                // An assassin pinned on the Deserted Mine entry cell was attacking throughout -
+                // Devouring Ghost, then Ghost Mage after the first strike switched it - healing
+                // between every swing, bag draining 147 to 136, and killing nothing. Eleven
+                // monsters on one cell at the new spawn density is not a fight it can win, and
+                // picking a different one of the eleven does not change that. The Mir 2 agents
+                // reach the same conclusion and retreat or teleport out.
+                //
+                // So the second strike stops arguing with the fight and leaves. Force() starts a
+                // trip, and on one already walking it sets the unstick scroll for the next tick -
+                // bounded by _scrolledToUnstick, so this cannot burn a scroll per strike.
+                if (_stuckStrikes >= 2 && Town != null)
+                {
+                    BrainLog?.Invoke($"stuck on {world.Location.X},{world.Location.Y} for the " +
+                                     $"{_stuckStrikes}{(_stuckStrikes == 2 ? "nd" : "th")} time - " +
+                                     "this fight is not winnable from here, leaving for town");
+                    Town.Force();
+                }
+                else
+                {
+                    BrainLog?.Invoke($"stuck on {world.Location.X},{world.Location.Y} for " +
+                                     $"{_config.StuckSeconds}s - dropped target and roam goal");
+                }
+            }
+
             // 1. Heal. Highest priority: being alive beats everything else.
-            if (world.MaxHealth > 0 && world.HealthPercent <= _config.HealAtPercent &&
+            if (!itemUsePending && world.MaxHealth > 0 &&
+                world.HealthPercent <= _config.HealAtPercent &&
                 DateTime.Now >= _nextPotion)
             {
                 int missing = world.MaxHealth - world.Health;
@@ -469,11 +635,12 @@ namespace MirBot
             //
             //     Below the heal threshold this is skipped: item use is gated on one global timer,
             //     so a mana potion drunk at 20% health is a health potion not drunk.
-            if (_config.DrinkManaAtPercent > 0 && world.MaxMana > 0 &&
+            if (!FrugalRecoveryCombat && !itemUsePending &&
+                _config.DrinkManaAtPercent > 0 && world.MaxMana > 0 &&
                 world.ManaPercent <= _config.DrinkManaAtPercent &&
                 world.HealthPercent > _config.HealAtPercent &&
                 DateTime.Now >= _nextPotion &&
-                Spells.HasCastable(world))
+                (Spells.UsesMana(world) || Skills.NeedsMana(world)))
             {
                 int manaSlot = items.FindManaPotionSlot(world.MaxMana - world.Mana);
 
@@ -569,9 +736,12 @@ namespace MirBot
             }
 
             // Trip steps come after survival but before picking a fight.
-            if (Town != null)
+            // A trip may decide to spend a scroll and advance its own phase before the packet is
+            // sent. Pause that state machine while another item use is outstanding; survival
+            // branches above and ordinary combat below remain free to act in the meantime.
+            if (Town != null && !itemUsePending)
             {
-                Decision trip = Town.Next(world, items);
+                Decision trip = Town.Next(world, items, itemUsePending);
 
                 if (trip != null)
                 {
@@ -601,7 +771,10 @@ namespace MirBot
                 // Travelling is server-driven; stand by rather than fighting our way across town.
                 if (Town.Phase == TownPhase.Travelling || Town.Phase == TownPhase.Talking ||
                     Town.Phase == TownPhase.Trading)
+                {
+                    IdleReason = $"standing by for the town trip ({Town.Phase})";
                     return null;
+                }
             }
 
             // 2b. Cross-map travel. Below the town trip, because arriving somewhere new with a
@@ -645,13 +818,17 @@ namespace MirBot
             //       WorldModel.HasBuff is fed by S.BuffAdd, S.BuffRemove and the login dump - so
             //       there is no timer here to drift, and a buff that is actually held simply stops
             //       being selected.
-            if (!world.Dead)
+            if (!world.Dead && !FrugalRecoveryCombat)
             {
                 ClientUserMagic buff = Spells.ChooseBuff(world, out bool atOwnFeet);
 
                 if (buff != null)
                 {
                     Spells.BuffIssued(buff);
+
+                    // Timer-tracked effects need their clock started here: they grant no buff, so
+                    // nothing else will ever tell us the cast happened.
+                    Spells.TimedSelfEffectIssued(buff);
 
                     return new Decision
                     {
@@ -695,6 +872,32 @@ namespace MirBot
                     };
             }
 
+            // 2b-i-c. Keep our own pet alive. Heal accepts an owned monster through the same
+            // server CanHelpTarget path as a friendly player. This is allowed even in frugal
+            // recovery combat: preserving an existing skeleton is cheaper than losing it and
+            // spending another amulet and summon cast.
+            ClientUserMagic petHeal = Spells.ChoosePetHeal(world, out WorldObject hurtPet);
+
+            if (petHeal != null && hurtPet != null)
+            {
+                Spells.PetHealIssued(hurtPet.ObjectID);
+
+                int petPercent = hurtPet.MaxHealth > 0
+                    ? hurtPet.Health * 100 / hurtPet.MaxHealth
+                    : 100;
+
+                return new Decision
+                {
+                    Action = BotAction.Cast,
+                    Reason = $"{petHeal.Info.Name} on {hurtPet.Name} at {petPercent}% HP",
+                    Subject = petHeal.Info.Name,
+                    TargetID = hurtPet.ObjectID,
+                    Direction = WorldModel.DirectionTo(world.Location, hurtPet.Location),
+                    Point = hurtPet.Location,
+                    Magic = petHeal.Info.Magic
+                };
+            }
+
             // 2b-ii. Keep a summon out.
             Decision summon = KeepSummon(world, items);
             if (summon != null) return summon;
@@ -711,6 +914,34 @@ namespace MirBot
             Decision doorway = ClearDoorway(world);
             if (doorway != null) return doorway;
 
+            // 2d. GATHER BEFORE PICKING A NEW FIGHT.
+            //
+            //     Looting used to sit at step 5, reachable only when SelectTarget returned null -
+            //     that is, only once there was nothing left alive worth attacking anywhere in
+            //     range. On a populated map that moment never arrives, so the bot walked away from
+            //     the corpse it had just made to start on the next monster, and the drops expired
+            //     where they fell. A wizard burned its way through a bag of mana potions killing
+            //     things and came home poorer than it left, because the gold it was killing FOR
+            //     was still on the floor behind it.
+            //
+            //     The distinction that matters is not "is anything alive" but "is anything ON us".
+            //     A monster in contact is a fight already in progress and wins outright; a monster
+            //     four tiles away that has not touched us is a fight the bot is choosing, and the
+            //     loot underfoot is worth more than that choice. Heal and Flee both sit above
+            //     this, so reaching here already means we are not in trouble.
+            //
+            //     Butchering rides along for the same reason and under the same guard: a carcass
+            //     is only worth anything while it is still there.
+            if (_config.GatherSafeRange > 0 &&
+                world.NearestLiveMonster(_config.GatherSafeRange, _unreachable.Keys) == null)
+            {
+                Decision pickup = TryLoot(world);
+                if (pickup != null) return pickup;
+
+                Decision carve = TryButcher(world);
+                if (carve != null) return carve;
+            }
+
             WorldObject target = SelectTarget(world);
 
             if (target != null)
@@ -725,7 +956,9 @@ namespace MirBot
                 //    from ten tiles rather than after a walk.
                 // Poison first: it ticks for the rest of the fight, so a turn spent applying it
                 // early is worth more than the same turn spent on one direct hit.
-                ClientUserMagic venom = Spells.ChoosePoison(world, items, target, distance);
+                ClientUserMagic venom = FrugalRecoveryCombat
+                    ? null
+                    : Spells.ChoosePoison(world, items, target, distance);
 
                 if (venom != null)
                 {
@@ -743,10 +976,39 @@ namespace MirBot
                     };
                 }
 
-                ClientUserMagic spell = Spells.Choose(world, target, distance);
+                ClientUserMagic spell = FrugalRecoveryCombat
+                    ? null
+                    : Spells.Choose(world, target, distance);
 
                 if (spell != null)
                 {
+                    // IS THIS GOING ANYWHERE? The identical question the melee branch asks below,
+                    // and the reason it is asked here too.
+                    //
+                    // NoDamageTo was called from exactly one place - the distance <= 1 branch -
+                    // so the entire protection existed only for characters in contact. A caster
+                    // returns from HERE every tick and never reaches it, which means a wizard or
+                    // a Taoist attacking anything immune, invulnerable or simply out of its depth
+                    // had no way out at all. A Chestnut Tree took 200 mana off a level 23 wizard
+                    // before anyone noticed.
+                    //
+                    // Counted per SPELL rather than per tick, so the approach turns that carry a
+                    // caster into range are not charged against its patience.
+                    if (NoDamageTo(target))
+                    {
+                        Blacklist(target.ObjectID, GiveUpFor);
+
+                        return new Decision
+                        {
+                            Action = BotAction.Roam,
+                            Reason = $"{target.Name} took no damage from " +
+                                     $"{_config.AttackPatience} casts",
+                            Subject = "giving up",
+                            Direction = NextRoamDirection(world, true),
+                            Distance = 1
+                        };
+                    }
+
                     return new Decision
                     {
                         Action = BotAction.Cast,
@@ -761,7 +1023,7 @@ namespace MirBot
 
                 // 3a-i. Hold the range. A caster that has something to throw should be throwing
                 //       it from a distance, not letting the target close and then meleeing.
-                Decision back = Kite(world, target, distance);
+                Decision back = FrugalRecoveryCombat ? null : Kite(world, target, distance);
                 if (back != null) return back;
 
                 // 3b. In contact. Either standing beside it, or - Mir allows this - standing on
@@ -807,7 +1069,9 @@ namespace MirBot
                             Distance = 1
                         };
 
-                    MagicType magic = Skills.ChooseAttackMagic(world, target, distance);
+                    MagicType magic = FrugalRecoveryCombat
+                        ? MagicType.None
+                        : Skills.ChooseAttackMagic(world, target, distance);
 
                     return new Decision
                     {
@@ -858,9 +1122,12 @@ namespace MirBot
                 return approach;
             }
 
-            // 5. Nothing to fight - loot, then wander.
+            // 5. Nothing to fight - loot, butcher, then wander.
             Decision idleLoot = TryLoot(world);
             if (idleLoot != null) return idleLoot;
+
+            Decision butcher = TryButcher(world);
+            if (butcher != null) return butcher;
 
             return Wander(world, "no targets", false);
         }
@@ -1347,6 +1614,7 @@ namespace MirBot
         /// </summary>
         private Decision KeepSummon(WorldModel world, Backpack items)
         {
+            if (FrugalRecoveryCombat) return null;
             if (!_config.KeepSummon || !_config.CastSpells) return null;
             if (world.Dead || DateTime.UtcNow < _nextSummon) return null;
             if (Town != null && Town.Active) return null;
@@ -1359,7 +1627,7 @@ namespace MirBot
 
             // No reagent, no summon - and the server would take the amulet it does not have and
             // tell us nothing. Checked here so the refusal is ours and is logged.
-            if (items.CountReagent(ItemType.Amulet) <= 0)
+            if (items.EquippedReagentCount(ItemType.Amulet) <= 0)
             {
                 SummonDiagnostic = "no amulet equipped or carried";
                 _nextSummon = DateTime.UtcNow.AddSeconds(Math.Max(5, _config.SummonRetrySeconds));
@@ -1555,6 +1823,38 @@ namespace MirBot
 
         private Point _roamTarget = Point.Empty;
 
+        private enum RoamTargetKind
+        {
+            None,
+            LocalCoverage,
+            MapWideCoverage,
+            FallbackSweep,
+            Random
+        }
+
+        /// <summary>
+        /// Coverage belongs to one brain and one connection. It is intentionally neither shared
+        /// nor persisted: Jill visiting a sector must not convince Wizzler that he has hunted it,
+        /// and reconnecting starts a fresh view of where this session has actually searched.
+        /// </summary>
+        private readonly ExplorationCoverage _coverage = new ExplorationCoverage();
+        private ExplorationChoice _explorationChoice;
+        private RoamTargetKind _roamKind;
+        private int _roamMapIndex = -1;
+
+        public string ExplorationMode => _roamKind == RoamTargetKind.LocalCoverage ? "local"
+            : _roamKind == RoamTargetKind.MapWideCoverage ? "map-wide"
+            : "none";
+
+        public DateTime? ExplorationTargetLastVisitedUtc =>
+            _explorationChoice?.LastVisitedUtc;
+
+        public ExplorationSnapshot ExplorationStatus()
+        {
+            if (_roamMapIndex < 0) return new ExplorationSnapshot(0, 0);
+            return _coverage.Snapshot(_roamMapIndex, Maps?.For(_roamMapIndex));
+        }
+
         /// <summary>
         /// Where the bot is currently wandering to, or empty.
         ///
@@ -1563,6 +1863,39 @@ namespace MirBot
         /// </summary>
         public Point RoamTarget => _roamTarget;
         private DateTime _roamUntil = DateTime.MinValue;
+
+        private void ObserveExploration(WorldModel world)
+        {
+            if (world == null || world.SelfID == 0) return;
+
+            DateTime now = DateTime.UtcNow;
+
+            if (_roamMapIndex != world.MapIndex)
+            {
+                ClearRoamTarget();
+                _roamMapIndex = world.MapIndex;
+            }
+
+            _coverage.Observe(world.MapIndex, world.Location, now);
+
+            // The objective is coverage of a sector, not standing on one arbitrary coordinate in
+            // it. Reaching any cell in the chosen sector completes that exploration leg; insisting
+            // on the exact sampled point would add travel without adding knowledge and could turn
+            // one awkward cell into a false stall.
+            if (_explorationChoice != null &&
+                world.Location.X / ExplorationCoverage.SectorSize == _explorationChoice.SectorX &&
+                world.Location.Y / ExplorationCoverage.SectorSize == _explorationChoice.SectorY)
+            {
+                BrainLog?.Invoke($"Exploration: reached {_roamKind.ToString().ToLowerInvariant()} " +
+                                 $"sector {_explorationChoice.SectorX},{_explorationChoice.SectorY}.");
+                ClearRoamTarget();
+            }
+
+            // A fight is useful work, not failed navigation. Keep the long-target watchdog paused
+            // while combat owns the decision so a two-minute fight cannot make exploration look
+            // stalled the instant Wander gets control again.
+            if (_sweeping && world.InCombat) _sweepProgressAt = now;
+        }
 
         /// <summary>
         /// Wander by walking somewhere, not by walking some way.
@@ -1589,17 +1922,88 @@ namespace MirBot
             if (grid == null || !_config.RoamToDestinations)
                 return Drift(world, reason, forceNew);
 
-            if (forceNew) _roamTarget = Point.Empty;
+            if (forceNew && _roamTarget != Point.Empty)
+            {
+                // A caller asking for a different destination has not proved the sector
+                // unreachable. Suppress it only briefly, so equal-age selection cannot hand the
+                // exact same target straight back on the next line.
+                if (IsCoverageTarget)
+                    _coverage.Bar(world.MapIndex, _roamTarget, DateTime.UtcNow.AddSeconds(30));
+
+                ClearRoamTarget();
+            }
+
+            if (SweepStalled(world))
+                AbandonSweep($"no closer than {_sweepBest} tiles for " +
+                             $"{SweepPatience.TotalSeconds:0}s");
 
             if (_roamTarget != Point.Empty &&
-                (DateTime.UtcNow > _roamUntil ||
+                (ShouldExpireRoamTarget(DateTime.UtcNow, _roamUntil, IsLongRoamTarget) ||
                  WorldModel.Distance(world.Location, _roamTarget) <= 1))
-                _roamTarget = Point.Empty;
+            {
+                if (IsCoverageTarget && WorldModel.Distance(world.Location, _roamTarget) <= 1)
+                    BrainLog?.Invoke($"Exploration: reached {_roamKind.ToString().ToLowerInvariant()} " +
+                                     $"target {_roamTarget.X},{_roamTarget.Y}.");
+
+                ClearRoamTarget();
+            }
 
             if (_roamTarget == Point.Empty)
             {
-                _roamTarget = PickRoamSpot(world, grid);
-                _roamUntil = DateTime.UtcNow.AddSeconds(Math.Max(5, _config.RoamRetargetSeconds));
+                bool mapWide = Sweeping(world);
+                int radius = Math.Max(4, _config.RoamRadius);
+                HashSet<Point> excluded = CoverageExcluded(world);
+
+                _explorationChoice = _coverage.Choose(
+                    world.MapIndex,
+                    grid,
+                    world.Location,
+                    radius,
+                    mapWide,
+                    excluded,
+                    _random,
+                    DateTime.UtcNow);
+
+                if (_explorationChoice != null)
+                {
+                    _roamTarget = _explorationChoice.Target;
+                    _roamKind = mapWide
+                        ? RoamTargetKind.MapWideCoverage
+                        : RoamTargetKind.LocalCoverage;
+
+                    BrainLog?.Invoke($"Exploration: {(mapWide ? "map-wide" : "local")} target " +
+                                     $"{_roamTarget.X},{_roamTarget.Y}, " +
+                                     CoverageAge(_explorationChoice) + ".");
+                }
+
+                // Retain the existing next-floor/far-side sweep as a recovery fallback. Coverage
+                // normally supplies the target; this remains useful when every eligible sector is
+                // temporarily barred or the map data offers no suitable cell.
+                if (_roamTarget == Point.Empty && mapWide)
+                {
+                    _roamTarget = PickSweepSpot(world, grid);
+                    if (_roamTarget != Point.Empty) _roamKind = RoamTargetKind.FallbackSweep;
+                }
+
+                if (_roamTarget == Point.Empty)
+                {
+                    _roamTarget = PickRoamSpot(world, grid);
+                    if (_roamTarget != Point.Empty) _roamKind = RoamTargetKind.Random;
+                }
+
+                _sweeping = IsLongRoamTarget;
+
+                if (_sweeping)
+                {
+                    _sweepBest = WorldModel.Distance(world.Location, _roamTarget);
+                    _sweepProgressAt = DateTime.UtcNow;
+                }
+
+                // A sweep is a long walk across the map and must not be re-rolled on the ordinary
+                // roam cadence, or it never arrives - which is the milling it exists to stop.
+                _roamUntil = DateTime.UtcNow.AddSeconds(_sweeping
+                    ? Math.Max(30, _config.RoamRetargetSeconds * 6)
+                    : Math.Max(5, _config.RoamRetargetSeconds));
             }
 
             if (_roamTarget == Point.Empty) return Drift(world, reason, forceNew);
@@ -1609,7 +2013,7 @@ namespace MirBot
             Decision step = new Decision
             {
                 Action = BotAction.Roam,
-                Reason = $"{reason} - wandering to {_roamTarget.X},{_roamTarget.Y} ({remaining} tiles)",
+                Reason = RoamReason(reason, remaining),
                 Subject = "roaming",
                 Destination = _roamTarget
             };
@@ -1618,11 +2022,96 @@ namespace MirBot
             // turn rather than searching again on the bot's own thread.
             if (!TrySteer(step, world, _roamTarget, 0, remaining))
             {
-                _roamTarget = Point.Empty;
+                if (IsCoverageTarget)
+                    AbandonExploration(world, "no route", SweepSentence);
+                else if (_roamKind == RoamTargetKind.FallbackSweep)
+                    AbandonSweep("no route");
+                else
+                    ClearRoamTarget();
+
                 return Drift(world, reason, forceNew);
             }
 
             return step;
+        }
+
+        private bool IsCoverageTarget =>
+            _roamKind == RoamTargetKind.LocalCoverage ||
+            _roamKind == RoamTargetKind.MapWideCoverage;
+
+        private bool IsLongRoamTarget =>
+            _roamKind == RoamTargetKind.MapWideCoverage ||
+            _roamKind == RoamTargetKind.FallbackSweep;
+
+        internal static bool ShouldExpireRoamTarget(DateTime now, DateTime until,
+            bool longTarget) => !longTarget && now > until;
+
+        private static string CoverageAge(ExplorationChoice choice)
+        {
+            if (choice?.LastVisitedUtc == null) return "target unseen";
+
+            TimeSpan age = DateTime.UtcNow - choice.LastVisitedUtc.Value;
+
+            if (age.TotalMinutes < 1) return $"last visited {Math.Max(0, age.TotalSeconds):0}s ago";
+            if (age.TotalHours < 1) return $"last visited {age.TotalMinutes:0}m ago";
+            return $"last visited {age.TotalHours:0.0}h ago";
+        }
+
+        private string RoamReason(string reason, int remaining)
+        {
+            switch (_roamKind)
+            {
+                case RoamTargetKind.LocalCoverage:
+                    return $"{reason} - exploring least-visited local sector at " +
+                           $"{_roamTarget.X},{_roamTarget.Y} ({remaining} tiles; " +
+                           CoverageAge(_explorationChoice) + ")";
+
+                case RoamTargetKind.MapWideCoverage:
+                    return $"{reason} - nothing here for {_config.SweepAfterIdleSeconds}s, " +
+                           $"exploring map-wide at {_roamTarget.X},{_roamTarget.Y} " +
+                           $"({remaining} tiles; {CoverageAge(_explorationChoice)})";
+
+                case RoamTargetKind.FallbackSweep:
+                    return $"{reason} - nothing here for {_config.SweepAfterIdleSeconds}s, " +
+                           $"fallback sweep to {_roamTarget.X},{_roamTarget.Y} ({remaining} tiles)";
+
+                default:
+                    return $"{reason} - random fallback to {_roamTarget.X},{_roamTarget.Y} " +
+                           $"({remaining} tiles)";
+            }
+        }
+
+        private HashSet<Point> CoverageExcluded(WorldModel world)
+        {
+            HashSet<Point> excluded = new HashSet<Point>();
+            HashSet<Point> doors = Doors(world);
+            HashSet<Point> learned = Nav?.BlockedOn(world.MapIndex);
+
+            if (doors != null) excluded.UnionWith(doors);
+            if (learned != null) excluded.UnionWith(learned);
+
+            return excluded;
+        }
+
+        private void AbandonExploration(WorldModel world, string why, TimeSpan sentence)
+        {
+            if (_roamTarget != Point.Empty)
+                _coverage.Bar(world.MapIndex, _roamTarget, DateTime.UtcNow + sentence);
+
+            BrainLog?.Invoke($"Exploration: abandoned {_roamTarget.X},{_roamTarget.Y} - {why}; " +
+                             $"sector barred for {sentence.TotalMinutes:0} minutes.");
+
+            ClearRoamTarget();
+        }
+
+        private void ClearRoamTarget()
+        {
+            _roamTarget = Point.Empty;
+            _roamKind = RoamTargetKind.None;
+            _explorationChoice = null;
+            _sweeping = false;
+            _sweepBest = int.MaxValue;
+            _sweepProgressAt = DateTime.MinValue;
         }
 
         /// <summary>The old blind walk, kept for maps with no grid and as the fallback when no
@@ -1641,6 +2130,299 @@ namespace MirBot
         /// set of every walkable cell in range costs a square of the radius on the bot's own
         /// thread, and a handful of darts finds open ground on any map that has any.
         /// </summary>
+        private bool _sweeping;
+
+        /// <summary>Closest we have been to the current sweep target, and when.</summary>
+        private int _sweepBest = int.MaxValue;
+        private DateTime _sweepProgressAt = DateTime.MinValue;
+
+        /// <summary>Sweep targets abandoned as unreachable, and when they may be tried again.</summary>
+        private readonly Dictionary<Point, DateTime> _sweepGaveUp = new Dictionary<Point, DateTime>();
+
+        /// <summary>How long a sweep may make no progress before it is abandoned.</summary>
+        private static readonly TimeSpan SweepPatience = TimeSpan.FromSeconds(45);
+
+        /// <summary>And how long that target is left alone afterwards.</summary>
+        private static readonly TimeSpan SweepSentence = TimeSpan.FromMinutes(10);
+
+        /// <summary>
+        /// Is the sweep getting anywhere? Abandon it if not.
+        ///
+        /// The sweep walks the length of a cave towards the next floor, so it deliberately
+        /// survives the ordinary roam re-roll - otherwise it never arrives. That exemption had no
+        /// counterpart: a sweep that could NEVER arrive was immortal. Two bots spent forty minutes
+        /// three and ten tiles from a stairway they could not reach, re-picking the same target
+        /// every thirty seconds.
+        ///
+        /// Invisible, too, on two counts. The action type never changed, and the log only writes
+        /// when it does, so both went silent mid-session and looked crashed. And the stuck
+        /// watchdog measures a bot pinned on ONE CELL - these were walking the whole time, just
+        /// not arriving. Distance to the goal is the thing that was not being watched.
+        /// </summary>
+        private bool SweepStalled(WorldModel world)
+        {
+            if (!_sweeping || _roamTarget == Point.Empty) return false;
+
+            int distance = WorldModel.Distance(world.Location, _roamTarget);
+
+            if (distance < _sweepBest)
+            {
+                _sweepBest = distance;
+                _sweepProgressAt = DateTime.UtcNow;
+                return false;
+            }
+
+            if (_sweepProgressAt == DateTime.MinValue)
+            {
+                _sweepProgressAt = DateTime.UtcNow;
+                return false;
+            }
+
+            return DateTime.UtcNow - _sweepProgressAt > SweepPatience;
+        }
+
+        private void AbandonSweep(string why)
+        {
+            if (IsCoverageTarget)
+            {
+                if (_roamTarget != Point.Empty && _roamMapIndex >= 0)
+                    _coverage.Bar(_roamMapIndex, _roamTarget, DateTime.UtcNow + SweepSentence);
+
+                BrainLog?.Invoke($"Exploration: abandoned {_roamTarget.X},{_roamTarget.Y} - {why}; " +
+                                 $"sector barred for {SweepSentence.TotalMinutes:0} minutes.");
+                ClearRoamTarget();
+                return;
+            }
+
+            if (_roamTarget != Point.Empty)
+                _sweepGaveUp[_roamTarget] = DateTime.UtcNow + SweepSentence;
+
+            BrainLog?.Invoke($"Sweep abandoned - {why}. That stairway is left alone for " +
+                             $"{SweepSentence.TotalMinutes:0} minutes.");
+
+            ClearRoamTarget();
+        }
+
+        private int _stuckStrikes;
+        private Point _stuckAt = Point.Empty;
+        private DateTime _stuckSince = DateTime.MinValue;
+
+        /// <summary>Remember where we are, and since when, for the stationary watchdog.</summary>
+        private void NoteWhereWeAre(WorldModel world)
+        {
+            if (world.Location == _stuckAt) return;
+
+            // Moving clears the record entirely: whatever was wrong, it is not wrong now.
+            _stuckAt = world.Location;
+            _stuckSince = DateTime.UtcNow;
+            _stuckStrikes = 0;
+        }
+
+        /// <summary>
+        /// Standing on one cell AND getting nothing for it.
+        ///
+        /// Movement alone was the first version and it was wrong within a minute of shipping: a
+        /// bot fighting things that are already adjacent does not move, and it should not. With
+        /// the cave spawn counts raised - Deserted Mine went from a median of 4 monsters in view
+        /// to 25 - standing still surrounded is now the NORMAL way to hunt well. It fired three
+        /// times in thirty seconds on a taoist that was looting and killing throughout, throwing
+        /// away a committed target each time, which costs every hit already landed on it.
+        ///
+        /// Experience is the honest progress signal, and it is already tracked for the status
+        /// page. Pinned and earning is a bot doing its job; pinned and earning nothing for twenty
+        /// seconds is the doorway case this exists for - an assassin at 51,292 swinging at ghosts
+        /// it never killed, its bag draining two weight a potion.
+        /// </summary>
+        private bool StuckTooLong(WorldModel world)
+        {
+            if (_config.StuckSeconds <= 0 || _stuckSince == DateTime.MinValue) return false;
+
+            TimeSpan limit = TimeSpan.FromSeconds(_config.StuckSeconds);
+
+            if (DateTime.UtcNow - _stuckSince <= limit) return false;
+
+            // Nothing earned at all yet - a fresh login, usually.
+            //
+            // This previously returned true, which was meant to avoid calling a new session
+            // permanently stuck and did exactly the opposite: with no experience recorded, the
+            // test collapsed back to movement alone, the very rule the experience condition was
+            // added to replace. A warrior fired it twenty-four seconds after logging in.
+            //
+            // Three times the limit before the movement-only reading is trusted. Long enough that
+            // connecting, loading a map and picking a first target cannot trip it; short enough
+            // that a bot which genuinely arrives into a wall still gets rescued.
+            if (world.LastExperienceGainUtc == DateTime.MinValue)
+                return DateTime.UtcNow - _stuckSince > TimeSpan.FromTicks(limit.Ticks * 3);
+
+            return DateTime.UtcNow - world.LastExperienceGainUtc > limit;
+        }
+
+        /// <summary>Restart the clock, so one trigger does not fire every tick afterwards.</summary>
+        private void ClearStuck() => _stuckSince = DateTime.UtcNow;
+
+        /// <summary>Long enough since the last swing or cast to stop searching locally.</summary>
+        private bool Sweeping(WorldModel world)
+        {
+            if (_config.SweepAfterIdleSeconds <= 0 || world == null) return false;
+
+            // A fresh connection or map can have no hit at all. Requiring _lastHitAt to be set
+            // made that worst case exempt forever: Wizzler roamed an empty Bichon Cave for five
+            // minutes after reconnect while the configured 45-second sweep never armed.
+            //
+            // Map entry is also a floor for an old hit timestamp. A kill on the previous map must
+            // not make a newly reached map look as though it has already been idle for minutes.
+            DateTime idleSince = _lastHitAt;
+            if (world.MapEnteredUtc > idleSince) idleSince = world.MapEnteredUtc;
+
+            return idleSince != DateTime.MinValue &&
+                   DateTime.UtcNow - idleSince >
+                       TimeSpan.FromSeconds(_config.SweepAfterIdleSeconds);
+        }
+
+        /// <summary>
+        /// A cell on the way to the next floor down, or empty when this map has no deeper floor.
+        ///
+        /// "Deeper" is decided on the map NAME - the same cave with a higher trailing number - so
+        /// the sweep can only ever go further in. Anything else would let an idle bot wander back
+        /// to town, or into an unrelated map the travel system never chose.
+        ///
+        /// The target is the exit cell itself when SweepEntersNextFloor is set, and otherwise a
+        /// walkable cell a few tiles short of it: far enough that getting there crosses the length
+        /// of the map, which is the point, without stepping through a door the brain has no
+        /// danger information about.
+        /// </summary>
+        private bool SweepTargetBarred(Point spot)
+        {
+            if (!_sweepGaveUp.TryGetValue(spot, out DateTime until)) return false;
+            if (DateTime.UtcNow < until) return true;
+
+            _sweepGaveUp.Remove(spot);
+            return false;
+        }
+
+        private Point PickSweepSpot(WorldModel world, MapGrid grid)
+        {
+            if (Exits == null) return Point.Empty;
+
+            string here = Globals.MapInfoList?.Binding
+                ?.FirstOrDefault(x => x.Index == world.MapIndex)?.Description ?? "";
+
+            int hereFloor = FloorNumber(here);
+
+            // NO NUMBERED FLOOR IS NOT THE SAME AS NOWHERE TO GO.
+            //
+            // This returned empty for any map whose name does not end in a floor number, which
+            // silently disabled the whole idle sweep on every cave that is not numbered. "Ant Cave
+            // North" is one: a Taoist roamed it for two and a half minutes without a single kill,
+            // wandering nineteen tiles at a time inside the same empty pocket, because the one
+            // mechanism meant to walk it out of there declined to produce a destination.
+            //
+            // The useful half of a sweep is crossing the map, not the door at the end of it. When
+            // there is no deeper floor to aim at, aim at the far side of the map instead.
+            if (hereFloor <= 0)
+            {
+                Point far = FarSideOf(world, grid);
+                return SweepTargetBarred(far) ? Point.Empty : far;
+            }
+
+            string stem = here.Substring(0, here.Length - hereFloor.ToString().Length).TrimEnd();
+
+            Point best = Point.Empty;
+            int bestDistance = int.MaxValue;
+
+            foreach (MapExit exit in Exits.ExitsFrom(world.MapIndex))
+            {
+                if (exit == null || exit.IsTeleport || exit.Cells == null) continue;
+
+                string there = exit.ToMapName ?? "";
+
+                if (FloorNumber(there) != hereFloor + 1) continue;
+                if (!there.StartsWith(stem, StringComparison.OrdinalIgnoreCase)) continue;
+
+                foreach (Point cell in exit.Cells)
+                {
+                    int distance = WorldModel.Distance(world.Location, cell);
+
+                    if (distance >= bestDistance || distance < 4) continue;
+
+                    Point aim = _config.SweepEntersNextFloor ? cell : StandOffFrom(cell, grid);
+
+                    if (aim == Point.Empty) continue;
+
+                    // Already proved unreachable from here. See AbandonSweep: without this the
+                    // give-up is pointless, because the very next pick returns the same stairway.
+                    if (SweepTargetBarred(aim)) continue;
+
+                    best = aim;
+                    bestDistance = distance;
+                }
+            }
+
+            return best;
+        }
+
+        /// <summary>
+        /// The most distant walkable cell we can find, for sweeping a map with no deeper floor.
+        ///
+        /// Sampled rather than scanned: the grid can be several hundred cells square and this runs
+        /// on the decision tick. Sixty tries reliably lands somewhere across the map, which is all
+        /// the sweep needs - it is looking for monsters on the way, not for a particular tile.
+        /// </summary>
+        private Point FarSideOf(WorldModel world, MapGrid grid)
+        {
+            if (grid == null) return Point.Empty;
+
+            Point best = Point.Empty;
+            int bestDistance = 0;
+
+            for (int tries = 0; tries < 60; tries++)
+            {
+                Point cell = new Point(_random.Next(grid.Width), _random.Next(grid.Height));
+
+                if (!grid.Walkable(cell)) continue;
+
+                int distance = WorldModel.Distance(world.Location, cell);
+
+                // Far enough to be worth the walk, and further than anything else we found.
+                if (distance <= bestDistance || distance < 25) continue;
+
+                best = cell;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
+
+        /// <summary>A walkable cell a few tiles off a door, so the sweep stops beside it.</summary>
+        private static Point StandOffFrom(Point cell, MapGrid grid)
+        {
+            for (int radius = 3; radius <= 6; radius++)
+                for (int dx = -radius; dx <= radius; dx++)
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        if (Math.Max(Math.Abs(dx), Math.Abs(dy)) != radius) continue;
+
+                        Point candidate = new Point(cell.X + dx, cell.Y + dy);
+
+                        if (grid.Walkable(candidate)) return candidate;
+                    }
+
+            return Point.Empty;
+        }
+
+        /// <summary>The trailing floor number of a map name, or 0. "Deserted Mine Lv 2" -> 2.</summary>
+        private static int FloorNumber(string mapName)
+        {
+            if (string.IsNullOrWhiteSpace(mapName)) return 0;
+
+            int end = mapName.Length;
+
+            while (end > 0 && char.IsDigit(mapName[end - 1])) end--;
+
+            return end == mapName.Length ||
+                   !int.TryParse(mapName.Substring(end), out int floor) ? 0 : floor;
+        }
+
         private Point PickRoamSpot(WorldModel world, MapGrid grid)
         {
             int radius = Math.Max(4, _config.RoamRadius);
@@ -1723,6 +2505,28 @@ namespace MirBot
             {
                 WorldObject current = world.Objects.FirstOrDefault(x => x.ObjectID == _committedTarget);
 
+                // Committed for a long time without ever hitting it.
+                //
+                // The existing give-ups all need a specific symptom: blocked moves, distance that
+                // stops shrinking, no route at all. A bot boxed in by other monsters has none of
+                // them - it steps sideways, the distance changes, a route exists on paper - and it
+                // will keep trying indefinitely while something it COULD hit stands next to it.
+                //
+                // So this is the catch-all: a target held for longer than the give-up time with no
+                // attack landed on it is written off, whatever the reason. The clock only runs
+                // while the target is committed, and any attack on it resets it, so a long fight
+                // against something tough is never cut short.
+                if (current != null && ShouldAbandonCommitted())
+                {
+                    string name = current.Name;
+
+                    Blacklist(current.ObjectID, GiveUpFor);
+                    BrainLog?.Invoke($"gave up on {name} - {_config.AttackGiveUpSeconds}s " +
+                                      "committed without landing a hit");
+
+                    return SelectTarget(world);      // pick again, now that it is parked
+                }
+
                 bool stillGood = current != null && current.IsValidTarget &&
                                  !_unreachable.ContainsKey(current.ObjectID) &&
                                  world.DistanceTo(current.Location) <= _config.AggroRange + 2;
@@ -1730,6 +2534,35 @@ namespace MirBot
                 // Commitment survives a monster becoming frightening mid-fight. Walking away from
                 // something that is already on us just means being hit in the back; the health
                 // thresholds above decide when to actually disengage.
+                //
+                // But commitment does NOT survive something else standing on us.
+                //
+                // Staying on a target is about not throwing away damage already dealt by switching
+                // mid-fight, and that reasoning quietly assumes the target is reachable. Surrounded
+                // by monsters while committed to one two tiles beyond them, it becomes the opposite
+                // of what it is for: the bot walks at something it cannot touch while three things
+                // it could hit take turns on its back.
+                //
+                // The watchdog below catches this eventually, but "eventually" is
+                // AttackGiveUpSeconds - forty-five seconds of free damage. An adjacent monster is
+                // a fight we are already in whether we like it or not, so it simply wins.
+                if (stillGood && world.DistanceTo(current.Location) > 1)
+                {
+                    WorldObject onTopOfUs = world.NearestLiveMonster(1, _unreachable.Keys);
+
+                    if (onTopOfUs != null && onTopOfUs.ObjectID != current.ObjectID)
+                    {
+                        TargetSwitches++;
+                        ForgetFight();
+
+                        _committedTarget = onTopOfUs.ObjectID;
+                        _committedAt = DateTime.UtcNow;
+                        _lastHitAt = DateTime.UtcNow;
+
+                        return onTopOfUs;
+                    }
+                }
+
                 if (stillGood) return current;
 
                 _committedTarget = 0;
@@ -1746,11 +2579,90 @@ namespace MirBot
                     ForgetFight();
                 }
 
-                _committedTarget = next.ObjectID;
+                if (_committedTarget != next.ObjectID)
+                {
+                    _committedTarget = next.ObjectID;
+                    _committedAt = DateTime.UtcNow;
+                    _lastHitAt = DateTime.UtcNow;      // a fresh target starts with a clean clock
+                }
             }
 
             return next;
         }
+
+        private DateTime _committedAt = DateTime.MinValue;
+        private DateTime _lastHitAt = DateTime.MinValue;
+
+        /// <summary>
+        /// Called whenever we actually swing or cast at the committed target, to reset the
+        /// abandon clock. Trying does not count - only attacking.
+        /// </summary>
+        private void NoteAttacked() => _lastHitAt = DateTime.UtcNow;
+
+        private bool ShouldAbandonCommitted()
+        {
+            if (_committedAt == DateTime.MinValue) return false;
+
+            DateTime since = _lastHitAt > _committedAt ? _lastHitAt : _committedAt;
+
+            return DateTime.UtcNow - since > GiveUpFor;
+        }
+
+        /// <summary>
+        /// Drop the current target and take the next one, on request.
+        ///
+        /// Parked only briefly: this is "not that one, the other one", not "this thing is
+        /// dangerous". The short sentence is long enough for SelectTarget to choose something else
+        /// and short enough that the bot comes back to it if it is genuinely the only thing there.
+        /// </summary>
+        public bool ForceNextTarget()
+        {
+            bool did = false;
+
+            // Whatever it is chasing, not just monsters.
+            //
+            // The first version parked only the committed monster, which did nothing visible when
+            // the bot was stuck on GROUND LOOT - the operator pressed the button, the log said the
+            // target was parked, and the bot carried on walking at the same unreachable potion.
+            // "Next target" means "stop doing that", so both are skipped.
+            if (_lootTarget != 0)
+            {
+                Park(_lootTarget, TimeSpan.FromSeconds(30));
+                _lootTarget = 0;
+                did = true;
+            }
+
+            if (_committedTarget != 0)
+            {
+                Blacklist(_committedTarget, TimeSpan.FromSeconds(20));
+                did = true;
+            }
+
+            return did;
+        }
+
+        /// <summary>Set by BotInstance so the brain can explain a retarget in the log.</summary>
+        public Action<string> BrainLog;
+
+        /// <summary>Set by BotInstance: true while a drop is out and unanswered.</summary>
+        public Func<bool> IsDropPending;
+
+        private bool DropPending => IsDropPending != null && IsDropPending();
+
+        /// <summary>
+        /// Slots the server has refused to let go of, and when to stop sulking about it.
+        ///
+        /// Keyed by slot rather than by item, because the refusal is usually about WHERE the bot
+        /// is standing - no free cell to drop onto - rather than about the item itself. Five
+        /// minutes is long enough to have walked somewhere else.
+        /// </summary>
+        private readonly Dictionary<int, DateTime> _dropRefused = new Dictionary<int, DateTime>();
+
+        public void NoteDropRefused(int slot) =>
+            _dropRefused[slot] = DateTime.UtcNow + TimeSpan.FromMinutes(5);
+
+        private bool DropRefusedRecently(int slot) =>
+            _dropRefused.TryGetValue(slot, out DateTime until) && DateTime.UtcNow < until;
 
         /// <summary>
         /// The nearest monster we are willing to START a fight with, skipping anything the danger
@@ -1770,6 +2682,24 @@ namespace MirBot
             {
                 WorldObject candidate = world.NearestLiveMonster(_config.AggroRange, skip);
                 if (candidate == null) return null;
+
+                // ADJACENT BEATS DANGEROUS. Always.
+                //
+                // Refusing to START a fight with something that would take us apart is right, and
+                // the comment above this method says so: "we simply do not initiate. If it comes
+                // to us anyway, the ordinary heal/flee rules take over." That last sentence was
+                // never true. Nothing below made an exception for a monster already standing on
+                // us, so a bot that got surrounded by things it had judged dangerous refused every
+                // single one of them and stood there being hit.
+                //
+                // Observed: an assassin at 19% health, out of healing potions, boxed in, with 245
+                // danger refusals across 79 decisions and ZERO attacks - walking at a Scarecrow
+                // two tiles away and a Snake Gall it could not reach while four monsters killed it.
+                //
+                // At range 1 the choice is not "fight this or avoid it". The damage is arriving
+                // either way, fleeing through a wall of monsters is not available, and killing the
+                // thing is the only action that makes it stop.
+                if (world.DistanceTo(candidate.Location) <= 1) return candidate;
 
                 if (!TooDangerous(world, candidate)) return candidate;
 
@@ -1807,6 +2737,18 @@ namespace MirBot
         private readonly Dictionary<uint, int> _lootAttempts = new Dictionary<uint, int>();
 
         /// <summary>
+        /// How many times we have failed to REACH a given drop, for the escalating backoff in
+        /// TryLoot. Distinct from _lootAttempts, which counts refusals while standing on it.
+        /// </summary>
+        private readonly Dictionary<uint, int> _lootBlocked = new Dictionary<uint, int>();
+
+        /// <summary>Blocked this many times and the short sentence becomes the long one.</summary>
+        private const int LootBlockedLimit = 4;
+
+        /// <summary>The drop we are currently walking to, so a manual skip can park it.</summary>
+        private uint _lootTarget;
+
+        /// <summary>
         /// An object left our view, so everything remembered about that id must go with it.
         ///
         /// This closes a real leak as well as a correctness hole. _lootAttempts was only ever
@@ -1817,12 +2759,106 @@ namespace MirBot
         /// </summary>
         public void ForgetObject(uint objectID)
         {
+            _butcherAttempts.Remove(objectID);
+            _butchered.Remove(objectID);
             _lootAttempts.Remove(objectID);
+            _lootBlocked.Remove(objectID);
+            if (_lootTarget == objectID) _lootTarget = 0;
             _unreachable.Remove(objectID);
 
             if (_committedTarget == objectID) _committedTarget = 0;
             if (_pursuitID == objectID) ForgetPursuit();
             if (_fightID == objectID) ForgetFight();
+        }
+
+        /// <summary>Cuts made per corpse, so a corpse that will not yield is abandoned.</summary>
+        private readonly Dictionary<uint, int> _butcherAttempts = new Dictionary<uint, int>();
+
+        /// <summary>Corpses the server has told us are finished with.</summary>
+        private readonly HashSet<uint> _butchered = new HashSet<uint>();
+
+        /// <summary>S.ObjectHarvested - this corpse has given up everything it is going to.</summary>
+        public void NoteHarvested(uint objectID)
+        {
+            _butchered.Add(objectID);
+            _butcherAttempts.Remove(objectID);
+        }
+
+        /// <summary>
+        /// Butcher a nearby carcass.
+        ///
+        /// Sits below fighting and looting and above wandering: it is worth a short detour and
+        /// never worth taking a hit for. A chicken or a deer drops nothing at all when killed -
+        /// the meat is only reachable this way - so for a bot working low-level ground this is
+        /// the difference between earning gold and earning none.
+        /// </summary>
+        private Decision TryButcher(WorldModel world)
+        {
+            if (!_config.ButcherEnabled || _butcher == null) return null;
+
+            // No room for what it yields, so there is no point making it.
+            if (world.MaxBagWeight > 0 && world.WeightPercent >= _config.HeavyWeightPercent)
+                return null;
+
+            // Anything alive nearby wins. Standing still over a corpse is how a bot gets killed,
+            // and the Mir 2 agents break off harvesting for exactly this at the same range.
+            if (world.NearestLiveMonster(2) != null) return null;
+
+            WorldObject corpse = null;
+            int best = int.MaxValue;
+
+            foreach (WorldObject ob in world.Objects)
+            {
+                if (ob.Kind != ObjectKind.Monster || !ob.Dead) continue;
+                if (_butchered.Contains(ob.ObjectID)) continue;
+                if (!_butcher.IsButcherable(ob.MonsterIndex)) continue;
+
+                _butcherAttempts.TryGetValue(ob.ObjectID, out int tries);
+                if (tries >= _config.ButcherAttempts) continue;
+
+                int distance = world.DistanceTo(ob.Location);
+                if (distance > _config.ButcherRange || distance >= best) continue;
+
+                corpse = ob;
+                best = distance;
+            }
+
+            if (corpse == null) return null;
+
+            if (best <= 1)
+            {
+                _butcherAttempts.TryGetValue(corpse.ObjectID, out int tries);
+                _butcherAttempts[corpse.ObjectID] = tries + 1;
+
+                return new Decision
+                {
+                    Action = BotAction.Butcher,
+                    Reason = $"butchering {corpse.Name}",
+                    Subject = $"butcher {corpse.Name}",
+                    TargetID = corpse.ObjectID,
+                    Direction = WorldModel.DirectionTo(world.Location, corpse.Location)
+                };
+            }
+
+            Decision walk = new Decision
+            {
+                Action = BotAction.Approach,
+                Reason = $"butcher {corpse.Name} at {best}",
+                Subject = $"butcher {corpse.Name}",
+                TargetID = corpse.ObjectID
+            };
+
+            // goalRange 1: harvesting is done from an adjacent tile, facing the corpse.
+            if (!TrySteer(walk, world, corpse.Location, 1, best))
+            {
+                // Cannot reach it this tick. Spend an attempt rather than orbiting it for ever -
+                // the loot path learned this lesson the expensive way.
+                _butcherAttempts.TryGetValue(corpse.ObjectID, out int tries);
+                _butcherAttempts[corpse.ObjectID] = tries + 1;
+                return null;
+            }
+
+            return walk;
         }
 
         private const int LootAttemptLimit = 4;
@@ -1876,13 +2912,36 @@ namespace MirBot
                 !TrySteer(walk, world, item.Location, 0, distance))
             {
                 // Could not get there THIS TICK. Usually something is standing in the way, and
-                // standing is a temporary condition - so a short sentence, or the bot walks away
-                // from loot it could have had a moment later.
-                Park(item.ObjectID, BlockedForNow);
+                // standing is a temporary condition - so the first sentence is short, or the bot
+                // walks away from loot it could have had a moment later.
+                //
+                // But a FIXED short sentence is a loop when the obstruction is not temporary.
+                // A potion under a monster, or a bot boxed in by a crowd, produced exactly that:
+                // park three seconds, retry, park three seconds, retry, for as long as the crowd
+                // lasted. One assassin spent its time alternating between drinking a potion and
+                // walking at a potion one tile away it could never reach, taking damage the whole
+                // time and never once attacking - 84 server resyncs in 81 seconds.
+                //
+                // So the sentence doubles each time the same object is blocked, and after enough
+                // goes it becomes the long one. Something genuinely temporary still gets its
+                // quick retry; something that is not stops being asked about.
+                _lootBlocked.TryGetValue(item.ObjectID, out int blocked);
+                _lootBlocked[item.ObjectID] = blocked + 1;
+
+                TimeSpan sentence = blocked >= LootBlockedLimit
+                    ? RefusedByServer
+                    : TimeSpan.FromTicks(BlockedForNow.Ticks * (1L << blocked));
+
+                Park(item.ObjectID, sentence);
                 _blockedMoves = 0;
                 ForgetPursuit();
                 return null;
             }
+
+            // Reaching it clears the record: the next time it is blocked starts from a short
+            // sentence again.
+            _lootBlocked.Remove(item.ObjectID);
+            _lootTarget = item.ObjectID;
 
             return walk;
         }
@@ -1891,6 +2950,15 @@ namespace MirBot
         public void Issued(Decision decision, WorldModel world)
         {
             LastAction = decision.Action;
+
+            // One place, rather than at each of the five sites that can attack. An attack ON THE
+            // COMMITTED TARGET resets the abandon clock; approaching it, kiting around it and
+            // failing to reach it all deliberately do not, because those are exactly the states
+            // the watchdog exists to time out.
+            if ((decision.Action == BotAction.Attack || decision.Action == BotAction.Cast) &&
+                decision.TargetID != 0 && decision.TargetID == _committedTarget)
+                NoteAttacked();
+
             _lastLocation = world.Location;
             _lastWasMove = decision.Action == BotAction.Approach ||
                            decision.Action == BotAction.Flee ||
@@ -1911,9 +2979,11 @@ namespace MirBot
                     break;
                 case BotAction.Deposit:
                 case BotAction.Withdraw:
+                case BotAction.MergeParts:
                     _nextAction = DateTime.Now + TurnTime + Margin;
                     break;
                 case BotAction.LearnBook:
+                case BotAction.AssemblePart:
                     _nextAction = DateTime.Now + ItemUseDelay + Margin;
                     break;
                 case BotAction.Unlock:
@@ -1951,12 +3021,30 @@ namespace MirBot
                 case BotAction.NPCClose:
                     _nextAction = DateTime.Now + TurnTime + Margin;
                     break;
+                case BotAction.Butcher:
+                    // Globals.HarvestTime is 600ms on the server; asking faster is throwing
+                    // packets away and counts against the flood threshold.
+                    _nextAction = DateTime.Now + TimeSpan.FromMilliseconds(600) + Margin;
+                    break;
                 case BotAction.Equip:
                 case BotAction.Loot:
                     _nextAction = DateTime.Now + TurnTime + Margin;
                     break;
                 case BotAction.Heal:
-                    _nextAction = DateTime.Now + ItemUseDelay + Margin;
+                    // DRINKING DOES NOT COST THE SWING.
+                    //
+                    // The server keeps two clocks: AttackTime for swings, and ItemTime with its
+                    // own one-second gate for potions (PlayerObject.cs:561). A player drinks and
+                    // keeps hitting. The bot funnelled both through _nextAction, so every potion
+                    // bought a full second of silence - roughly half its damage output whenever it
+                    // was taking damage, which is exactly when it can least afford to lose it. An
+                    // assassin pinned at the mine entrance alternated Heal, Attack, Heal, Attack
+                    // once a second and killed nothing.
+                    //
+                    // _nextPotion already models the item cooldown correctly and is checked by
+                    // both drink branches, so the item side loses nothing. _nextAction drops to
+                    // packet spacing, which is all it was ever needed for here.
+                    _nextAction = DateTime.Now + Margin;
                     _nextPotion = DateTime.Now + ItemUseDelay + Margin;
                     break;
                 case BotAction.Attack:

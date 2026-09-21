@@ -91,6 +91,7 @@ SpellManaFloorPercent=0
 # to spend it on. This is what makes casting more than one burst per login: mana
 # potions were already bought, carried and reserved, and nothing ever drank one.
 DrinkManaAtPercent=40
+HealPetAtPercent=60
 
 # --- Teleport NPCs ----------------------------------------------------------------
 # Use NPCs that move the character to another map, as extra edges in the travel graph.
@@ -132,6 +133,40 @@ BlockedCellEvidence=3
 # auto-revive on, that is a death loop that lasts all night.
 RestockAtPotionPercent=25
 
+# Share of the bag budgeted for healing potions, and for mana potions.
+#
+# The budget is a WEIGHT, not a count, because the tiers do not weigh the same: a
+# Healing Potion is 1 apiece and a Healing Potion (IV) is 3. What it buys is HEALING,
+# and healing per unit of weight roughly doubles up the tiers - 30/1 against 170/3 -
+# so the number that matters is which tier gets bought, not how much bag is set aside.
+# This was 50 while BestPotion was quietly buying the cheap tiers whenever gold was
+# tight; a level 18 assassin reserved 69 of a 138-weight bag, held sixty-nine tier-one
+# potions, had nothing surplus to sell, and went back to town five times in nineteen
+# minutes. 30% of that bag is thirteen tier-four potions - about seven full health bars.
+HealthPotionWeightPercent=30
+ManaPotionWeightPercent=10
+
+# How many potions of a tier we must be able to afford before settling for a weaker one.
+#
+# Gold decides how many potions to buy, never which. Without this floor the purchase
+# asked "can I afford the FULL target of these?" of each tier in turn, so a bot that was
+# briefly short of gold fell through every good tier and bought the cheapest thing on the
+# shelf - thirty healing against a 124-point gap, four drinks to top up, half the bag
+# gone to carry them. Keep it small: a half-filled target is topped up on the next visit
+# at no extra cost, whereas a bag full of the wrong tier persists until something sells it.
+MinUsefulPotionBuy=4
+
+# Most of the purse one potion restock may spend, as a percentage, once above PoorGold.
+#
+# The potion purchase deliberately ignores GoldReserve - that reserve is there to stop
+# optional GEAR shopping eating the survival budget, and applying it to potions blocks
+# the one purchase it is held for. But "do not block it" became "spend everything" the
+# moment potion ranking started preferring the best healing per unit of weight, because
+# the best tier stopped being the cheap one: an assassin with 40,687 gold bought 29 Life
+# Pill (III) at ~1,400 each and left the shop with thirty-nine gold. Below PoorGold the
+# cap does not apply - a bot that is already broke needs a drink more than a balance.
+PotionMaxGoldPercent=50
+
 # Reagents (Taoist amulets and poisons) are bought toward a stock target, but no single
 # trip may spend more than this share of gold on them. The target is the destination;
 # this is the pace. One level 14 Taoist put 10,000 of its 11,165 gold into a single
@@ -150,6 +185,12 @@ TorchGoldFloor=500
 # outranked everything for five hours and pulled a warrior out of the only other map
 # it ever tried.
 HuntingChoices=3
+
+# How quickly old hunting evidence yields to a fresh sample. The accumulated experience and
+# accumulated hours are both halved over this many idle hours, so an old average does not drift
+# toward zero by itself; instead, the next real sample can replace a lucky historical result.
+# Set to 0 to keep a lifetime average.
+HuntingHalfLifeHours=4
 
 # Keep exploring until this many maps have a usable measurement at the current class
 # and level band, then start exploiting. The Mir 2 agents instead roll a flat 1-in-20,
@@ -179,12 +220,41 @@ MinimumSampleMinutes=4
 # home with an empty purse cannot buy potions, cannot buy a way back, and dies there.
 TravelGoldPerHop=3000
 
-# Below this much gold, hunt only on the maps named in TownMaps. Poverty is the one state
-# where wandering is actively harmful: the bot cannot buy its way out of any problem it
-# meets. The restriction is logged when it applies, so it can never become a silent
-# "too poor to leave, too poor at home to ever leave" trap.
+# The same float for a leg that is WALKED rather than bought from a teleport NPC.
+#
+# The paid rate covers a fare out, a fare home, and being a long way from a vendor. None
+# of that applies to a map you can walk onto: the way back is the same walk and it costs
+# nothing. Charging the paid rate for a free step is how the poverty trap actually held -
+# a bot with 907 gold was refused one free map because it could not afford 3,000, so it
+# stayed on its two worst measured maps and stayed poor. Not zero, because each map
+# crossed is another map to fight back across.
+TravelGoldPerFreeHop=250
+
+# Below this much gold, take no PAID teleport - hunt on the maps named in TownMaps and
+# anywhere reachable on foot from where we are standing.
+#
+# This used to be TownMaps only, on the reasoning that poverty is the one state where
+# wandering is actively harmful. The restriction was logged so it could never become a
+# silent "too poor to leave, too poor at home to ever leave" trap. It was logged, and it
+# became one anyway: a level 18 assassin spent over an hour between Bichon Town and Banya
+# Village, its two worst measured maps, with Ant Cave and Deserted Mine two free steps
+# away. Being broke is a reason not to spend, not a reason not to move - and the fare is
+# already priced twice over, by the route search and by the affordability check.
 #
 # Deliberately well above "can afford one potion". The bar is being able to absorb the
 # ordinary costs of being away from home - a repair bill, a full restock and a way back -
 # not merely surviving the next ten minutes. A single broken ring cost 611 gold.
 PoorGold=10000
+
+# Poverty recovery is latched: entering below RecoveryGold does not end again at 5,001.
+# It ends only after a completed town trip leaves RecoveryExitGold and usable supplies.
+# While on RecoveryMaps the bot melees trivial mobs and preserves spells, attack skills,
+# summons, poison reagents and mana potions. Levelled characters with the configured share
+# of their health/mana potion targets plus their town-scroll reserve move to
+# RecoveryCaveMaps for better money.
+RecoveryGold=5000
+RecoveryExitGold=25000
+RecoveryMaps=Bichon Town,Banya Village
+RecoveryCaveMaps=Flea Cave Lv 1
+RecoveryCaveMinimumLevel=20
+RecoveryCaveSupplyPercent=60

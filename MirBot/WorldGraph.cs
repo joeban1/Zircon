@@ -297,9 +297,13 @@ namespace MirBot
         /// anything needing an item or an instance - are excluded here rather than discovered by
         /// walking into them.
         /// </summary>
+        /// <param name="avoid">
+        /// Maps not to route THROUGH. The destination itself is always allowed - if the caller has
+        /// asked to go somewhere, refusing to plan a route there is not our decision to make.
+        /// </param>
         public List<MapExit> Route(int fromMapIndex, int toMapIndex, MirClass mirClass, int level,
             long gold = long.MaxValue, long goldFloor = 0, int pkPoints = 0,
-            int maxGoldPercent = 0)
+            int maxGoldPercent = 0, HashSet<int> avoid = null)
         {
             if (fromMapIndex == toMapIndex) return new List<MapExit>();
 
@@ -317,6 +321,9 @@ namespace MirBot
                 {
                     if (seen.Contains(exit.ToMapIndex)) continue;
                     if (!exit.Allows(mirClass, level, gold, goldFloor, pkPoints, maxGoldPercent)) continue;
+
+                    if (avoid != null && exit.ToMapIndex != toMapIndex &&
+                        avoid.Contains(exit.ToMapIndex)) continue;
 
                     seen.Add(exit.ToMapIndex);
                     cameBy[exit.ToMapIndex] = exit;
@@ -356,9 +363,13 @@ namespace MirBot
         /// wrong, and arriving somewhere distant with an empty purse is how a bot dies far from a
         /// vendor. Routing each candidate separately would be a BFS per map; this is one.
         /// </summary>
+        /// <param name="freeOnly">
+        /// Walk-through exits only - no paid teleports. "Can I get there without spending anything"
+        /// is a different question from "can I get there", and a broke bot needs the first one.
+        /// </param>
         public Dictionary<int, int> HopCounts(int fromMapIndex, MirClass mirClass, int level,
             long gold = long.MaxValue, long goldFloor = 0, int pkPoints = 0,
-            int maxGoldPercent = 0)
+            int maxGoldPercent = 0, bool freeOnly = false, HashSet<int> avoid = null)
         {
             Dictionary<int, int> hops = new Dictionary<int, int> { [fromMapIndex] = 0 };
             Queue<int> queue = new Queue<int>();
@@ -373,6 +384,8 @@ namespace MirBot
                 foreach (MapExit exit in ExitsFrom(map))
                 {
                     if (hops.ContainsKey(exit.ToMapIndex)) continue;
+                    if (freeOnly && exit.Cost > 0) continue;
+                    if (avoid != null && avoid.Contains(exit.ToMapIndex)) continue;
                     if (!exit.Allows(mirClass, level, gold, goldFloor, pkPoints, maxGoldPercent)) continue;
 
                     hops[exit.ToMapIndex] = next;

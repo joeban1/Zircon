@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Read-only. Opens a Zircon System.db and prints its monster spawns.
+ 
+    Its own project for the same reason IconExport is: the bot must not grow a code path that
+    opens arbitrary databases, and this is a question you ask occasionally and never in a loop.
+    It writes nothing, anywhere.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>SpawnDump</AssemblyName>
+    <RootNamespace>SpawnDump</RootNamespace>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LibraryCore\LibraryCore.csproj" />
+  </ItemGroup>
+
+</Project>

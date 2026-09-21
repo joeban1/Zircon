@@ -153,6 +153,31 @@ namespace MirBot
         /// tell us. So it rules out only the clearly wrong: a map whose ordinary inhabitants are far
         /// above us, or one built around a boss.
         /// </summary>
+        /// <summary>
+        /// Have we outgrown this map? Median monster level is the same signal WorthExploring
+        /// trusts for the upper bound, used here for the lower one.
+        ///
+        /// Separate from WorthExploring because the two are asked at different moments: this one
+        /// also has to guard the EXPLOIT path, where a map already in the memory is re-chosen from
+        /// a stored rate. That path applied no level test of any kind, which is how a character
+        /// carried a starter town forward through every band it passed through.
+        /// </summary>
+        public bool OutgrownBy(int mapIndex, int level, int levelsBelow, out string why)
+        {
+            why = "";
+
+            if (levelsBelow <= 0) return false;
+
+            MapProfileEntry entry = For(mapIndex);
+
+            if (entry == null || entry.MedianLevel <= 0) return false;
+
+            if (entry.MedianLevel + levelsBelow >= level) return false;
+
+            why = $"typical monster is level {entry.MedianLevel}, we are {level}";
+            return true;
+        }
+
         public bool WorthExploring(int mapIndex, int level, int levelsAbove, out string why)
         {
             why = "";

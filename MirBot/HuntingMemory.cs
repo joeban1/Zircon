@@ -138,6 +138,11 @@ namespace MirBot
             }
         }
 
+        /// <summary>
+        /// How long a measurement takes to lose half its weight. See BotConfig.HuntingHalfLifeHours.
+        /// </summary>
+        public double HalfLifeHours { get; set; }
+
         public void Record(int mapIndex, string mapName, string mirClass, int level,
             double experiencePerHour, double hours)
         {
@@ -146,6 +151,30 @@ namespace MirBot
             lock (Sync)
             {
                 HuntingEntry entry = Find(mapIndex, mapName, mirClass, level);
+
+                // AGE THE EVIDENCE BEFORE ADDING TO IT.
+                //
+                // Both accumulators are scaled by the same factor, so the stored average does not
+                // move at all here - what changes is that the sample about to be added carries
+                // proportionally more weight than the stale hours it is joining. A map whose
+                // reputation rests on one lucky window an hour ago can now be talked out of it by
+                // one honest window today, which a lifetime mean could never allow.
+                //
+                // Deaths are deliberately NOT decayed. They are a raw count of things that have
+                // actually happened to us, they were never part of the rate, and a map that has
+                // killed a character thirty times has not become safer by being left alone.
+                if (HalfLifeHours > 0 && entry.UpdatedUtc != default && entry.HoursSampled > 0)
+                {
+                    double idle = (DateTime.UtcNow - entry.UpdatedUtc).TotalHours;
+
+                    if (idle > 0)
+                    {
+                        double keep = Math.Pow(0.5, idle / HalfLifeHours);
+
+                        entry.TotalExperience *= keep;
+                        entry.HoursSampled *= keep;
+                    }
+                }
 
                 entry.Samples++;
                 entry.HoursSampled += hours;
@@ -233,29 +262,79 @@ namespace MirBot
             return rows;
         }
 
+        /// <summary>How many bands below the current one still count. 2 = this band and the one under it.</summary>
+        private const int CarryForwardBands = 2;
+
+        /// <summary>
+        /// How hard a band of staleness counts against a map, in the same shape as the death
+        /// penalty: the rate is divided by (1 + bandsBelow * this). At 0.35 a measurement from the
+        /// band below is worth about three quarters of one taken here, which is enough for a
+        /// current-band reading to win whenever there is one and not so much that old knowledge is
+        /// thrown away.
+        /// </summary>
+        private const double StalePenaltyPerBand = 0.35;
+
+        /// <summary>
+        /// Does a record from this band still tell us anything at that band?
+        ///
+        /// Our own band and the ones beneath it only. A rate measured ABOVE us is about a stronger
+        /// character than this one and would send a bot somewhere it cannot yet survive.
+        /// </summary>
+        private static bool Carries(int entryBand, int band) =>
+            entryBand <= band && band - entryBand < CarryForwardBands;
+
+        private static double Ranked(HuntingEntry entry, int band, double deathPenalty) =>
+            entry.Score(deathPenalty) /
+            (1 + StalePenaltyPerBand * Math.Max(0, band - entry.LevelBand));
+
         /// <summary>
         /// Best known maps for this class and level, best first, ranked on mean rate discounted by
-        /// deaths. Empty until something is measured.
+        /// deaths and by how long ago the band was.
+        ///
+        /// CROSSING A BAND IS NOT AMNESIA. This used to match the band exactly, and Lethal() - the
+        /// one place that had already met the problem - did not. The consequence is that every
+        /// LevelBandSize levels a bot forgets everything it has ever measured and starts again from
+        /// nothing: MeasuredCount drops to zero, ExploreUntilMapsKnown forces exploration, and the
+        /// bot wanders off to whatever unmeasured map is nearest.
+        ///
+        /// A level 26 warrior did exactly this. It had 414,675 exp/hour recorded for Deserted Mine
+        /// and 387,508 for Ant Cave North, levelled from 25 to 26, crossed from band 4 into band 5,
+        /// logged "exploring - only 0 of 4 maps measured", and went to Banya Village - a map its own
+        /// memory rated at 127,796 - by way of a 5,000 gold teleport. It was not choosing badly; it
+        /// could no longer see what it knew.
+        ///
+        /// The band exists because a rate measured at level 10 says little about level 25, and that
+        /// is still true. But "less relevant" is not "unknown", and the honest expression of it is a
+        /// discount, not a filter. One entry per map: where both this band and the one below have a
+        /// reading, the fresher one wins outright rather than competing with itself for a slot in
+        /// the take.
         /// </summary>
         public List<HuntingEntry> Best(string mirClass, int level, int take,
             double deathPenalty = DefaultDeathPenalty)
         {
-            List<HuntingEntry> found = new List<HuntingEntry>();
+            Dictionary<int, HuntingEntry> byMap = new Dictionary<int, HuntingEntry>();
+            int band;
 
             lock (Sync)
             {
-                int band = BandOf(level);
+                band = BandOf(level);
 
                 foreach (HuntingEntry entry in Entries)
                 {
-                    if (entry.Class != mirClass || entry.LevelBand != band) continue;
+                    if (entry.Class != mirClass) continue;
+                    if (!Carries(entry.LevelBand, band)) continue;
                     if (entry.AverageExperiencePerHour <= 0) continue;
 
-                    found.Add(entry);
+                    if (!byMap.TryGetValue(entry.MapIndex, out HuntingEntry held) ||
+                        entry.LevelBand > held.LevelBand)
+                        byMap[entry.MapIndex] = entry;
                 }
             }
 
-            found.Sort((a, b) => b.Score(deathPenalty).CompareTo(a.Score(deathPenalty)));
+            List<HuntingEntry> found = new List<HuntingEntry>(byMap.Values);
+
+            found.Sort((a, b) => Ranked(b, band, deathPenalty)
+                                     .CompareTo(Ranked(a, band, deathPenalty)));
 
             if (found.Count > take) found.RemoveRange(take, found.Count - take);
 
@@ -288,6 +367,20 @@ namespace MirBot
         {
             HashSet<int> lethal = new HashSet<int>();
 
+            // Deaths SUMMED PER MAP across the window, not tested per record.
+            //
+            // Records are keyed by band, so the old per-entry test meant a band boundary reset the
+            // death count as surely as it used to reset the rate. A map that killed us twice at
+            // level 20 and twice at level 21 holds two entries of two, neither reaching three, and
+            // is never called lethal - after four deaths. The threshold is about how often a place
+            // has killed THIS character, and levelling up in between does not make it safer.
+            //
+            // Measured separately and checked after, because "we have earned here" has to win over
+            // "we have died here" wherever both are true, whichever band each came from: a map with
+            // any real rate belongs to Score() and its death discount, not to this list.
+            Dictionary<int, int> deaths = new Dictionary<int, int>();
+            HashSet<int> everPaid = new HashSet<int>();
+
             lock (Sync)
             {
                 int band = BandOf(level);
@@ -295,17 +388,25 @@ namespace MirBot
                 foreach (HuntingEntry entry in Entries)
                 {
                     if (entry.Class != mirClass) continue;
-                    if (entry.AverageExperiencePerHour > 0) continue;
-                    if (entry.Deaths < minDeaths) continue;
 
                     // Only our own band and the ones beneath it, and not from so far below that
                     // the character it happened to is no longer recognisably this one.
                     if (entry.LevelBand > band) continue;
                     if (band - entry.LevelBand >= forgetAfterBands) continue;
 
-                    lethal.Add(entry.MapIndex);
+                    if (entry.AverageExperiencePerHour > 0)
+                    {
+                        everPaid.Add(entry.MapIndex);
+                        continue;
+                    }
+
+                    deaths.TryGetValue(entry.MapIndex, out int sofar);
+                    deaths[entry.MapIndex] = sofar + Math.Max(0, entry.Deaths);
                 }
             }
+
+            foreach (KeyValuePair<int, int> pair in deaths)
+                if (pair.Value >= minDeaths && !everPaid.Contains(pair.Key)) lethal.Add(pair.Key);
 
             return lethal;
         }
@@ -320,7 +421,10 @@ namespace MirBot
         /// <summary>How many distinct maps we have a usable measurement for, at this class and band.</summary>
         public int MeasuredCount(string mirClass, int level)
         {
-            int count = 0;
+            // Counted over the same window Best() ranks over, and counted per MAP rather than per
+            // record, or the two disagree about what the bot knows. They disagreeing is what
+            // decides whether it explores, so this is not a cosmetic tidy-up.
+            HashSet<int> maps = new HashSet<int>();
 
             lock (Sync)
             {
@@ -328,14 +432,15 @@ namespace MirBot
 
                 foreach (HuntingEntry entry in Entries)
                 {
-                    if (entry.Class != mirClass || entry.LevelBand != band) continue;
+                    if (entry.Class != mirClass) continue;
+                    if (!Carries(entry.LevelBand, band)) continue;
                     if (entry.AverageExperiencePerHour <= 0) continue;
 
-                    count++;
+                    maps.Add(entry.MapIndex);
                 }
             }
 
-            return count;
+            return maps.Count;
         }
 
         public string Describe()

@@ -35,6 +35,18 @@ namespace MirBot
         /// <summary>True when this page stocks a healing potion.</summary>
         public bool SellsHealthPotion;
 
+        /// <summary>
+        /// True when this page stocks a MANA potion.
+        ///
+        /// The directory recorded only health potions, so "the potion seller" meant "the health
+        /// potion seller" everywhere - and the two are not the same NPC. A level 22 wizard sat on
+        /// four mana potions against a budget of thirty-six for forty minutes, correctly flagged
+        /// short on every tick, walking a full vendor lap and reporting "no mana potion on this
+        /// page" at every stop, because nothing in the routing could express the idea of wanting
+        /// one. Same shape as the reagent bug: bought-if-present is not the same as routed-to.
+        /// </summary>
+        public bool SellsManaPotion;
+
         /// <summary>Item types this page will REPAIR (DialogType.Repair pages only).</summary>
         public HashSet<ItemType> Repairs = new HashSet<ItemType>();
 
@@ -80,6 +92,7 @@ namespace MirBot
             DescribeStock() +
             $"{(SellsTownScroll ? ", sells scrolls" : "")}" +
             $"{(SellsHealthPotion ? ", sells potions" : "")}" +
+            $"{(SellsManaPotion ? ", sells mana" : "")}" +
             $"{(Repairs.Count == 0 ? "" : ", repairs " + string.Join("/", Repairs))}" +
             $"{(SellsBooksFor.Count == 0 ? "" : $", sells {SellsBooksFor.Count} books")}]";
     }
@@ -251,6 +264,16 @@ namespace MirBot
                          g.Item.Stats[Stat.Health] > 0 &&
                          g.GoodsIndex == npc.GoodsIndex);
 
+                // Health <= 0 as well as Mana > 0, so a dual potion counts as healing only and is
+                // not double-booked. Matches Backpack.IsManaPotion, which is what the buy step
+                // uses - if these two disagreed we would route to a shop and then refuse to buy.
+                bool sellsMana = page.Goods != null && page.Goods.Any(
+                    g => g.Item != null &&
+                         g.Item.ItemType == ItemType.Consumable &&
+                         g.Item.Stats[Stat.Health] <= 0 &&
+                         g.Item.Stats[Stat.Mana] > 0 &&
+                         g.GoodsIndex == npc.GoodsIndex);
+
                 List<int> bookMagics = new List<int>();
 
                 if (books != null && page.Goods != null)
@@ -265,7 +288,7 @@ namespace MirBot
                 bool repairs = page.DialogType == NPCDialogType.Repair &&
                                page.Types != null && page.Types.Count > 0;
 
-                if (buys || sellsScroll || sellsPotion || repairs || bookMagics.Count > 0)
+                if (buys || sellsScroll || sellsPotion || sellsMana || repairs || bookMagics.Count > 0)
                 {
                     VendorEntry entry = new VendorEntry
                     {
@@ -273,7 +296,8 @@ namespace MirBot
                         Page = page,
                         ButtonPath = new List<int>(path),
                         SellsTownScroll = sellsScroll,
-                        SellsHealthPotion = sellsPotion
+                        SellsHealthPotion = sellsPotion,
+                        SellsManaPotion = sellsMana
                     };
 
                     foreach (int index in bookMagics) entry.SellsBooksFor.Add(index);
@@ -362,11 +386,11 @@ namespace MirBot
 
         public List<VendorEntry> BestRestockersFor(bool needScrolls, bool needPotions,
             int currentMapIndex, IEnumerable<VendorEntry> already = null, Point from = default,
-            bool sameMapOnly = false)
+            bool sameMapOnly = false, bool needMana = false)
         {
             List<VendorEntry> chosen = new List<VendorEntry>();
 
-            if (!needScrolls && !needPotions) return chosen;
+            if (!needScrolls && !needPotions && !needMana) return chosen;
 
             if (needScrolls && needPotions)
             {
@@ -403,6 +427,18 @@ namespace MirBot
                 VendorEntry potions = Nearest(x => x.SellsHealthPotion, currentMapIndex, already,
                     from, sameMapOnly);
                 if (potions != null) chosen.Add(potions);
+            }
+
+            // Mana, on its own stop when no stop already chosen happens to stock it.
+            //
+            // Placed after health for the same reason health precedes scrolls: the purse is spent
+            // in itinerary order, and not being able to heal kills faster than not being able to
+            // cast. A caster with no mana is still most of a character; one with no potions is not.
+            if (needMana && !chosen.Any(x => x.SellsManaPotion))
+            {
+                VendorEntry mana = Nearest(x => x.SellsManaPotion, currentMapIndex,
+                    Combine(already, chosen), from, sameMapOnly);
+                if (mana != null && !chosen.Contains(mana)) chosen.Add(mana);
             }
 
             if (needScrolls)

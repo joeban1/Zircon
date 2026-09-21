@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Library;
+using Library.SystemModels;
+
+namespace MirBot
+{
+    /// <summary>
+    /// Which skill books can only be got by killing things, and where those things live.
+    ///
+    /// Some of the best skills on this server are never sold. Summon Skeleton is the obvious one -
+    /// it roughly doubles what a Taoist can do - and no NPC anywhere stocks it; it drops from the
+    /// undead in the cave tiers at about one in 450 from a Ghost Mage. A bot that only ever chooses
+    /// hunting grounds by experience per hour has no reason to go anywhere that has it, so it can
+    /// stay permanently weak while standing next to the answer.
+    ///
+    /// The concrete case: a level 22 Taoist farming Ant Cave North, which drops NOT ONE skill book
+    /// for ANY class. No amount of time there could ever have advanced her skills.
+    ///
+    /// Deliberately derived from the database rather than configured. The first instinct was a rule
+    /// naming Deserted Mine, and the data says that would have been wrong: Summon Skeleton drops on
+    /// TWELVE maps - Banya Cave 1-3, Bichon Cave 1-3, Deserted Mine 1-3 and Lost Paradise Cave 1-3 -
+    /// one of which, Bichon Cave Lv 1, was already in that character's own preferred list and is far
+    /// gentler than the mine. Hardcoding the destination would have sent a weak character past the
+    /// easy source to a hard one.
+    /// </summary>
+    public sealed class BookDropIndex
+    {
+        /// <summary>MagicInfo.Index -> the book item that teaches it, for drop-only books.</summary>
+        private readonly Dictionary<int, ItemInfo> _dropOnly = new Dictionary<int, ItemInfo>();
+
+        /// <summary>Map index -> the drop-only magics obtainable there.</summary>
+        private readonly Dictionary<int, HashSet<int>> _byMap = new Dictionary<int, HashSet<int>>();
+
+        public int BookCount => _dropOnly.Count;
+        public int MapCount => _byMap.Count;
+
+        public void Build(MagicBooks books)
+        {
+            _dropOnly.Clear();
+            _byMap.Clear();
+
+            if (books == null) return;
+
+            try
+            {
+                // A book counts as SOLD only when its goods index belongs to a real NPC. The goods
+                // tables carry entries no vendor is attached to, and treating those as "on sale"
+                // would hide genuinely drop-only skills.
+                HashSet<int> npcGoods = new HashSet<int>();
+
+                foreach (NPCInfo npc in Globals.NPCInfoList?.Binding ?? Enumerable.Empty<NPCInfo>())
+                    npcGoods.Add(npc.GoodsIndex);
+
+                HashSet<int> sold = new HashSet<int>();
+
+                foreach (NPCPage page in Globals.NPCPageList?.Binding ?? Enumerable.Empty<NPCPage>())
+                {
+                    if (page?.Goods == null) continue;
+
+                    foreach (NPCGood good in page.Goods)
+                    {
+                        if (good?.Item == null || good.Item.ItemType != ItemType.Book) continue;
+                        if (!npcGoods.Contains(good.GoodsIndex)) continue;
+
+                        sold.Add(good.Item.Index);
+                    }
+                }
+
+                // Every drop-only book, keyed by the skill it teaches.
+                foreach (ItemInfo info in Globals.ItemInfoList?.Binding ?? Enumerable.Empty<ItemInfo>())
+                {
+                    if (info == null || info.ItemType != ItemType.Book) continue;
+                    if (sold.Contains(info.Index)) continue;
+
+                    MagicInfo magic = books.For(info);
+                    if (magic == null) continue;
+
+                    _dropOnly[magic.Index] = info;
+                }
+
+                // Where they fall: monster -> its drops, monster -> the maps it spawns on.
+                foreach (MonsterInfo monster in Globals.MonsterInfoList?.Binding
+                                                ?? Enumerable.Empty<MonsterInfo>())
+                {
+                    if (monster?.Drops == null || monster.Respawns == null) continue;
+
+                    List<int> magics = new List<int>();
+
+                    foreach (DropInfo drop in monster.Drops)
+                    {
+                        if (drop?.Item == null || drop.Item.ItemType != ItemType.Book) continue;
+
+                        MagicInfo magic = books.For(drop.Item);
+                        if (magic == null || !_dropOnly.ContainsKey(magic.Index)) continue;
+
+                        magics.Add(magic.Index);
+                    }
+
+                    if (magics.Count == 0) continue;
+
+                    foreach (RespawnInfo respawn in monster.Respawns)
+                    {
+                        int mapIndex = respawn?.Region?.Map?.Index ?? -1;
+                        if (mapIndex < 0) continue;
+
+                        if (!_byMap.TryGetValue(mapIndex, out HashSet<int> set))
+                            _byMap[mapIndex] = set = new HashSet<int>();
+
+                        foreach (int index in magics) set.Add(index);
+                    }
+                }
+            }
+            catch
+            {
+                // Pre-login or a database that did not load. Everything below then returns empty,
+                // and travel behaves exactly as it did before this existed.
+                _dropOnly.Clear();
+                _byMap.Clear();
+            }
+        }
+
+        /// <summary>
+        /// Drop-only skills this character could learn TODAY and does not have.
+        ///
+        /// Gated on the book's own requirement rather than the skill's cast level, because that is
+        /// what the server enforces when the book is used - the same distinction that decides
+        /// whether the town trip buys one.
+        /// </summary>
+        public HashSet<int> Wanted(MirClass mirClass, int level, Stats stats, WorldModel world)
+        {
+            HashSet<int> wanted = new HashSet<int>();
+
+            foreach (KeyValuePair<int, ItemInfo> pair in _dropOnly)
+            {
+                if (world != null && world.Knows(pair.Key)) continue;
+                if (!Backpack.CanClassUseInfo(pair.Value, mirClass)) continue;
+                if (!Backpack.MeetsRequirement(pair.Value, level, stats)) continue;
+
+                wanted.Add(pair.Key);
+            }
+
+            return wanted;
+        }
+
+        /// <summary>How many of the wanted skills this map can supply.</summary>
+        public int Supplies(int mapIndex, HashSet<int> wanted)
+        {
+            if (wanted == null || wanted.Count == 0) return 0;
+            if (!_byMap.TryGetValue(mapIndex, out HashSet<int> here)) return 0;
+
+            int count = 0;
+            foreach (int magic in here) if (wanted.Contains(magic)) count++;
+            return count;
+        }
+
+        /// <summary>The book names a map supplies, for the travel log.</summary>
+        public string Names(int mapIndex, HashSet<int> wanted)
+        {
+            if (!_byMap.TryGetValue(mapIndex, out HashSet<int> here)) return "";
+
+            List<string> names = new List<string>();
+
+            foreach (int magic in here)
+                if (wanted.Contains(magic) && _dropOnly.TryGetValue(magic, out ItemInfo info))
+                    names.Add(info.ItemName);
+
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return string.Join(", ", names.Take(4)) + (names.Count > 4 ? ", ..." : "");
+        }
+    }
+}

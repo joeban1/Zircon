@@ -156,8 +156,15 @@ namespace MirBot
   #tip hr { border:none; border-top:1px solid var(--line); margin:5px 0; }
 
   /* --- the summary strip --- */
-  .strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr));
+  /* FOUR PER ROW, wrapping to as many rows as there are bots.
+     auto-fit with a 215px minimum fitted as many cards per row as the window allowed, which
+     was fine at four bots and squeezed eight onto one line on a wide monitor - every card
+     narrower than its own text. Capping the track count at four keeps each card readable and
+     puts bots 5-8 on a second row. */
+  .strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr));
            gap:8px; margin-bottom:12px; }
+  @media (max-width:1100px){ .strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  @media (max-width:560px) { .strip { grid-template-columns:minmax(0,1fr); } }
   .mini { background:var(--card); border:1px solid var(--line); border-radius:10px;
           padding:9px 11px; cursor:pointer; }
   .mini:hover { border-color:#3a4150; }
@@ -169,8 +176,12 @@ namespace MirBot
   .mini .act { font-size:12px; margin-top:5px; white-space:nowrap; overflow:hidden;
                text-overflow:ellipsis; }
   .mini .act b { font-weight:600; }
-  .mini .sub { color:var(--dim); font-size:11px; margin-top:2px; white-space:nowrap;
-               overflow:hidden; text-overflow:ellipsis; }
+  .mini .sub { color:var(--dim); font-size:11px; margin-top:2px; display:flex; gap:6px;
+               align-items:baseline; }
+  /* The map/kill text is the part allowed to be cut short; gold never is. */
+  .mini .sub .where { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .mini .sub .gp { margin-left:auto; flex:none; color:var(--text);
+                   font-variant-numeric:tabular-nums; }
   .mini .bars { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; margin-top:6px; }
   .mini .bars span { color:var(--dim); font-size:10px; font-variant-numeric:tabular-nums; }
   .mini .bar { margin-top:2px; }
@@ -356,6 +367,7 @@ const CARD_HTML = `
       <button data-a="stop">Stop</button>
       <button data-a="towntrip">Town trip</button>
       <button data-a="forcerepair">Repair</button>
+      <button data-a="nexttarget" title="Skip the current target and pick another nearby">Next target</button>
       <button data-a="travel">Travel</button>
       <select data-r="map"></select>
       <button data-a="go">Go</button>
@@ -384,6 +396,8 @@ const CARD_HTML = `
       <div><div class="k">Bag</div><div class="v" data-r="bag"></div></div>
       <div><div class="k">Location</div><div class="v" data-r="loc"></div>
            <div class="detail" data-r="locdetail"></div></div>
+      <div><div class="k">Coverage</div><div class="v" data-r="coverage"></div>
+           <div class="detail" data-r="coverdetail"></div></div>
       <div><div class="k">Town trip</div><div class="v" data-r="trip"></div>
            <div class="detail" data-r="tripdetail"></div></div>
       <div><div class="k">Bank</div><div class="v" data-r="bank"></div></div>
@@ -406,6 +420,10 @@ const CARD_HTML = `
 
     <div class="pane"><h4 data-r="storehead">Storage</h4>
       <div class="scroll cells" data-r="storelist"></div></div>
+
+    <div class="pane"><h4 data-r="petshead">Pets</h4>
+      <div class="scroll"><table><tr><th>Pet</th><th>HP</th><th>Away</th></tr>
+        <tbody data-r="pets"></tbody></table></div></div>
 
     <div class="pane"><h4>History</h4>
       <div class="scroll"><table><tr><th>Action</th><th>Subject</th><th>When</th></tr>
@@ -430,7 +448,7 @@ const MINI_HTML = `
     <span class="lv" data-r="lv"></span>
   </div>
   <div class="act"><b data-r="action"></b><span data-r="subject"></span></div>
-  <div class="sub" data-r="sub"></div>
+  <div class="sub"><span class="where" data-r="sub"></span><span class="gp" data-r="gold"></span></div>
   <div class="bars">
     <div><span data-r="hp"></span><div class="bar hp"><i data-r="hpbar"></i></div></div>
     <div><span data-r="mp"></span><div class="bar mp"><i data-r="mpbar"></i></div></div>
@@ -476,6 +494,9 @@ function patchMini(mini, b) {
     (b.state !== "Playing" ? b.state
       : ever ? `kill ${ago(b.secondsSinceGain)} ago`
       : `no kill · ${ago(b.secondsInGame)}`));
+
+  text(el.gold, b.gold === null || b.gold === undefined
+    ? "" : String(b.gold).replace(/\B(?=(\d{3})+(?!\d))/g, ",") + "g");
 
   text(el.hp, `HP ${b.healthPercent}%`);
   el.hpbar.style.width = pct(b.health, b.maxHealth) + "%";
@@ -649,6 +670,22 @@ function patch(card, b) {
   text(el.loc, `${b.mapName || ("map " + b.mapIndex)} · ${b.x},${b.y}` +
                (b.inSafeZone ? " · safe" : ""));
   text(el.locdetail, "map " + b.mapIndex);
+  text(el.coverage, b.explorationTotalSectors
+    ? `${b.explorationVisitedSectors}/${b.explorationTotalSectors} sectors`
+    : "—");
+
+  const coverageMode = b.explorationMode || "none";
+  let coverageTarget = "";
+  if (coverageMode !== "none") {
+    if (!b.explorationTargetLastVisitedUtc) coverageTarget = " · target unseen";
+    else {
+      const seconds = Math.max(0,
+        Math.floor((Date.now() - Date.parse(b.explorationTargetLastVisitedUtc)) / 1000));
+      coverageTarget = ` · target last visited ${ago(seconds)} ago`;
+    }
+  }
+  text(el.coverdetail, coverageMode === "none" ? "no exploration target"
+                                                : coverageMode + coverageTarget);
   text(el.bag, `${b.bagWeight}/${b.maxBagWeight} (${b.bagPercent}%)`);
   text(el.trip, b.tripPhase || "—");
   text(el.tripdetail, b.tripStatus);
@@ -670,6 +707,26 @@ function patch(card, b) {
   renderSlots(card, el.equip, b.equipment);
   renderCells(card, "bag", el.baglist, b.inventory, 48);
   renderCells(card, "store", el.storelist, storage, 0);
+
+  // PETS. The heading carries the standing order, because a pet doing nothing is far more often
+  // the mode than the pet: PetMode.Move and PetMode.None make the server null its target outright
+  // (MonsterObject.ProcessAI), so "Pets - Move" explains an idle skeleton at a glance.
+  const pets = b.pets || [];
+  text(el.petshead, pets.length
+    ? `Pets (${pets.length})${b.petMode ? " - " + b.petMode : ""}`
+    : `Pets${b.petMode ? " - " + b.petMode : ""}`);
+
+  rows(card, "pets", el.pets, pets.length
+    ? pets.map(p => `<tr>
+        <td>${esc(p.name)}${p.level ? ` <span class="count">L${p.level}</span>` : ""}</td>
+        <td class="${p.maxHealth > 0 && p.healthPercent <= 33 ? "bad" : ""}">${
+          // UNKNOWN IS NOT ZERO. A monster's health only reaches us via
+          // S.DataObjectHealthMana, which the server does not always send for a pet - and
+          // rendering a missing value as "0%" reads as a pet about to die.
+          p.maxHealth > 0 ? p.healthPercent + "%" : "?"}</td>
+        <td>${p.distance}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="3" style="color:var(--dim)">none summoned</td></tr>`);
 
   rows(card, "hist", el.hist, b.history.slice().reverse().map(e => `<tr>
       <td>${esc(e.action)} ${e.count > 1 ? `<span class="count">x${e.count}</span>` : ""}</td>

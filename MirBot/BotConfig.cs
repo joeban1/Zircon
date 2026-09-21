@@ -49,11 +49,75 @@ namespace MirBot
         // tier. A 216 HP wizard at the 60% mark is missing 86, and a tier IV potion heals 170: more
         // than half of it hits the cap and is lost.
         public int PanicHealPercent = 30;
+
+        /// <summary>
+        /// A consumable restoring less than this is loot, not a potion. See Backpack.MinPotionRestore.
+        /// </summary>
+        public int MinPotionRestore = 20;
+
+        /// <summary>
+        /// Wholesale sell refusals within ResyncWindowMinutes before forcing a relog. 0 disables.
+        ///
+        /// A refused sell order is the clearest evidence available that our inventory model and
+        /// the server's have diverged: NPCSell voids the whole order when any one link does not
+        /// match what the server holds in that slot. Once the two slot maps disagree there is no
+        /// way back from incremental packets - the protocol has no "send me my inventory" request
+        /// - so the only repair is a fresh login, where StartInformation.Items arrives complete.
+        ///
+        /// Today's session survived only because every deploy happened to relog the bots. That is
+        /// luck, not design, and a bot left running for a day had no way to recover at all.
+        /// </summary>
+        public int ResyncAfterSellRefusals = 3;
+
+        public int ResyncWindowMinutes = 10;
         public int FleeAtPercent = 25;   // disengage at or below this HP%
         public int AggroRange = 8;       // how far to look for a monster worth engaging
         public bool AllowRunning = true; // run (2 tiles) instead of walking when the way is clear
         public bool LootEnabled = true;
         public int LootRange = 6;        // how far to detour for a dropped item
+
+        /// <summary>
+        /// Collect loot and butcher carcasses before starting a NEW fight, so long as nothing is
+        /// within this many tiles. 0 restores the old order, where gathering only happened once
+        /// the area was completely clear.
+        ///
+        /// Two tiles is "in contact or about to be": anything closer than that is a fight already
+        /// happening, and fighting has to win. Anything further is a fight the bot would be
+        /// CHOOSING, and choosing one over the loot already lying on the floor is what made a
+        /// wizard spend mana potions faster than it earned the gold to replace them.
+        /// </summary>
+        public int GatherSafeRange = 2;
+
+        /// <summary>
+        /// Butcher the corpses of animals that carry a harvest yield.
+        ///
+        /// Meat sells for real money and is invisible without this: a chicken or a deer drops
+        /// NOTHING when killed, so a bot farming them earns experience and no gold at all.
+        /// </summary>
+        public bool ButcherEnabled = true;
+
+        /// <summary>
+        /// Monster AI numbers always treated as butcherable, whatever their drop table says.
+        ///
+        /// 1 Chicken, 2 Cow/Deer/Pig/Sheep, 5 Carnivorous Plant on this server. Deliberately NOT
+        /// the Mir 2 agents' { 1, 2, 4, 5, 7, 9 }: here 7 is Ant Needler and the archers and 9 is
+        /// the sorcerers, all ordinary combat monsters. Add 4 to include Chestnut Tree if the
+        /// gathering nodes turn out to be worth the detour - its drop table has five chestnut
+        /// tiers but only two of any one name, so the repeat detector does not catch it.
+        /// </summary>
+        public string ButcherAIs = "1,2,5";
+
+        /// <summary>How far to walk to reach a corpse. Beyond this it is not worth the trip.</summary>
+        public int ButcherRange = 8;
+
+        /// <summary>
+        /// Give up on a corpse after this many cuts.
+        ///
+        /// A harvest ends with S.ObjectHarvested or the corpse being removed, but a refusal is
+        /// silent - the same shape as a refused pick-up - so a corpse that will not yield has to
+        /// be abandoned by counting. Six comfortably covers the six-roll meat tables.
+        /// </summary>
+        public int ButcherAttempts = 8;
         public int HeavyWeightPercent = 70;  // above this, only loot consumables and upgrades
         public int TownAtWeightPercent = 90; // above this, town-teleport out if a scroll is carried
         // Go to town when this few inventory slots remain free. Weight and slots are separate
@@ -71,23 +135,100 @@ namespace MirBot
         // Share of the bag set aside for potions. The flat reserves above become floors:
         // a level 40 warrior with a big bag should not carry a level 1 character's ten.
         //
-        // Raised from 25 because the budget is in WEIGHT and potion tiers do not weigh the same:
-        // Healing Potion (II) is 1 each but (IV) is 3, measured from bag deltas across three bots.
-        // So a quarter of a 123-weight bag bought thirty tier-II potions or only TEN tier-IV, and
-        // the bots buy the strong ones - which is how a wizard with a "full" potion target ran
-        // itself dry thirty times and spent nine emergency scrolls in one session.
+        // This went 25 -> 50 -> 30, and the middle step was a fix for the wrong problem.
         //
-        // Half the bag still leaves plenty for loot: the town trip triggers at 90% weight, and
-        // slots rather than weight are usually what fills first.
-        public int HealthPotionWeightPercent = 50;
+        // The 25 -> 50 raise was reasoned from weight: the budget is in WEIGHT and potion tiers do
+        // not weigh the same - Healing Potion (II) is 1 each but (IV) is 3, measured from bag
+        // deltas across three bots - so a quarter of a 123-weight bag bought thirty tier-II potions
+        // or only TEN tier-IV. A wizard on that budget ran itself dry thirty times.
+        //
+        // That is all true and it still does not follow that the answer is more weight. What the
+        // budget actually buys is HEALING, and healing per unit of weight roughly doubles up the
+        // tiers: 30/1 for tier one against 170/3 for tier four. The wizard was not short of budget,
+        // it was short of the good tiers - and BestPotion was quietly buying the cheap ones
+        // whenever gold was tight, which it usually was. With that fixed the same healing fits in
+        // far less bag.
+        //
+        // And half the bag was expensive. A level 18 assassin with a 138-weight bag reserved 69 of
+        // it for potions, held sixty-nine, had nothing surplus to sell, filled the remainder with
+        // loot in about two minutes and went back to town - five times in nineteen minutes.
+        //
+        // 30% of a 138-weight bag is 41: thirteen tier-four potions, about 2,200 healing, or seven
+        // full bars for that character. The restock floor scales with this number (see
+        // shortOfPotions in TownTrip), so a smaller target means fewer restock trips, not more.
+        public int HealthPotionWeightPercent = 30;
         public int ManaPotionWeightPercent = 10;
         // NOTE: PotionHealPercentTarget was removed. It set a FLOOR on potion size, which became
         // redundant and then actively contradictory once purchasing gained a CEILING derived from
         // MaxHealth and HealAtPercent - see BestPotion. Two settings that can disagree about the
         // same decision are worse than one, whichever wins.
         public int ManaPotionReserve = 15;   // same for mana potions
+        // How many of a tier we must be able to afford before settling for a weaker one.
+        //
+        // Deliberately small. The question this answers is "is buying these worth the trip?", not
+        // "have we finished shopping" - the target above decides that, and a half-filled target is
+        // topped up on the next visit at no extra cost, because the bot was going to town anyway.
+        // Set it high and the bot starts downgrading its potions whenever it is briefly short of
+        // gold, which is exactly the failure this exists to prevent.
+        public int MinUsefulPotionBuy = 4;
+        // Largest share of the purse one potion restock may spend, once we are above PoorGold.
+        //
+        // The potion purchase deliberately ignores GoldReserve: that reserve exists to stop
+        // optional GEAR shopping eating the survival budget, and applying it to potions blocks the
+        // one purchase it is being held for. Correct - but "do not block it" quietly became "spend
+        // everything", and once potion ranking started preferring the best healing per unit of
+        // weight the best tier stopped being cheap. An assassin with 40,687 gold bought 29 Life
+        // Pill (III) at about 1,400 each and walked away with THIRTY-NINE gold: no repair, no
+        // gear, no fare, and an hour of selling undone in one transaction.
+        //
+        // Same shape as TeleportMaxGoldPercent, and for the same reason: a purchase should be
+        // affordable in proportion to what we have, not merely survivable once. Below PoorGold the
+        // share does not apply at all - a bot that is already broke needs something to drink more
+        // than it needs a balance.
+        public int PotionMaxGoldPercent = 50;
+        // How many times the CHEAPEST option's gold-per-healing a potion may cost and still be
+        // considered. 0 disables the test.
+        //
+        // Healing per unit of WEIGHT was the whole ranking, and weight is only one of the two
+        // things a bot is short of. Life Pill (IV) weighs nothing and heals 170 - the same as a
+        // Healing Potion (IV), which weighs 3 - so on healing-per-weight the pill scored 170 to
+        // the potion's 57 and won every single time. It costs 3,500 against a few hundred: about
+        // twenty gold per point of healing against two.
+        //
+        // A level 27 warrior bought 150 of them and went from 667,936 gold to 253,329 overnight,
+        // in purchases of 33 and 76 at a time, while every other bot did the same at smaller
+        // scale. Nothing in the ranking had an opinion about money.
+        //
+        // Three times the cheapest is deliberately loose: it is meant to strike out the absurd,
+        // not to force the bot into the bargain bin. Paying a premium for a genuinely lighter or
+        // stronger potion is fine; paying ten times for an identical heal is not.
+        public int PotionGoldPerHealFactor = 3;
+        // Ceiling on a single potion purchase, as a multiple of the character's full pool.
+        //
+        // The quantity is normally limited by the weight budget, which stops being a limit at all
+        // when the potion WEIGHS NOTHING: RoomFor divides by max(1, weight), so a weightless pill
+        // is costed as though it weighed one, and an 87-weight budget authorises 87 of them. At
+        // 3,500 each that is a 300,000 gold restock. Total healing is the honest bound when weight
+        // is not one - twelve full health bars is already a long session.
+        public int PotionMaxPoolMultiple = 12;
+        // How many times the LIGHTEST option's weight-per-healing a potion may weigh and still be
+        // considered. 0 disables. The mirror of PotionGoldPerHealFactor, on the other resource.
+        //
+        // This exists so the two sanity bounds can be bounds and the RANKING can be about what
+        // actually matters. Elixir Of Life (V) weighs nineteen for 250 healing - roughly eight
+        // times the weight per point of an ordinary potion - and is struck out here rather than
+        // having to be out-argued by the ranking.
+        public int PotionWeightPerHealFactor = 3;
         public int TownScrollReserve = 3;    // always carry this many town teleport scrolls
         public bool KeepTorchLit = true;     // replace the torch when the slot is empty
+
+        // Throw away the starting weapon and armour once something better is worn.
+        //
+        // They are flagged Worthless on the INSTANCE, so no vendor will take them however sellable
+        // the database item looks - a Commoner Outfit is 5 weight and a Trainee's Armour 11, held
+        // for ever on bots that spend their lives near the weight cap. Narrow by design: see
+        // Backpack.IsReplacedStarterKit for the four conditions it requires.
+        public bool DropReplacedStarterKit = true;
         // Clear the Locked flag on surplus consumables so they can actually be sold.
         public bool UnlockToSell = true;
         // The ONLY maps a town trip will shop on. Comma separated map descriptions.
@@ -152,7 +293,61 @@ namespace MirBot
         // Do not explore a map whose TYPICAL monster is more than this far above us. Checked
         // against System.db, because the learned danger model only knows maps that have
         // already hurt us and is therefore silent about anywhere new.
+        /// <summary>
+        /// How long it takes for a hunting measurement to lose half its weight. 0 keeps the old
+        /// behaviour, where every sample ever taken counts equally for ever.
+        ///
+        /// A plain lifetime mean cannot forget. Bichon Town held a 122,976 exp/hour average built
+        /// from 0.4 hours of sampling while its most recent window read 30,285, and Deserted Mine
+        /// carried best 793,927 against last 15,033 - so a map measured once, luckily, outranked
+        /// maps measured honestly, and no amount of ordinary evidence could catch up.
+        ///
+        /// Decaying the accumulated experience AND the accumulated hours together leaves the
+        /// average itself untouched at rest - it is a ratio, and both halves shrink equally - and
+        /// changes only how much the next real sample is allowed to move it. Four hours means a
+        /// morning's stale reading is worth about a sixth of a fresh one by evening.
+        /// </summary>
+        public double HuntingHalfLifeHours = 4;
+
+        /// <summary>
+        /// How much to favour a hunting ground that drops a skill book we want but cannot buy,
+        /// as a percentage bonus PER wanted book. 0 disables the whole idea.
+        ///
+        /// A bonus rather than a rule, and that is the important part. Overriding the ranking
+        /// would park a character on a book map at terrible experience for as long as the book
+        /// refused to drop; a multiplier means a map that is both book-bearing and decent wins,
+        /// while a book-bearing deathtrap still loses to the danger and level filters that run
+        /// before this.
+        ///
+        /// It also needs no off switch. The bonus exists only while there is a book to want, so
+        /// when the last one is learnt the ranking silently goes back to being about experience.
+        /// </summary>
+        /// 100 rather than a gentler number because of a real near-miss: a level 22 Taoist chose
+        /// Ant Cave North at 248,148 exp/hour over Bichon Cave Lv 1 at 105,728, and Bichon Cave
+        /// was the one dropping BOTH Summon Skeleton and Magic Resistance. At 60% per book that
+        /// came to 232,602 against 248,148 - it lost by six percent, to a map that drops no skill
+        /// book for any class at all. Ant Cave can never make that character stronger; Summon
+        /// Skeleton roughly doubles what a Taoist does, permanently. One session of experience is
+        /// the wrong thing to weigh against that.
+        public int BookHuntBonusPercent = 100;
+
         public int ExploreLevelsAbove = 3;
+
+        /// <summary>
+        /// Skip a hunting ground whose TYPICAL monster is this many levels below us. 0 disables.
+        ///
+        /// Every level test in this bot had an upper bound and no lower one. WorthExploring rules
+        /// out a map that outclasses us and says nothing whatever about a map we have outgrown, so
+        /// nothing anywhere could express "too easy to be worth the walk".
+        ///
+        /// A level 22 Taoist spent the morning killing chickens in Bichon Town - median monster
+        /// level 10, no drops without butchering - because one 0.4 hour sample had recorded it at
+        /// 122,976 exp/hour and the ranking had no reason to doubt it. The two starter towns sit at
+        /// median 10, the first caves at 18, the mines at 20; eight levels of slack keeps a
+        /// character in its own tier and out of the previous one without being so tight that a bot
+        /// levelling quickly runs out of anywhere to go.
+        /// </summary>
+        public int HuntLevelsBelow = 8;
 
         // --- Travelling and gold ---------------------------------------------------------
         // Never set off on a journey without enough gold to restock on arrival. A bot that
@@ -160,6 +355,18 @@ namespace MirBot
         // back, and dies. Scaled per map transition, since each hop is another map to cross on
         // foot if it goes wrong.
         public long TravelGoldPerHop = 3000;
+        // The same float, for a leg that is WALKED rather than bought.
+        //
+        // TravelGoldPerHop is the right order for a paid journey: the fare out, a fare home, and
+        // enough left to be somewhere far from a vendor. None of that applies to a map you can walk
+        // onto. The way back is the same walk, it costs nothing, and the town scroll in the bag is
+        // the real emergency exit.
+        //
+        // Charging the paid rate for a free step is how the poverty deadlock actually held: a level
+        // 18 assassin with 907 gold was refused one free map because it could not afford 3,000, and
+        // stayed in the two worst hunting grounds it had ever measured for over an hour. Small but
+        // not zero - each map crossed is still another map to fight back across.
+        public long TravelGoldPerFreeHop = 250;
         // Below this much gold, hunt only on the maps named in TownMaps. Poverty is the one
         // state where wandering is actively harmful: it cannot buy its way out of trouble.
         //
@@ -169,6 +376,44 @@ namespace MirBot
         // spiral that a broke wizard demonstrated all night. One broken ring cost 611 gold, so a
         // few thousand is barely a handful of repairs.
         public long PoorGold = 10000;
+
+        /// <summary>
+        /// Below this, enter recovery mode. 0 disables.
+        ///
+        /// Permitting the cheap maps turned out not to be enough. The outgrown filter already
+        /// lifted while poor, so Bichon Town was allowed - but the hunting ranking is experience
+        /// only, so Deserted Mine at 422,000 an hour still won every time. A level 24 wizard with
+        /// 23 gold and no mana stood in it at zero of 428 mana meleeing ghosts, spending half its
+        /// actions drinking the health potions it could not replace either; its bag fell from 46%
+        /// to 7% in eight minutes. Permitted is not preferred, and only preferred gets a broke
+        /// character back on its feet.
+        ///
+        /// Separate from PoorGold, which means "too broke for paid teleports and fussy shopping".
+        /// This is the harder line: too broke to be anywhere but the beginner ground.
+        /// </summary>
+        public long RecoveryGold = 5000;
+
+        /// <summary>
+        /// Recovery does not finish merely by crossing RecoveryGold. It stays latched until a
+        /// completed town trip leaves this much gold and a usable supply load, so buying the next
+        /// batch of potions cannot send the character straight back into poverty.
+        /// </summary>
+        public long RecoveryExitGold = 25000;
+
+        /// <summary>
+        /// Where a broke character earns. Weak mobs it can melee with no mana and no potions, and
+        /// the only maps on the server carrying butcherable animals - which is the point, because
+        /// meat is what turns those kills into gold.
+        /// </summary>
+        public string RecoveryMaps = "Bichon Town,Banya Village";
+
+        /// <summary>
+        /// Once an experienced recovery-mode character has enough potions and its scroll reserve,
+        /// use a better money ground rather than continuing to farm beginner animals.
+        /// </summary>
+        public string RecoveryCaveMaps = "Flea Cave Lv 1";
+        public int RecoveryCaveMinimumLevel = 20;
+        public int RecoveryCaveSupplyPercent = 60;
         public int PursuitPatience = 25;      // approach attempts allowed without getting closer
         // Cargo looting: how much a drop must be worth per unit of weight to be taken. The
         // bar slides between the two gold marks - poor characters take more, rich ones less.
@@ -182,6 +427,9 @@ namespace MirBot
         // Special repair costs twice as much but does NOT eat the item's maximum durability,
         // which ordinary repair does permanently. Worth it for gear we intend to keep.
         public bool PreferSpecialRepair = true;
+        // Low-level gear is replaced too quickly for preserved maximum durability to repay the
+        // doubled repair bill. Below this level, skip special and use the ordinary pass instead.
+        public int SpecialRepairMinimumLevel = 30;
         // Buy weapons, armour and accessories from shops when they beat what we are wearing.
         public bool BuyGear = true;
         // Never spend below this much gold: repairs and potions come first.
@@ -249,6 +497,8 @@ namespace MirBot
         // Drink a mana potion at or below this share of the pool, if the character has spells to
         // spend it on. 0 disables.
         public int DrinkManaAtPercent = 40;
+        // Heal our own visible pet at or below this health percentage. Zero disables.
+        public int HealPetAtPercent = 60;
         // Furthest we will cast. The server's own limit is Globals.MagicRange (10).
         public int CastRange = 9;
         // Keep self-buffs up - Magic Shield and the like. Cast only when the SERVER says the buff
@@ -324,6 +574,74 @@ namespace MirBot
         // Cells that change the map are treated as obstacles while hunting, so the bot cannot
         // wander back out of a map it just walked into. Off means the old behaviour.
         public bool AvoidMapExits = true;
+        // Seconds pinned on one cell before the bot decides it is stuck, whatever else it seems
+        // to be achieving. 0 disables.
+        //
+        // Every other give-up here watches ONE axis: blocked moves, a target that will not die, a
+        // drop that cannot be reached, a trip that fails. A bot can fail on all of them at once
+        // and trip none, because each looks locally like progress.
+        //
+        // An assassin did exactly that. Pinned on 51,292 in Deserted Mine for ninety seconds, one
+        // tile from the exit, swinging at ghosts and drinking a potion every three seconds - bag
+        // 59 down to 23 - while its health sawed between 51% and 84% and never improved. The
+        // attack watchdog saw attacks landing. Travel saw an active trip. Nothing was watching the
+        // only number that mattered: it had not moved at all.
+        //
+        // The Mir 2 agents carry the same idea and reach for it sooner - five seconds stationary
+        // and they break state and re-roam. Twenty is the equivalent here, because our bot stands
+        // still legitimately while fighting something adjacent.
+        public int StuckSeconds = 20;
+        // How often to re-lay a self-centred area effect that grants no buff - PoisonousCloud is
+        // the only one today. It lasts Magic.GetPower() seconds, which the client cannot read, so
+        // this is a plain interval. A re-cast while the cloud is still up is refused silently, so
+        // erring long costs a little uptime and erring short costs nothing but a wasted request.
+        public int SelfAoeRecastSeconds = 25;
+        // Seconds of finding nothing to fight before a wander becomes a SWEEP towards the next
+        // floor. 0 disables and roaming stays purely local.
+        //
+        // Roaming picks a random walkable point within RoamRadius of where the bot stands, which
+        // is a local search: it explores the pocket it is already in and has no way to conclude
+        // "there is nothing here, go further in". In a cave that is exactly the wrong shape. The
+        // caves run about a third of the monster density of the town maps - Deserted Mine Lv 1
+        // measured a median of 3 monsters in view against 16 for Banya Village, and nothing at all
+        // 14% of the time - so a bot that walks a decent way in and then mills back and forth is
+        // the expected behaviour of a local search on a sparse map, not a bug in the pathing.
+        //
+        // The sweep gives the wander a direction: head for the stairs down. Combat still preempts
+        // it - Wander is the last branch of Decide - so anything met on the way is fought and the
+        // sweep resumes afterwards, which is the "fight, then carry on" pattern asked for.
+        public int SweepAfterIdleSeconds = 45;
+
+        /// <summary>
+        /// Minutes without a single point of experience before the hunting ground is reconsidered.
+        /// 0 disables.
+        ///
+        /// The bot has always MEASURED this - WorldModel.LastExperienceGainUtc feeds the "last
+        /// kill: 26 minutes ago" line on the status page - and no decision anywhere consulted it.
+        /// So the one number that says plainly "whatever I am doing is not working" was collected,
+        /// displayed to a human, and ignored by the bot.
+        ///
+        /// Travel was reconsidered on exactly four events: a town trip ending, the map having no
+        /// spawns at all, the map being outgrown, and a storage errand. A level 25 wizard walled
+        /// into a pocket of Banya Cave Lv 1 - a map with 280 spawns, so not barren, and level
+        /// appropriate, so not outgrown - matched none of them. It roamed for twenty-five minutes
+        /// with no trip to finish, and nothing would ever have moved it.
+        ///
+        /// The cave sweep is the local answer to this and it is not enough: it walks towards the
+        /// next floor, and a bot that cannot REACH the next floor abandons the sweep (correctly)
+        /// and goes back to roaming the same pocket. Leaving the map is the escalation that was
+        /// missing.
+        /// </summary>
+        public int UnproductiveMinutes = 12;
+        // Walk through to the next floor on reaching it, rather than stopping at the stairs.
+        //
+        // The sweep only ever aims at a DEEPER floor of the same cave - matched on the map name,
+        // so "Deserted Mine Lv 1" will aim at "Deserted Mine Lv 2" and never back towards town.
+        // Entering is off by default because the brain cannot see the hunting memory or the danger
+        // tables that Travel consults, so it cannot tell that the next floor is one that has been
+        // killing us. With it off the bot sweeps the full length of the map and turns around,
+        // which is the useful half of the behaviour and carries no new risk.
+        public bool SweepEntersNextFloor = false;
         // How far from the nearest exit the bot walks before it settles in to hunt, in Chebyshev
         // tiles. Measured rather than guessed: arriving in Banya Cave Lv 1 put the bot at 132,175
         // with the way back at 124-126,180-182 - exactly 6 tiles, so a clearance of 6 would never
@@ -415,10 +733,26 @@ namespace MirBot
         {
             if (maxBagWeight <= 0 || percent <= 0) return floor;
 
+            int unit = System.Math.Max(1, itemWeight);
             int weightBudget = maxBagWeight * percent / 100;
-            int count = weightBudget / System.Math.Max(1, itemWeight);
+            int count = weightBudget / unit;
 
-            return System.Math.Max(floor, count);
+            int target = System.Math.Max(floor, count);
+
+            // THE FLOOR IS A COUNT AND THE BUDGET IS A WEIGHT, so for anything heavy the floor can
+            // demand far more bag than the budget allows - and then the two halves of the system
+            // disagree about the same number. The buyer tops up to the floor; the keeper trims to
+            // the budget and calls the difference surplus; the next trip buys it back.
+            //
+            // A level 26 warrior found the case: Elixir Of Life (V) weighs NINETEEN, so an 82-weight
+            // budget is four of them, but HealthPotionReserve is ten. Buy to ten (190 weight), keep
+            // four, sell six, buy six. A shopping loop that also spends the gold each way.
+            //
+            // The floor exists for small bags, where a percentage of very little is not enough to
+            // survive on. It has no business overriding a budget that already affords more than one.
+            if (count >= 1 && (long)target * unit > weightBudget) target = count;
+
+            return System.Math.Max(1, target);
         }
         public bool BuyBooks = true;
         public bool LearnBooks = true;
@@ -492,11 +826,19 @@ namespace MirBot
                 case "timeoutseconds": config.TimeOut = TimeSpan.FromSeconds(int.Parse(value)); break;
                 case "healatpercent": config.HealAtPercent = int.Parse(value); break;
                 case "panichealpercent": config.PanicHealPercent = int.Parse(value); break;
+                case "minpotionrestore": config.MinPotionRestore = int.Parse(value); break;
+                case "resyncaftersellrefusals": config.ResyncAfterSellRefusals = int.Parse(value); break;
+                case "resyncwindowminutes": config.ResyncWindowMinutes = int.Parse(value); break;
                 case "fleeatpercent": config.FleeAtPercent = int.Parse(value); break;
                 case "aggrorange": config.AggroRange = int.Parse(value); break;
                 case "allowrunning": config.AllowRunning = bool.Parse(value); break;
                 case "lootenabled": config.LootEnabled = bool.Parse(value); break;
                 case "lootrange": config.LootRange = int.Parse(value); break;
+                case "gathersaferange": config.GatherSafeRange = int.Parse(value); break;
+                case "butcherenabled": config.ButcherEnabled = bool.Parse(value); break;
+                case "butcherais": config.ButcherAIs = value; break;
+                case "butcherrange": config.ButcherRange = int.Parse(value); break;
+                case "butcherattempts": config.ButcherAttempts = int.Parse(value); break;
                 case "heavyweightpercent": config.HeavyWeightPercent = int.Parse(value); break;
                 case "townatweightpercent": config.TownAtWeightPercent = int.Parse(value); break;
                 case "townatfreeslots": config.TownAtFreeSlots = int.Parse(value); break;
@@ -511,6 +853,7 @@ namespace MirBot
                 case "manapotionreserve": config.ManaPotionReserve = int.Parse(value); break;
                 case "townscrollreserve": config.TownScrollReserve = int.Parse(value); break;
                 case "keeptorchlit": config.KeepTorchLit = bool.Parse(value); break;
+                case "dropreplacedstarterkit": config.DropReplacedStarterKit = bool.Parse(value); break;
                 case "unlocktosell": config.UnlockToSell = bool.Parse(value); break;
                 case "townmaps": config.TownMaps = value; break;
                 case "returnwithin": config.ReturnWithin = int.Parse(value); break;
@@ -526,8 +869,19 @@ namespace MirBot
                 case "exploreuntilmapsknown": config.ExploreUntilMapsKnown = int.Parse(value); break;
                 case "explorechancepercent": config.ExploreChancePercent = int.Parse(value); break;
                 case "explorelevelsabove": config.ExploreLevelsAbove = int.Parse(value); break;
+                case "bookhuntbonuspercent": config.BookHuntBonusPercent = int.Parse(value); break;
+                case "huntinghalflifehours": config.HuntingHalfLifeHours = double.Parse(value); break;
+                case "huntlevelsbelow": config.HuntLevelsBelow = int.Parse(value); break;
                 case "travelgoldperhop": config.TravelGoldPerHop = long.Parse(value); break;
                 case "poorgold": config.PoorGold = long.Parse(value); break;
+                case "unproductiveminutes": config.UnproductiveMinutes = int.Parse(value); break;
+                case "sweepafteridleseconds": config.SweepAfterIdleSeconds = int.Parse(value); break;
+                case "recoverygold": config.RecoveryGold = long.Parse(value); break;
+                case "recoveryexitgold": config.RecoveryExitGold = long.Parse(value); break;
+                case "recoverymaps": config.RecoveryMaps = value; break;
+                case "recoverycavemaps": config.RecoveryCaveMaps = value; break;
+                case "recoverycaveminimumlevel": config.RecoveryCaveMinimumLevel = int.Parse(value); break;
+                case "recoverycavesupplypercent": config.RecoveryCaveSupplyPercent = int.Parse(value); break;
                 case "pursuitpatience": config.PursuitPatience = int.Parse(value); break;
                 case "lootpoorgold": config.LootPoorGold = long.Parse(value); break;
                 case "lootrichgold": config.LootRichGold = long.Parse(value); break;
@@ -537,6 +891,7 @@ namespace MirBot
                 case "storagesize": config.StorageSize = int.Parse(value); break;
                 case "repairatdurability": config.RepairAtDurability = int.Parse(value); break;
                 case "preferspecialrepair": config.PreferSpecialRepair = bool.Parse(value); break;
+                case "specialrepairminimumlevel": config.SpecialRepairMinimumLevel = int.Parse(value); break;
                 case "buygear": config.BuyGear = bool.Parse(value); break;
                 case "goldreserve": config.GoldReserve = long.Parse(value); break;
                 case "minimumupgradepercent": config.MinimumUpgradePercent = int.Parse(value); break;
@@ -550,6 +905,7 @@ namespace MirBot
                 case "castspells": config.CastSpells = bool.Parse(value); break;
                 case "spellmanafloorpercent": config.SpellManaFloorPercent = int.Parse(value); break;
                 case "drinkmanaatpercent": config.DrinkManaAtPercent = int.Parse(value); break;
+                case "healpetatpercent": config.HealPetAtPercent = int.Parse(value); break;
                 case "castrange": config.CastRange = int.Parse(value); break;
                 case "maintainbuffs": config.MaintainBuffs = bool.Parse(value); break;
                 case "buyreagents": config.BuyReagents = bool.Parse(value); break;

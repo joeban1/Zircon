@@ -32,6 +32,8 @@ namespace MirBot
         public TeleportDirectory Teleports { get; } = new TeleportDirectory();
         public MapProfile Profiles { get; } = new MapProfile();
         public MonsterIndex Monsters { get; } = new MonsterIndex();
+        public ButcherIndex Butcher { get; } = new ButcherIndex();
+        public BookDropIndex BookDrops { get; } = new BookDropIndex();
         public MapLibrary Maps { get; private set; }
 
         /// <summary>A map's display name, or a readable fallback when the database has none.</summary>
@@ -325,7 +327,10 @@ namespace MirBot
                           (health > 0 ? $", heals {health} HP" : "") +
                           (mana > 0 ? $", restores {mana} MP" : "") +
                           (health > 0 && info.Weight > 0
-                              ? $"  [{health / (double)info.Weight:N1} HP per weight]" : ""));
+                              ? $"  [{health / (double)info.Weight:N1} HP per weight]" : "") +
+                          $"  |{(info.StartItem ? " START" : "")}" +
+                          $"{(info.CanSell ? "" : " NOSELL")}{(info.CanDrop ? "" : " NODROP")}" +
+                          $"{(info.CanStore ? "" : " NOSTORE")}{(info.CanTrade ? "" : " NOTRADE")}");
                 shown++;
             }
 
@@ -489,6 +494,26 @@ namespace MirBot
             // match silently, and an empty whitelist then FAILS OPEN and shops anywhere.
             Vendors.SetTownMaps(first.TownMaps.Split(','));
             Monsters.Build();
+
+            // Host-wide for the same reason as TownMaps: what counts as a potion is a property of
+            // the server's item data, not of a character.
+            Backpack.MinPotionRestore = first.MinPotionRestore;
+
+            // Built from the same first-bot config as TownMaps above, and host-wide for the same
+            // reason: which monsters carry a harvest yield is a property of the SERVER's data, not
+            // of any character. Logged because it is an inference, not a lookup - if it names
+            // something odd, the detector is wrong and that should be visible.
+            List<int> butcherAIs = new List<int>();
+
+            foreach (string part in (first.ButcherAIs ?? "").Split(','))
+                if (int.TryParse(part.Trim(), out int ai)) butcherAIs.Add(ai);
+
+            Butcher.Build(butcherAIs);
+            Log.Write($"Butcherable monsters - {Butcher.Describe()}");
+
+            BookDrops.Build(Books);
+            Log.Write($"Drop-only skill books: {BookDrops.BookCount} across " +
+                      $"{BookDrops.MapCount} map(s)");
             BotConnection.Monsters = Monsters;
 
             // Shared: maps never change, and one copy of the grids serves every bot.
@@ -503,7 +528,10 @@ namespace MirBot
             // resolving the same relative path twice invites the two to disagree.
             MemoryFolder = memory;
 
-            Hunting = new HuntingMemory(Path.Combine(memory, "hunting.json"), first.LevelBandSize);
+            Hunting = new HuntingMemory(Path.Combine(memory, "hunting.json"), first.LevelBandSize)
+            {
+                HalfLifeHours = first.HuntingHalfLifeHours
+            };
             Danger = new MonsterMemory(Path.Combine(memory, "monsters.json"));
             Nav = new NavCorrections(Path.Combine(memory, "navdata.json"));
             Deaths = new DeathMemory(Path.Combine(memory, "deaths.json"));
@@ -766,11 +794,10 @@ namespace MirBot
                 Thread.Sleep(500);
             }
 
-            // Anything learned since the last timed write would otherwise be lost.
-            Hunting.Flush();
-            Danger.Flush();
-            Nav.Flush();
-            Deaths.Flush();
+            // An early flush, so a hang in the logout loop below cannot cost a whole session's
+            // learning. It is NOT the authoritative one - see the second flush after the threads
+            // have joined.
+            FlushMemory();
 
             // Ask every bot to log out properly FIRST. Going straight to RequestShutdown tears the
             // socket down without a C.Logout, so characters linger in the world until the server
@@ -799,11 +826,30 @@ namespace MirBot
             foreach (BotInstance instance in _instances) instance.RequestShutdown();
             foreach (BotInstance instance in _instances) instance.Join(TimeSpan.FromSeconds(15));
 
+            // The flush that actually matters, AFTER every bot thread has stopped.
+            //
+            // The banks used to be written only before the logout request, and the bots keep
+            // playing throughout the grace period that follows - up to forty seconds of fighting,
+            // dying and learning, all of it discarded. It went unnoticed while the banks held
+            // hunting rates and blocked cells, where losing the last half minute is nothing. It
+            // became obvious the moment deaths were recorded: an assassin died eighteen seconds
+            // into a shutdown, the log recorded it, and deaths.json never heard about it.
+            FlushMemory();
+
             foreach (Timer timer in _startTimers) timer.Dispose();
             _startTimers.Clear();
 
             _status?.Dispose();
             Log.Write("Host stopped.");
+        }
+
+        /// <summary>Write every memory bank. Cheap when nothing has changed - each one no-ops.</summary>
+        private void FlushMemory()
+        {
+            Hunting.Flush();
+            Danger.Flush();
+            Nav.Flush();
+            Deaths.Flush();
         }
 
         public void RequestShutdown() => _shutdown.Cancel();

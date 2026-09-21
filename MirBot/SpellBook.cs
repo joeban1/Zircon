@@ -61,7 +61,8 @@ namespace MirBot
             // bypass that and re-poison an already-poisoned target every other turn.
 
             // Assassin
-            MagicType.Hemorrhage, MagicType.FlamingDaggers, MagicType.Shredding
+            MagicType.Hemorrhage, MagicType.FlamingDaggers, MagicType.Shredding,
+            MagicType.HellFire
         };
 
         /// <summary>
@@ -82,7 +83,11 @@ namespace MirBot
         ///     still land on us, because CanHelpTarget always returns true for the caster, so
         ///     casting at our own feet is the correct way to self-buff with them.
         /// </summary>
-        private static readonly (MagicType Magic, BuffType Buff, bool AtOwnFeet)[] SelfBuffs =
+        /// <summary>
+        /// Buff is null for effects that grant no BuffType and so cannot be confirmed with
+        /// HasBuff - see PoisonousCloud below. Those are re-cast on a timer instead.
+        /// </summary>
+        private static readonly (MagicType Magic, BuffType? Buff, bool AtOwnFeet)[] SelfBuffs =
         {
             // Wizard
             (MagicType.MagicShield, BuffType.MagicShield, false),
@@ -91,8 +96,23 @@ namespace MirBot
             // Taoist - ground-targeted, cast at our own location
             (MagicType.MagicResistance, BuffType.MagicResistance, true),
             (MagicType.Resilience, BuffType.Resilience, true),
-            (MagicType.StrengthOfFaith, BuffType.StrengthOfFaith, false)
+            (MagicType.StrengthOfFaith, BuffType.StrengthOfFaith, false),
+
+            // Assassin - and the only entry here that is NOT a buff.
+            //
+            // PoisonousCloud spawns SpellObjects across a radius-2 area centred on the caster for
+            // Magic.GetPower() seconds (PoisonousCloud.cs:35-58). It grants no BuffType, so there
+            // is nothing for HasBuff to answer and no confirmation to wait on - hence the null.
+            //
+            // The server refuses a re-cast SILENTLY while a cloud is already on our cell, so the
+            // timer is not an optimisation but the whole of the bookkeeping: the bot cannot see
+            // spell objects at all (S.ObjectSpell is unhandled) and would otherwise ask forever
+            // and never know it was being ignored.
+            (MagicType.PoisonousCloud, null, true)
         };
+
+        /// <summary>When a timer-tracked self effect may be cast again, by MagicInfo.Index.</summary>
+        private readonly Dictionary<int, DateTime> _timedRecast = new Dictionary<int, DateTime>();
 
         /// <summary>
         /// When a buff attempt may next be made, keyed by MagicInfo.Index, and how many attempts
@@ -123,6 +143,14 @@ namespace MirBot
         private readonly Dictionary<uint, DateTime> _poisonPending = new Dictionary<uint, DateTime>();
 
         private static readonly TimeSpan PoisonConfirmWindow = TimeSpan.FromSeconds(8);
+
+        /// <summary>
+        /// Heal is a short heal-over-time buff. Pet buffs are not represented in WorldModel, so a
+        /// local target gate prevents paying for another cast while the previous one is ticking.
+        /// Health packets remain authoritative about whether another heal is needed afterwards.
+        /// </summary>
+        private readonly Dictionary<uint, DateTime> _petHealRetry = new Dictionary<uint, DateTime>();
+        private static readonly TimeSpan PetHealWindow = TimeSpan.FromSeconds(8);
 
         /// <summary>Why the last buff attempt was skipped, for the log.</summary>
         public string BuffDiagnostic = "";
@@ -162,9 +190,30 @@ namespace MirBot
                     : $"{magic.Info.Name} (needs level {magic.Info.NeedLevel1})");
             }
 
-            return names.Count == 0
-                ? $"no castable spells among {world.KnownMagicCount} skills"
-                : "can cast " + string.Join(", ", names);
+            if (names.Count > 0) return "can cast " + string.Join(", ", names);
+
+            // NAME WHAT IT DOES KNOW.
+            //
+            // "no castable spells among 5 skills" is a dead end: it says a character cannot cast
+            // without saying what it is holding or why none of it qualifies, and an assassin has
+            // now sat at 7% mana swinging a bare weapon through two separate investigations with
+            // this line as the only evidence. The list is short and the answer is always in it.
+            List<string> held = new List<string>();
+
+            foreach (ClientUserMagic magic in world.Magics)
+            {
+                if (magic?.Info == null) continue;
+
+                string why = magic.ItemRequired ? "needs an item"
+                    : !Castable.Contains(magic.Info.Magic) ? "not a castable type"
+                    : world.Level < magic.Info.NeedLevel1 ? $"needs level {magic.Info.NeedLevel1}"
+                    : "castable";
+
+                held.Add($"{magic.Info.Name} [{magic.Info.Magic}] cost {magic.Cost} - {why}");
+            }
+
+            return $"no castable spells among {world.KnownMagicCount} skills: " +
+                   string.Join("; ", held);
         }
 
         /// <summary>
@@ -173,6 +222,38 @@ namespace MirBot
         /// Asked before drinking a mana potion. A warrior's mana pays for nothing the bot uses, so
         /// pouring potions into it would be burning gold and bag weight for no effect.
         /// </summary>
+        /// <summary>
+        /// Does this character have ANY spell it will actually cast that costs mana?
+        ///
+        /// Broader than HasCastable on purpose. HasCastable answers "can I throw something at a
+        /// target", and the mana-drinking gate was built out of it - so a character whose only
+        /// costed magic is a self-centred area spell was judged to have no use for mana at all.
+        ///
+        /// An assassin sat at 9 of 125 mana swinging a bare weapon, holding two mana potions and a
+        /// Poisonous Cloud costing 11. Cloud is cast through the SelfBuffs path, which is neither
+        /// Castable nor anything the gate consulted, so the bot never drank, never had the 11, and
+        /// could never cast the one spell it owned. Its own skill line read "no castable spells"
+        /// while listing a spell with a price on it.
+        ///
+        /// Anything this book can issue and has to pay for counts.
+        /// </summary>
+        public bool UsesMana(WorldModel world)
+        {
+            foreach (ClientUserMagic magic in world.Magics)
+            {
+                if (magic?.Info == null || magic.ItemRequired) continue;
+                if (magic.Cost <= 0) continue;
+                if (world.Level < magic.Info.NeedLevel1) continue;
+
+                if (Castable.Contains(magic.Info.Magic)) return true;
+
+                foreach ((MagicType Magic, BuffType? Buff, bool AtOwnFeet) self in SelfBuffs)
+                    if (self.Magic == magic.Info.Magic) return true;
+            }
+
+            return false;
+        }
+
         public bool HasCastable(WorldModel world)
         {
             foreach (ClientUserMagic magic in world.Magics)
@@ -263,9 +344,25 @@ namespace MirBot
 
             int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
 
-            foreach ((MagicType magic, BuffType buff, bool feet) in SelfBuffs)
+            foreach ((MagicType magic, BuffType? buff, bool feet) in SelfBuffs)
             {
-                if (world.HasBuff(buff)) continue;
+                if (buff.HasValue)
+                {
+                    if (world.HasBuff(buff.Value)) continue;
+                }
+                else
+                {
+                    // A timed area effect is only worth laying when there is something to lay it
+                    // on. A real buff is free to hold indefinitely, so the branch above has never
+                    // needed a combat test - but PoisonousCloud expires, costs mana each time and
+                    // does nothing at all in an empty street. Sindo was seen casting it in town
+                    // between vendors.
+                    if (world.NearestLiveMonster(_config.AggroRange) == null) continue;
+
+                    if (_timedRecast.TryGetValue(MagicIndex(world, magic), out DateTime again) &&
+                        DateTime.UtcNow < again)
+                        continue;
+                }
                 if (!world.TryGetMagic(magic, out ClientUserMagic known)) continue;
                 if (known.Info == null) continue;
                 if (world.Level < known.Info.NeedLevel1) continue;
@@ -297,6 +394,21 @@ namespace MirBot
         /// HasBuff turning true - and if it does, ChooseBuff stops selecting this spell anyway, so
         /// the backoff never gets in the way of a buff that is actually landing.
         /// </summary>
+        private static int MagicIndex(WorldModel world, MagicType magic) =>
+            world.TryGetMagic(magic, out ClientUserMagic known) && known.Info != null
+                ? known.Info.Index : -1;
+
+        /// <summary>Note a timer-tracked self effect as freshly cast.</summary>
+        public void TimedSelfEffectIssued(ClientUserMagic magic)
+        {
+            if (magic?.Info == null) return;
+
+            foreach ((MagicType m, BuffType? buff, bool _) in SelfBuffs)
+                if (buff == null && m == magic.Info.Magic)
+                    _timedRecast[magic.Info.Index] =
+                        DateTime.UtcNow + TimeSpan.FromSeconds(Math.Max(5, _config.SelfAoeRecastSeconds));
+        }
+
         public void BuffIssued(ClientUserMagic magic)
         {
             if (magic?.Info == null) return;
@@ -341,7 +453,7 @@ namespace MirBot
             // MagicCast and simply stops if it is not there (PoisonDust.cs:64) - no error, no
             // cooldown, nothing to learn from. Checking here makes the refusal ours and visible,
             // rather than a spell that appears to be cast and silently never happens.
-            if (items == null || items.CountReagent(ItemType.Poison) <= 0) return null;
+            if (items == null || items.EquippedReagentCount(ItemType.Poison) <= 0) return null;
 
             // Confirmed by the server: stop, and drop our guess, which has served its purpose.
             if (target.Poison.HasFlag(PoisonType.Green) || target.Poison.HasFlag(PoisonType.Red))
@@ -377,11 +489,66 @@ namespace MirBot
             PoisonsCast++;
         }
 
+        /// <summary>Choose our lowest visible pet that Heal can help right now.</summary>
+        public ClientUserMagic ChoosePetHeal(WorldModel world, out WorldObject target)
+        {
+            target = null;
+
+            if (!_config.CastSpells || _config.HealPetAtPercent <= 0) return null;
+            if (DateTime.UtcNow < _nextCast) return null;
+            if (!world.TryGetMagic(MagicType.Heal, out ClientUserMagic magic)) return null;
+            if (magic.Info == null || world.Level < magic.Info.NeedLevel1) return null;
+
+            int threshold = Math.Clamp(_config.HealPetAtPercent, 1, 99);
+            int lowest = int.MaxValue;
+
+            foreach (WorldObject pet in world.OwnPets)
+            {
+                if (pet.MaxHealth <= 0 || pet.Health <= 0) continue;
+
+                int percent = pet.Health * 100 / pet.MaxHealth;
+                if (percent > threshold || percent >= lowest) continue;
+                if (world.DistanceTo(pet.Location) > Math.Min(_config.CastRange, 10)) continue;
+
+                if (_petHealRetry.TryGetValue(pet.ObjectID, out DateTime retry) &&
+                    DateTime.UtcNow < retry)
+                    continue;
+
+                lowest = percent;
+                target = pet;
+            }
+
+            if (target == null) return null;
+
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            if (world.Mana - magic.Cost < floor)
+            {
+                target = null;
+                return null;
+            }
+
+            if (_cooldowns.TryGetValue(magic.Info.Index, out DateTime ready) &&
+                DateTime.UtcNow < ready)
+            {
+                target = null;
+                return null;
+            }
+
+            return magic;
+        }
+
+        public void PetHealIssued(uint targetID) =>
+            _petHealRetry[targetID] = DateTime.UtcNow + PetHealWindow;
+
         /// <summary>
         /// Forget targets that are gone. Object ids are recycled by the server, so a pending entry
         /// that outlives its monster would suppress poison on whatever inherits the id.
         /// </summary>
-        public void ForgetPoison(uint targetID) => _poisonPending.Remove(targetID);
+        public void ForgetPoison(uint targetID)
+        {
+            _poisonPending.Remove(targetID);
+            _petHealRetry.Remove(targetID);
+        }
 
         public void ForgetAllPoison() => _poisonPending.Clear();
 

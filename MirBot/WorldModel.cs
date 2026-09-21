@@ -68,11 +68,28 @@ namespace MirBot
         public bool IsPet => !string.IsNullOrEmpty(PetOwner);
 
         /// <summary>
+        /// A gathering node or map fixture rather than a monster: AI 4 is Chestnut Tree, Blood
+        /// Stone, Dark Stone, Life Stone and Enshrinement Box.
+        ///
+        /// These are monsters in the data model the same way guards are, and they are just as
+        /// wrong to attack. A level 23 wizard found the Chestnut Tree and could not be talked out
+        /// of it: trees take no damage from spells, so it threw Cyclone at one from five tiles,
+        /// stepped in, threw again, backed off to its preferred range, threw again - twelve mana a
+        /// cast, indefinitely, until the mana potions it had finally been routed to a shop for
+        /// were gone.
+        ///
+        /// The no-damage watchdog should have caught it and could not: see NoDamageTo, which was
+        /// only ever asked on the MELEE path. Both ends are fixed, but a tree should not be a
+        /// target in the first place.
+        /// </summary>
+        public bool IsSceneryNode => AI == 4;
+
+        /// <summary>
         /// Attackable at all. Pets are excluded outright: under the ordinary attack mode the server
         /// silently refuses attacks on an owned monster, so swinging at one is a decision that can
         /// never succeed and produces no error to learn from.
         /// </summary>
-        public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet;
+        public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet && !IsSceneryNode;
 
         public override string ToString() => $"{Kind}:{Name}#{ObjectID}@{Location.X},{Location.Y}" +
                                              (Dead ? " (dead)" : "");
@@ -249,6 +266,13 @@ namespace MirBot
         /// an hour, deciding and moving and walking to vendors, while this does not move once.
         /// </summary>
         public DateTime LastExperienceGainUtc = DateTime.MinValue;
+
+        /// <summary>
+        /// When the current map was entered. Productivity is map-local: an old drought must not
+        /// make the bot abandon a fresh destination before that destination has had its own fair
+        /// observation window.
+        /// </summary>
+        public DateTime MapEnteredUtc = DateTime.MinValue;
 
         public bool AtMaxLevel => MaxExperienceKnown && MaxExperience == 0;
 
@@ -547,6 +571,7 @@ namespace MirBot
             Location = start.Location;
             Direction = start.Direction;
             MapIndex = start.MapIndex;
+            MapEnteredUtc = DateTime.UtcNow;
             Class = start.Class;
             Gender = start.Gender;
             Level = start.Level;
@@ -578,6 +603,7 @@ namespace MirBot
 
         public void ApplyMapChanged(int mapIndex)
         {
+            if (MapIndex != mapIndex) MapEnteredUtc = DateTime.UtcNow;
             MapIndex = mapIndex;
 
             // Objects belong to the map we left.

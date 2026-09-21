@@ -18,3 +18,19 @@ licenses.licx
 # MirBot: real bot configs hold credentials. Only the example is tracked.
 MirBot/bot.ini
 MirBot/bot-*.ini
+
+# MirBot build output. The host deploys these by copying the compiled binaries into this
+# folder for the desktop to pick up over SMB - they are artefacts, not source.
+MirBot/MirBot.dll
+MirBot/MirBot.exe
+MirBot/MirBot.pdb
+MirBot/LibraryCore.dll
+MirBot/LibraryCore.pdb
+MirBot/*.deps.json
+MirBot/*.runtimeconfig.json
+MirBot/status.html
+MirBot/*.log
+MirBot/memory/
+MirBot/Data/
+SpawnDump/bin/
+SpawnDump/obj/

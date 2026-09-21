@@ -140,6 +140,56 @@ namespace MirBot
 
         public void Process(S.ObjectHarvest p) => World.ApplyTurn(p.ObjectID, p.Direction, p.Location);
 
+        /// <summary>
+        /// A monster (or player) died where we can see it.
+        ///
+        /// The bot did not handle this at all. WorldModel.MarkDead existed and nothing ever called
+        /// it, so the only way an object stopped being a live target was S.ObjectRemove - the
+        /// corpse vanishing entirely, some seconds later. Until then IsLiveMonster stayed true for
+        /// something already dead.
+        ///
+        /// Butchering needs the corpse, so this had to be handled to build it; but it is worth
+        /// having on its own account.
+        /// </summary>
+        public void Process(S.ObjectDied p)
+        {
+            World.MarkDead(p.ObjectID, true);
+        }
+
+        /// <summary>
+        /// An item is gone from a grid for good.
+        ///
+        /// This had no handler at all, so the bot kept items the server had destroyed. A wizard's
+        /// Candle burned down to nothing and vanished in game while the bot went on believing it
+        /// was wearing one at 0 of 8 - and a phantom is not merely a wrong status line. Worn items
+        /// are counted against WearWeight, so an item that does not exist can be the three points
+        /// that stop a real one going on, which is the shape of bug that cost a whole morning
+        /// today with a Flame Robe.
+        ///
+        /// Success-gated like S.ItemMove and S.ItemLock: the packet is enqueued before validation
+        /// and the flag is set on the same object afterwards, so a refusal arrives here too and
+        /// must not be applied.
+        /// </summary>
+        public void Process(S.ItemDelete p)
+        {
+            if (!p.Success)
+            {
+                Log($"Delete REFUSED by the server: {p.Grid}:{p.Slot} - nothing changed.");
+                return;
+            }
+
+            Items.NoteDeleted(p.Grid, p.Slot);
+        }
+
+        /// <summary>A corpse has given up everything it is going to. See ScriptedBrain.TryButcher.</summary>
+        public void Process(S.ObjectHarvested p)
+        {
+            OnHarvested?.Invoke(p.ObjectID);
+        }
+
+        /// <summary>Raised when a corpse is finished with.</summary>
+        public Action<uint> OnHarvested;
+
         public void Process(S.ObjectRemove p)
         {
             World.ApplyRemove(p.ObjectID);
@@ -244,8 +294,13 @@ namespace MirBot
 
         public void Process(S.GainedExperience p) => World.ApplyExperienceGain(p.Amount);
 
-        public void Process(S.LevelChanged p) =>
+        public void Process(S.LevelChanged p)
+        {
             World.ApplyLevelChanged(p.Level, p.Experience, p.MaxExperience);
+
+            // A level up raises WearWeight, so gear refused as too heavy may now fit.
+            Items.ClearEquipRefusals();
+        }
 
         public void Process(S.CurrencyChanged p) => World.ApplyCurrency(p.CurrencyIndex, p.Amount);
 
@@ -323,6 +378,192 @@ namespace MirBot
 
         #region Inventory
 
+        /// <summary>What we last asked to drop, pending the server's answer.</summary>
+        private CellLinkInfo _pendingDrop;
+        private DateTime _dropDeadline = DateTime.MinValue;
+
+        /// <summary>
+        /// A drop is out and unanswered.
+        ///
+        /// Without this the brain re-decided "drop that" on the very next tick, before the first
+        /// request had been answered - so one item produced a stream of drops, the first succeeded,
+        /// and every one after it was refused because the slot was already empty. The deadline
+        /// exists because a request that is never answered must not wedge the bot for ever.
+        /// </summary>
+        public bool DropPending => _pendingDrop != null && DateTime.UtcNow < _dropDeadline;
+
+        /// <summary>Told when the server throws a drop out, so the brain can stop asking.</summary>
+        public Action<int> OnDropRefused;
+
+        /// <summary>Told which slot the server refused to buy, when the order named only one.</summary>
+        public Action<int> OnSellRefused;
+
+        /// <summary>Told about EVERY refusal, however many slots it named.</summary>
+        public Action OnSellOrderRefused;
+
+        /// <summary>
+        /// The server's verdict on a drop.
+        ///
+        /// S.ItemChanged is enqueued before validation and has Success set on the same object
+        /// afterwards, the same shape as the sell path. The server refuses a drop outright when
+        /// CanDrop is false, the item is Locked or Marriage-bound, or there is no free cell to
+        /// drop onto - and a bot standing in a crowded doorway hits that last one routinely.
+        /// </summary>
+        public void Process(S.ItemChanged p)
+        {
+            CellLinkInfo pending = _pendingDrop;
+            int usedSlot = _pendingUse;
+            string usedName = _pendingUseName;
+
+            // THE SLOT COMES FROM THE SERVER, not from what we think we asked about.
+            //
+            // The handler used to be drop-only: if no drop was pending it returned, throwing away
+            // every potion, book and town-scroll verdict the server ever sent. Correlating by a
+            // single pending field is also unsafe - a late item-use answer arriving while a drop
+            // is outstanding would be read as the drop's verdict - and unnecessary, because
+            // S.ItemChanged echoes the GridType and Slot it concerns (PlayerObject.cs:5581).
+            int slot = p.Link?.Slot ?? -1;
+            bool inventory = p.Link == null || p.Link.GridType == GridType.Inventory;
+            bool answersUse = inventory && usedSlot >= 0 && slot == usedSlot;
+            bool answersDrop = inventory && pending != null && slot == pending.Slot;
+
+            if (answersUse)
+            {
+                // The server's item cooldown starts from an ACCEPTED use. See ItemUseCooldown.
+                if (p.Success) _lastAcceptedUse = DateTime.UtcNow;
+
+                OnItemUseVerdict?.Invoke(usedSlot, p.Success);
+
+                _pendingUse = -1;
+                _pendingUseName = null;
+                _pendingUseAt = DateTime.MinValue;
+
+                // Logged both ways. Refused uses were completely invisible before, and they are
+                // the event that desynchronised the whole model.
+                Log(p.Success
+                    ? $"Used {usedName ?? "item"} from slot {usedSlot} - server confirms, " +
+                      $"{p.Link?.Count ?? 0} left."
+                    : $"Use REFUSED for {usedName ?? "item"} in slot {usedSlot} - the model is " +
+                       "left alone, the item is still there.");
+            }
+
+            if (answersDrop)
+            {
+                _pendingDrop = null;
+                _dropDeadline = DateTime.MinValue;
+            }
+
+            if (!p.Success)
+            {
+                // NOTHING IS APPLIED. Not for a drop, not for a use.
+                if (!answersDrop) return;
+
+                // Said once, and the slot is not asked about again for a good while. The server
+                // refuses a drop when there is no free cell to put it on - standing in a doorway
+                // or a crowd is enough - and retrying that every tick is a spin, not a strategy.
+                Log($"Drop REFUSED for slot {pending.Slot} - keeping it, and not asking again " +
+                    "for a while.");
+
+                OnDropRefused?.Invoke(pending.Slot);
+                return;
+            }
+
+            // Link.Count is what REMAINS in the slot, and zero means the whole stack went
+            // (PlayerObject.cs:6486-6496). Applied to the slot the SERVER named.
+            long remaining = p.Link?.Count ?? 0;
+
+            if (inventory && slot >= 0) Items.NoteSlotCount(slot, remaining);
+
+            if (answersDrop)
+                Log(remaining <= 0
+                    ? $"Dropped all of slot {pending.Slot}."
+                    : $"Dropped part of slot {pending.Slot}, {remaining} left.");
+        }
+
+        /// <summary>The slot of an item use awaiting the server's S.ItemChanged verdict.</summary>
+        private int _pendingUse = -1;
+        private string _pendingUseName;
+        private DateTime _pendingUseAt = DateTime.MinValue;
+
+        /// <summary>
+        /// A normal use answers immediately; a use queued behind the server's auto-potion clock
+        /// answers when UseItemTime opens again. Five seconds covers that delay without allowing a
+        /// genuinely lost answer to stop healing for the rest of the connection.
+        /// </summary>
+        private static readonly TimeSpan ItemUseAnswerWindow = TimeSpan.FromSeconds(5);
+
+        /// <summary>
+        /// The server's own gap between accepted item uses (PlayerObject.cs: `SEnvir.Now <
+        /// UseItemTime` is a bare return, i.e. a silent refusal).
+        ///
+        /// Waiting for the previous VERDICT is not the same as waiting for the previous
+        /// COOLDOWN, and that difference cost a bot its escape route. Wizzler drank a Mana Potion
+        /// at 15:55:21.603, the verdict arrived immediately, so the pending gate opened - and the
+        /// town scroll went out 33ms later, inside the server's one-second window. It was refused,
+        /// the trip decided "the scroll did not move us", and the map was marked scroll-proof.
+        /// Seven refusals in one session landed within a second of an accepted use.
+        ///
+        /// 1100ms rather than 1000: the clock starts server-side, and a round trip is not free.
+        /// </summary>
+        private static readonly TimeSpan ItemUseCooldown = TimeSpan.FromMilliseconds(1100);
+
+        private DateTime _lastAcceptedUse = DateTime.MinValue;
+
+        /// <summary>Told (slot, accepted) for every item use the server answers.</summary>
+        public Action<int, bool> OnItemUseVerdict;
+
+        public bool ItemUsePending => _pendingUse >= 0;
+
+        /// <summary>True while the server's item cooldown would silently refuse another use.</summary>
+        public bool ItemUseOnCooldown =>
+            DateTime.UtcNow - _lastAcceptedUse < ItemUseCooldown;
+
+        /// <summary>
+        /// Release a use whose verdict was lost. A late successful S.ItemChanged is still applied
+        /// by Process even after this correlation record is gone, because the server-supplied slot
+        /// and remaining count stay authoritative.
+        /// </summary>
+        public void CheckPendingItemUse()
+        {
+            if (_pendingUse < 0) return;
+            if (DateTime.UtcNow - _pendingUseAt < ItemUseAnswerWindow) return;
+
+            Log($"Use verdict timed out for {_pendingUseName ?? "item"} in slot {_pendingUse} " +
+                $"after {ItemUseAnswerWindow.TotalSeconds:0}s - allowing another use; any late " +
+                "server verdict will still be applied.");
+
+            _pendingUse = -1;
+            _pendingUseName = null;
+            _pendingUseAt = DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// The only path that sends C.ItemUse. Zircon keeps one delayed manual use while its
+        /// auto-potion clock is active; sending another replaces that delayed request and emits a
+        /// refusal for the first. Keep exactly one outstanding until its slot-specific verdict.
+        /// </summary>
+        private bool TryItemUse(int slot)
+        {
+            if (ItemUsePending) return false;
+            if (ItemUseOnCooldown) return false;
+
+            _pendingUse = slot;
+            _pendingUseName = Items.InSlot(slot)?.Info?.ItemName;
+            _pendingUseAt = DateTime.UtcNow;
+
+            Enqueue(new C.ItemUse
+            {
+                Link = new CellLinkInfo
+                {
+                    GridType = GridType.Inventory,
+                    Slot = slot,
+                    Count = 1
+                }
+            });
+
+            return true;
+        }
+
         /// <summary>
         /// Sales the server threw out whole, this connection.
         ///
@@ -362,17 +603,223 @@ namespace MirBot
 
             SellRefusals++;
 
+            // NAME EVERY SLOT IN THE ORDER, because the server never will.
+            //
+            // Six hypotheses have been argued at this refusal from the outside - an unlock race,
+            // items dropped on death, an unconfirmed unlock, a negative total price, untyped
+            // items, a non-BuySell page - and correlation studies rejected five of them. The one
+            // that survived was found by comparing code, not by inference, and the fix for it made
+            // things worse. That is a long way to go without ever looking at what was in the bag.
+            //
+            // Every remaining way the server can refuse is a bare `return` (PlayerObject.cs:9565-
+            // 9571): the slot is empty, the count exceeds the stack, CanSell is false, the item is
+            // Locked, Marriage-bound or Worthless, or its type is not on the vendor's page. All
+            // six are visible in what we THINK we are holding, so printing that turns the next
+            // refusal into an answer instead of another theory:
+            //
+            //   NOTHING IN MODEL       -> our slot map has a phantom
+            //   offering N of M        -> our count is ahead of the server's
+            //   a flag or odd type     -> our Sellable filter has a hole
+            //   everything looks fine  -> the disagreement is about the slot INDEX
+            System.Text.StringBuilder detail = new System.Text.StringBuilder();
+
+            foreach (CellLinkInfo link in pending)
+            {
+                if (detail.Length > 0) detail.Append(", ");
+
+                ClientUserItem held = Items.InSlot(link.Slot);
+
+                if (held?.Info == null)
+                {
+                    detail.Append($"[{link.Slot}] NOTHING IN MODEL (offered {link.Count})");
+                    continue;
+                }
+
+                detail.Append($"[{link.Slot}] {held.Info.ItemName}");
+
+                if (link.Count != held.Count) detail.Append($" offering {link.Count} of {held.Count}");
+                else detail.Append($" x{held.Count}");
+
+                detail.Append($" {held.Info.ItemType}");
+
+                if (held.Flags != default) detail.Append($" {held.Flags}");
+                if (!held.Info.CanSell) detail.Append(" CANNOTSELL");
+            }
+
+            Log($"Sell REFUSED contents: {detail}");
+
+            OnSellOrderRefused?.Invoke();
+
+            // ONE slot means we know exactly which item is at fault.
+            //
+            // The all-or-nothing rule usually hides the culprit, so the honest response to a
+            // multi-slot refusal is to keep everything and say so. A single-slot order has no such
+            // ambiguity: that item passed every check we can make - CanSell, Locked, Marriage,
+            // Worthless, item part, the vendor's accepted types - and the server still refused it.
+            // Our model of it is wrong in a way we cannot see, most likely a count or an item that
+            // is already gone.
+            //
+            // Without this the slot is offered again at the next vendor, and the next. A taoist
+            // spent thirty-three minutes at 90% bag walking a vendor circuit re-offering the same
+            // refused item, never selling, never hunting. Repeating a refused request unchanged is
+            // the failure this codebase produces most often; the loot and drop paths already have
+            // their own sentences for it, and selling had none.
+            if (pending.Count == 1)
+            {
+                Log($"Sell REFUSED for slot {pending[0].Slot} alone - our model of it must be " +
+                    "wrong, so it is not offered again for a while.");
+
+                OnSellRefused?.Invoke(pending[0].Slot);
+                return;
+            }
+
             Log($"Sell REFUSED by the server: {pending.Count} slot(s), nothing sold. The order is " +
                 "all-or-nothing, so one locked, worthless or already-gone item voids it. Keeping " +
                 "them in the model rather than guessing.");
+        }
+
+        /// <summary>
+        /// The server's verdict on a lock change. The only thing that may clear the flag.
+        ///
+        /// Sent for every lock request it actually performs, and not sent at all for one it
+        /// declines - so its absence is the refusal, and the absence is handled by simply never
+        /// having changed anything.
+        /// </summary>
+        public void Process(S.ItemLock p)
+        {
+            if (p.Grid != GridType.Inventory) return;
+
+            if (p.Locked) Items.NoteLocked(p.Slot);
+            else Items.NoteUnlocked(p.Slot);
+        }
+
+        private EquipRequest _pendingEquip;
+        private (int From, int To, bool Parts, bool Merge)? _pendingDeposit;
+        private (int From, int To, bool Parts)? _pendingWithdraw;
+        private (int From, int To)? _pendingPartMerge;
+
+        /// <summary>Told when the server throws an equip or bank move out.</summary>
+        public Action<string> OnMoveRefused;
+
+        /// <summary>
+        /// The server's verdict on an equip, deposit or withdraw. The ONLY thing that may apply one.
+        ///
+        /// S.ItemMove is enqueued before any validation and has Success set on the same object
+        /// afterwards (PlayerObject.cs:6653-6664) - the pattern S.ItemsChanged already relies on -
+        /// so the answer always arrives and always means something. The bot ignored it entirely and
+        /// applied every move to its own model the moment the request went out.
+        ///
+        /// That is not a cosmetic drift. A level 22 wizard tried to wear a Flame Robe weighing 12
+        /// when its remaining wear allowance was 8 - Wizard L22 has WearWeight 20 and was already
+        /// carrying 23 worn - so the server refused. The bot recorded the robe as worn anyway, and
+        /// from that moment its equipment and inventory disagreed with the server's: the robe was
+        /// in the bag as far as the server was concerned, which shifted every slot after it and
+        /// got the next sell order voided wholesale.
+        ///
+        /// Refusing to guess also fixes the behaviour the operator wanted: an equip that does not
+        /// land leaves the item in the bag, where the ordinary storage rules can deal with it,
+        /// instead of vanishing into a piece of equipment the character is not wearing.
+        /// </summary>
+        public void Process(S.ItemMove p)
+        {
+            EquipRequest equip = _pendingEquip;
+            (int From, int To, bool Parts, bool Merge)? deposit = _pendingDeposit;
+            (int From, int To, bool Parts)? withdraw = _pendingWithdraw;
+            (int From, int To)? partMerge = _pendingPartMerge;
+
+            _pendingEquip = null;
+            _pendingDeposit = null;
+            _pendingWithdraw = null;
+            _pendingPartMerge = null;
+
+            if (!p.Success)
+            {
+                string what = equip != null ? $"equip {equip.ItemName}"
+                    : deposit != null ? $"deposit from slot {deposit.Value.From}"
+                    : withdraw != null ? $"withdraw from slot {withdraw.Value.From}"
+                    : partMerge != null ? $"merge part slot {partMerge.Value.From} into {partMerge.Value.To}"
+                    : $"move {p.FromGrid}:{p.FromSlot} -> {p.ToGrid}:{p.ToSlot}";
+
+                Log($"Move REFUSED by the server: {what}. The model is left alone - whatever we " +
+                    "thought we were moving is still where it was.");
+
+                if (equip != null) Items.NoteEquipRefused(equip);
+
+                OnMoveRefused?.Invoke(what);
+                return;
+            }
+
+            if (equip != null) Items.NoteEquipped(equip);
+            else if (deposit != null)
+                Items.NoteDeposited(deposit.Value.From, deposit.Value.To, deposit.Value.Parts,
+                    deposit.Value.Merge);
+            else if (withdraw != null)
+                Items.NoteWithdrawn(withdraw.Value.From, withdraw.Value.To, withdraw.Value.Parts);
+            else if (partMerge != null)
+                Items.NotePartsMerged(partMerge.Value.From, partMerge.Value.To);
+        }
+
+        private string _pendingBuy;
+        private DateTime _pendingBuyAt;
+
+        /// <summary>
+        /// How long to wait for a purchase to arrive before calling it refused. The server answers
+        /// a successful C.NPCBuy with S.ItemsGained in the same tick, so this is generous.
+        /// </summary>
+        private static readonly TimeSpan BuyAnswerWindow = TimeSpan.FromSeconds(3);
+
+        /// <summary>Told when a purchase was paid for in decisions and never arrived.</summary>
+        public Action<string> OnBuyRefused;
+
+        /// <summary>
+        /// Did the last purchase actually turn up?
+        ///
+        /// C.NPCBuy has no reply of its own: a success produces S.ItemsGained and a refusal
+        /// produces NOTHING - no packet, no flag, at most a chat line nothing here consumes. So
+        /// the bot logged "NPCBuy (1 x Bloody Flower)" and moved on, and nobody could tell the
+        /// difference between a book bought and a book declined.
+        ///
+        /// An assassin bought that book on every town trip for an entire session. It never reached
+        /// the inventory, never reached storage, was never learnt and was never sold - because it
+        /// was never sold TO us. The only trace was a decision line describing a request.
+        ///
+        /// Checked on a timer rather than on the next packet, because the absence is the signal
+        /// and an absence has to be waited for.
+        /// </summary>
+        public void CheckPendingBuy()
+        {
+            if (_pendingBuy == null) return;
+            if (DateTime.UtcNow - _pendingBuyAt < BuyAnswerWindow) return;
+
+            string what = _pendingBuy;
+            _pendingBuy = null;
+
+            Log($"Buy REFUSED by the server: {what} never arrived - no S.ItemsGained followed the " +
+                "order. Gold was not spent; nothing was received.");
+
+            OnBuyRefused?.Invoke(what);
         }
 
         public void Process(S.ItemsGained p)
         {
             if (p.Items == null) return;
 
+            // Whatever arrived, the order was answered.
+            _pendingBuy = null;
+
             foreach (ClientUserItem item in p.Items)
+            {
+                // Experience, quest items and currency are announced here but never land in the
+                // bag. See Backpack.OccupiesASlot.
+                if (!Backpack.OccupiesASlot(item))
+                {
+                    Log($"Gained {item?.Info?.ItemName ?? "something"} x{item?.Count ?? 0} - " +
+                        "not a bag item, so it is not modelled as one.");
+                    continue;
+                }
+
                 Items.Set(item);
+            }
         }
 
         #endregion
@@ -398,16 +845,8 @@ namespace MirBot
             switch (decision.Action)
             {
                 case BotAction.Heal:
-                    Enqueue(new C.ItemUse
-                    {
-                        Link = new CellLinkInfo
-                        {
-                            GridType = GridType.Inventory,
-                            Slot = decision.PotionSlot,
-                            Count = 1
-                        }
-                    });
-                    Items.NoteUsed(decision.PotionSlot);
+                    // NOT applied here - see Process(S.ItemChanged) and Backpack.NoteUsed.
+                    TryItemUse(decision.PotionSlot);
                     break;
 
                 case BotAction.Equip:
@@ -419,7 +858,11 @@ namespace MirBot
                         ToSlot = decision.Equip.ToSlot,
                         MergeItem = false
                     });
-                    Items.NoteEquipped(decision.Equip);
+                    // Remembered, not applied - see Process(S.ItemMove).
+                    _pendingEquip = decision.Equip;
+                    _pendingDeposit = null;
+                    _pendingWithdraw = null;
+                    _pendingPartMerge = null;
                     break;
 
                 case BotAction.Attack:
@@ -451,17 +894,37 @@ namespace MirBot
                     break;
 
                 case BotAction.Unlock:
+                    // Asked for, NOT applied. The flag changes when S.ItemLock says it changed.
+                    //
+                    // This used to clear Locked locally the moment the request went out, which is
+                    // the same optimistic-model mistake that NPCSell had, and it fails the same
+                    // way - except worse, because nothing ever corrected it.
+                    //
+                    // The server's ItemLock handler returns SILENTLY, sending no packet at all,
+                    // when the slot is out of range or holds nothing (PlayerObject.cs:7466-7471).
+                    // So whenever our slot map has drifted, the unlock does nothing, we mark the
+                    // item unlocked anyway, and from then on every sell order containing that slot
+                    // is voided by the server - all-or-nothing, no error, for ever. Only a relog
+                    // fixed it, which is exactly what was observed: a taoist re-offering the same
+                    // refused item at vendor after vendor for thirty-three minutes, 59 refusals to
+                    // the assassin's zero, because casters carry the most locked consumables.
+                    //
+                    // Leaving the flag set when the server stays silent is the safe failure: the
+                    // item is genuinely still locked, Sellable filters it, and no order is spoiled.
                     Enqueue(new C.ItemLock
                     {
                         GridType = GridType.Inventory,
                         SlotIndex = decision.FromSlot,
                         Locked = false
                     });
-                    Items.NoteUnlocked(decision.FromSlot);
                     break;
 
                 case BotAction.Loot:
                     Enqueue(new C.PickUp());
+                    break;
+
+                case BotAction.Butcher:
+                    Enqueue(new C.Harvest { Direction = decision.Direction });
                     break;
 
                 case BotAction.AutoPath:
@@ -499,9 +962,13 @@ namespace MirBot
                         ToGrid = decision.PartsGrid ? GridType.PartsStorage : GridType.Storage,
                         FromSlot = decision.FromSlot,
                         ToSlot = decision.ToSlot,
-                        MergeItem = false
+                        MergeItem = decision.MergeItem
                     });
-                    Items.NoteDeposited(decision.FromSlot, decision.ToSlot, decision.PartsGrid);
+                    _pendingDeposit = (decision.FromSlot, decision.ToSlot, decision.PartsGrid,
+                        decision.MergeItem);
+                    _pendingEquip = null;
+                    _pendingWithdraw = null;
+                    _pendingPartMerge = null;
                     break;
 
                 case BotAction.Withdraw:
@@ -513,7 +980,29 @@ namespace MirBot
                         ToSlot = decision.ToSlot,
                         MergeItem = false
                     });
-                    Items.NoteWithdrawn(decision.FromSlot, decision.ToSlot);
+                    _pendingWithdraw = (decision.FromSlot, decision.ToSlot, decision.PartsGrid);
+                    _pendingEquip = null;
+                    _pendingDeposit = null;
+                    _pendingPartMerge = null;
+                    break;
+
+                case BotAction.MergeParts:
+                    Enqueue(new C.ItemMove
+                    {
+                        FromGrid = GridType.PartsStorage,
+                        ToGrid = GridType.PartsStorage,
+                        FromSlot = decision.FromSlot,
+                        ToSlot = decision.ToSlot,
+                        MergeItem = true
+                    });
+                    _pendingPartMerge = (decision.FromSlot, decision.ToSlot);
+                    _pendingEquip = null;
+                    _pendingDeposit = null;
+                    _pendingWithdraw = null;
+                    break;
+
+                case BotAction.AssemblePart:
+                    TryItemUse(decision.PotionSlot);
                     break;
 
                 case BotAction.NPCRepair:
@@ -536,17 +1025,10 @@ namespace MirBot
                     break;
 
                 case BotAction.LearnBook:
-                    Enqueue(new C.ItemUse
-                    {
-                        Link = new CellLinkInfo
-                        {
-                            GridType = GridType.Inventory,
-                            Slot = decision.PotionSlot,
-                            Count = 1
-                        }
-                    });
-                    // Consumed whether the roll succeeds or fails.
-                    Items.NoteUsed(decision.PotionSlot);
+                    // Consumed whether the LEARNING roll succeeds or fails - but only if the
+                    // server accepted the use at all, which is a different question and the one
+                    // this bot kept getting wrong. See Process(S.ItemChanged).
+                    TryItemUse(decision.PotionSlot);
                     break;
 
                 case BotAction.Logout:
@@ -561,17 +1043,55 @@ namespace MirBot
                     Enqueue(new C.NPCButton { ButtonID = decision.ButtonID });
                     break;
 
+                case BotAction.DropItem:
+                {
+                    long count = Items.CountInSlot(decision.PotionSlot);
+
+                    if (count <= 0)
+                    {
+                        Log($"Drop: slot {decision.PotionSlot} holds nothing we can count.");
+                        break;
+                    }
+
+                    // Remembered, not applied - the server answers with S.ItemChanged and sets
+                    // Success on it. Exactly the mistake NPCSell taught: a refusal that the bot
+                    // records as a success leaves it blind to something it is still carrying.
+                    _pendingDrop = new CellLinkInfo
+                    {
+                        GridType = GridType.Inventory,
+                        Slot = decision.PotionSlot,
+                        Count = count
+                    };
+
+                    _dropDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+
+                    Enqueue(new C.ItemDrop { Link = _pendingDrop, Slot = decision.PotionSlot });
+                    break;
+                }
+
                 case BotAction.NPCSell:
                 {
                     // Skip anything we cannot state a real count for. The server voids the WHOLE
                     // order on a single bad link, so one guessed count costs every other sale in
                     // the same request.
+                    // Whole stack unless the brain asked for part of one, and never more than the
+                    // slot actually holds - the server refuses the ENTIRE order on a single
+                    // link.Count greater than the stack (PlayerObject.cs:9565), silently.
                     List<CellLinkInfo> links = decision.SellSlots
-                        .Select(slot => new CellLinkInfo
+                        .Select(slot =>
                         {
-                            GridType = GridType.Inventory,
-                            Slot = slot,
-                            Count = Items.CountInSlot(slot)
+                            long have = Items.CountInSlot(slot);
+
+                            long want = decision.SellCounts != null &&
+                                        decision.SellCounts.TryGetValue(slot, out long part)
+                                ? part : have;
+
+                            return new CellLinkInfo
+                            {
+                                GridType = GridType.Inventory,
+                                Slot = slot,
+                                Count = Math.Max(0, Math.Min(want, have))
+                            };
                         })
                         .Where(link => link.Count > 0)
                         .ToList();
@@ -592,6 +1112,10 @@ namespace MirBot
                 }
 
                 case BotAction.NPCBuy:
+                    // Remembered so the OUTCOME can be checked - see Process(S.ItemsGained).
+                    _pendingBuy = decision.Reason;
+                    _pendingBuyAt = DateTime.UtcNow;
+
                     Enqueue(new C.NPCBuy
                     {
                         Index = decision.BuyIndex,
@@ -606,16 +1130,7 @@ namespace MirBot
                     break;
 
                 case BotAction.TownTeleport:
-                    Enqueue(new C.ItemUse
-                    {
-                        Link = new CellLinkInfo
-                        {
-                            GridType = GridType.Inventory,
-                            Slot = decision.PotionSlot,
-                            Count = 1
-                        }
-                    });
-                    Items.NoteUsed(decision.PotionSlot);
+                    TryItemUse(decision.PotionSlot);
                     break;
 
                 case BotAction.Flee:

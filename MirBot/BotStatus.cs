@@ -40,6 +40,24 @@ namespace MirBot
     public sealed record ItemStat(string Name, int Amount);
 
     /// <summary>
+    /// One summoned or tamed creature, as the bot currently sees it.
+    ///
+    /// Ownership is the only signal the protocol carries - S.ObjectMonster.PetOwner, a plain
+    /// string - so a pet is simply a monster whose owner name matches ours. There is no packet
+    /// that reports a pet's target, so what it is fighting cannot be shown; distance and health
+    /// are what the world model genuinely knows.
+    /// </summary>
+    public sealed record PetStatus
+    {
+        public string Name { get; init; } = "";
+        public int Level { get; init; }
+        public int Health { get; init; }
+        public int MaxHealth { get; init; }
+        public int HealthPercent { get; init; }
+        public int Distance { get; init; }
+    }
+
+    /// <summary>
     /// One carried, worn or stored item, with enough to render the tooltip the client shows.
     ///
     /// Flattened on the bot thread, as the rule at the top of this file demands: ItemInfo.Stats is
@@ -148,6 +166,14 @@ namespace MirBot
         public int? DestX { get; init; }
         public int? DestY { get; init; }
 
+        /// <summary>none | local | map-wide. Fallback sweep/random roaming report none.</summary>
+        public string ExplorationMode { get; init; } = "none";
+        public int ExplorationVisitedSectors { get; init; }
+        public int ExplorationTotalSectors { get; init; }
+
+        /// <summary>Null means either no exploration target or a sector never visited before.</summary>
+        public string ExplorationTargetLastVisitedUtc { get; init; }
+
         public int BagWeight { get; init; }
         public int MaxBagWeight { get; init; }
         public int BagPercent { get; init; }
@@ -229,6 +255,11 @@ namespace MirBot
 
         public IReadOnlyList<EquipmentStatus> Equipment { get; init; } =
             Array.Empty<EquipmentStatus>();
+
+        /// <summary>The standing order given to pets: Both, Move, Attack, PvP or None.</summary>
+        public string PetMode { get; init; } = "";
+
+        public IReadOnlyList<PetStatus> Pets { get; init; } = Array.Empty<PetStatus>();
         public IReadOnlyList<ItemStatus> Inventory { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<ItemStatus> Storage { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<HistoryStatus> History { get; init; } = Array.Empty<HistoryStatus>();
