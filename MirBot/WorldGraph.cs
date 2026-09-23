@@ -17,6 +17,13 @@ namespace MirBot
         /// <summary>Cells on the source map that trigger the move.</summary>
         public IReadOnlyList<Point> Cells = Array.Empty<Point>();
 
+        /// <summary>
+        /// Roughly where we land on the destination map: the centre of the destination region for
+        /// a walk-on exit (the server picks a random cell in it), the NPC's target spot for a
+        /// teleport. Empty when unknown. Used only to estimate walking distance when planning.
+        /// </summary>
+        public Point Arrival = Point.Empty;
+
         /// <summary>Requirements the server checks on arrival, so we can rule the exit out first.</summary>
         public int MinimumLevel;
         public int MaximumLevel;
@@ -149,12 +156,15 @@ namespace MirBot
                     continue;
                 }
 
+                MapGrid arrivalGrid = maps?.For(destination.Map.Index);
+
                 MapExit exit = new MapExit
                 {
                     FromMapIndex = source.Map.Index,
                     ToMapIndex = destination.Map.Index,
                     ToMapName = destination.Map.Description ?? "",
                     Cells = cells,
+                    Arrival = arrivalGrid == null ? Point.Empty : Centre(Points(destination, arrivalGrid)),
                     MinimumLevel = destination.Map.MinimumLevel,
                     MaximumLevel = destination.Map.MaximumLevel,
                     RequiredClass = destination.Map.RequiredClass,
@@ -208,6 +218,7 @@ namespace MirBot
                     ToMapName = route.ToMapName,
                     Cells = new[] { spot },
                     Teleport = route,
+                    Arrival = route.ToPoint,
                     MinimumLevel = destination?.MinimumLevel ?? 0,
                     MaximumLevel = destination?.MaximumLevel ?? 0,
                     RequiredClass = destination?.RequiredClass ?? RequiredClass.None
@@ -224,6 +235,16 @@ namespace MirBot
         }
 
         public int TeleportCount { get; private set; }
+
+        /// <summary>The cell nearest a region's centroid, so it is always a real cell of it.</summary>
+        private static Point Centre(List<Point> cells)
+        {
+            if (cells.Count == 0) return Point.Empty;
+
+            double cx = cells.Average(c => c.X), cy = cells.Average(c => c.Y);
+
+            return cells.OrderBy(c => (c.X - cx) * (c.X - cx) + (c.Y - cy) * (c.Y - cy)).First();
+        }
 
         private static List<Point> Points(MapRegion region, MapGrid grid)
         {
@@ -301,54 +322,105 @@ namespace MirBot
         /// Maps not to route THROUGH. The destination itself is always allowed - if the caller has
         /// asked to go somewhere, refusing to plan a route there is not our decision to make.
         /// </param>
+        // Route costs, in tiles walked. Tuned so the obvious human choice wins: a 3,000-gold Hexa
+        // Stone hop over a 320-tile walk through Phantom Forest, for a rich bot.
+        public const int UnknownWalkTiles = 80;    // leg start with no known position
+        public const int HopTiles = 15;            // map change: loading, clearing the doorway
+        public const int TeleportTalkTiles = 10;   // walking up to and talking with the NPC
+        public const int TeleportGoldScale = 1000; // tiles = fare * scale / gold held
+
+        /// <summary>
+        /// The cheapest way from here to there, in estimated tiles walked, or null when there is no
+        /// way at all.
+        ///
+        /// Each leg costs the walk from where we enter a map to the exit we leave by, plus a small
+        /// per-hop cost; a teleport adds the talk and its fare relative to the gold we hold (3,000
+        /// gold is 1.5 tiles to a bot with two million, 150 tiles to one with twenty thousand);
+        /// crossing a map adds dangerTiles for it - deaths there, from the caller.
+        ///
+        /// It used to be a breadth-first search on map changes alone. Banya Village to Zuma Temple
+        /// Lv 1 is two changes whether you walk ~320 tiles through Phantom Forest or take the Hexa
+        /// Stone to Sabuk Keep and walk ~160, and the walk won every tie because walk-on exits are
+        /// listed before NPCs. Mirbot died on that walk twice in four minutes.
+        ///
+        /// Every exit is still checked with Allows (level, class, fare, gold floor) and avoid is
+        /// still a hard exclusion; only the choice between legal routes changed.
+        /// </summary>
         public List<MapExit> Route(int fromMapIndex, int toMapIndex, MirClass mirClass, int level,
             long gold = long.MaxValue, long goldFloor = 0, int pkPoints = 0,
-            int maxGoldPercent = 0, HashSet<int> avoid = null)
+            int maxGoldPercent = 0, HashSet<int> avoid = null, Point start = default,
+            Func<int, int> dangerTiles = null)
         {
             if (fromMapIndex == toMapIndex) return new List<MapExit>();
 
-            Queue<int> queue = new Queue<int>();
-            Dictionary<int, MapExit> cameBy = new Dictionary<int, MapExit>();
-            HashSet<int> seen = new HashSet<int> { fromMapIndex };
+            // A state is "on this map, having entered at this point". Entering by different exits
+            // puts us in different places, so states are keyed by the exit used to arrive.
+            List<(int Map, Point At, long Cost, int Previous, MapExit By)> states =
+                new List<(int, Point, long, int, MapExit)> { (fromMapIndex, start, 0, -1, null) };
+            Dictionary<MapExit, long> bestVia = new Dictionary<MapExit, long>();
+            HashSet<int> settled = new HashSet<int>();
+            PriorityQueue<int, long> open = new PriorityQueue<int, long>();
+            open.Enqueue(0, 0);
 
-            queue.Enqueue(fromMapIndex);
-
-            while (queue.Count > 0)
+            while (open.TryDequeue(out int index, out _))
             {
-                int map = queue.Dequeue();
+                if (!settled.Add(index)) continue;
+
+                (int map, Point at, long cost, _, _) = states[index];
+
+                if (map == toMapIndex) return Reconstruct(states, index);
+
+                int danger = map == fromMapIndex ? 0 : Math.Max(0, dangerTiles?.Invoke(map) ?? 0);
 
                 foreach (MapExit exit in ExitsFrom(map))
                 {
-                    if (seen.Contains(exit.ToMapIndex)) continue;
+                    if (exit.ToMapIndex == map) continue;
                     if (!exit.Allows(mirClass, level, gold, goldFloor, pkPoints, maxGoldPercent)) continue;
 
                     if (avoid != null && exit.ToMapIndex != toMapIndex &&
                         avoid.Contains(exit.ToMapIndex)) continue;
 
-                    seen.Add(exit.ToMapIndex);
-                    cameBy[exit.ToMapIndex] = exit;
+                    long next = cost + danger + LegTiles(at, exit, gold);
 
-                    if (exit.ToMapIndex == toMapIndex) return Reconstruct(cameBy, fromMapIndex, toMapIndex);
+                    if (bestVia.TryGetValue(exit, out long known) && known <= next) continue;
+                    bestVia[exit] = next;
 
-                    queue.Enqueue(exit.ToMapIndex);
+                    states.Add((exit.ToMapIndex, exit.Arrival, next, index, exit));
+                    open.Enqueue(states.Count - 1, next);
                 }
             }
 
             return null;
         }
 
-        private static List<MapExit> Reconstruct(Dictionary<int, MapExit> cameBy, int from, int to)
+        /// <summary>Estimated tiles for one leg: walk to the exit from where we stand, then cross.</summary>
+        public static long LegTiles(Point from, MapExit exit, long gold)
+        {
+            long walk = UnknownWalkTiles;
+
+            if (from != Point.Empty && exit.Cells.Count > 0)
+                walk = exit.Cells.Min(c => Math.Max(Math.Abs(c.X - from.X), Math.Abs(c.Y - from.Y)));
+
+            long tiles = walk + HopTiles;
+
+            if (exit.IsTeleport)
+            {
+                tiles += TeleportTalkTiles;
+
+                if (exit.Cost > 0 && gold > 0 && gold != long.MaxValue)
+                    tiles += exit.Cost * TeleportGoldScale / gold;
+            }
+
+            return tiles;
+        }
+
+        private static List<MapExit> Reconstruct(
+            List<(int Map, Point At, long Cost, int Previous, MapExit By)> states, int index)
         {
             List<MapExit> route = new List<MapExit>();
-            int current = to;
 
-            while (current != from)
-            {
-                if (!cameBy.TryGetValue(current, out MapExit exit)) return null;
-
-                route.Add(exit);
-                current = exit.FromMapIndex;
-            }
+            for (int i = index; states[i].Previous >= 0; i = states[i].Previous)
+                route.Add(states[i].By);
 
             route.Reverse();
             return route;

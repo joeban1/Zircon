@@ -47,6 +47,10 @@ namespace MirBot
         public DeathMemory Deaths { get; private set; }
         public LevelMemory Levels { get; private set; }
         public MapTripMemory MapTrips { get; private set; }
+        public ProgressHistory Progress { get; private set; }
+
+        /// <summary>Phone notifications; a disabled no-op until Prepare has run.</summary>
+        public Notifier Notify { get; private set; } = new Notifier(null, null);
         public GoldLog Gold { get; private set; }
         public XpLog Xp { get; private set; }
 
@@ -138,11 +142,33 @@ namespace MirBot
         /// </summary>
         public bool CheckTravel(string destination)
         {
+            // Optional origin: "Banya Village@151,164>Zuma Temple Lv 1". Default is map 1.
             MapInfo from = Globals.MapInfoList.Binding.FirstOrDefault(x => x.Index == 1);
+            System.Drawing.Point start = System.Drawing.Point.Empty;
+
+            int split = destination.IndexOf('>');
+            if (split > 0)
+            {
+                string origin = destination.Substring(0, split).Trim();
+                destination = destination.Substring(split + 1).Trim();
+
+                int at = origin.IndexOf('@');
+                if (at > 0)
+                {
+                    string[] xy = origin.Substring(at + 1).Split(',');
+                    if (xy.Length == 2 && int.TryParse(xy[0], out int sx) && int.TryParse(xy[1], out int sy))
+                        start = new System.Drawing.Point(sx, sy);
+                    origin = origin.Substring(0, at).Trim();
+                }
+
+                from = Globals.MapInfoList.Binding.FirstOrDefault(x =>
+                    string.Equals(x.Description, origin, StringComparison.OrdinalIgnoreCase) ||
+                    x.Index.ToString() == origin);
+            }
 
             if (from == null)
             {
-                Log.Write("No map index 1 to start from.");
+                Log.Write("No origin map to start from.");
                 return false;
             }
 
@@ -173,6 +199,33 @@ namespace MirBot
                 foreach (MapExit exit in route) path += " -> " + exit.ToMapName;
 
                 Log.Write($"  Warrior L{level,-3} {route.Count} map change(s): {path}");
+            }
+
+            // What a real bot would plan: a level 42 Warrior holding 2,000,000 gold, from the
+            // given position, with this class's recorded deaths as crossing danger (150/death).
+            Dictionary<int, int> deaths = Hunting?.DeathsByMap("Warrior", 42) ?? new Dictionary<int, int>();
+            Func<int, int> danger = map => deaths.TryGetValue(map, out int n) ? Math.Min(n * 150, 1500) : 0;
+
+            foreach ((string label, Func<int, int> d) in new[] { ("no danger", (Func<int, int>)null), ("with deaths", danger) })
+            {
+                List<MapExit> planned = World.Route(from.Index, to.Index, MirClass.Warrior, 42,
+                    2_000_000, 0, 0, 0, null, start, d);
+
+                if (planned == null) { Log.Write($"  L42 2M gold {label}: no route."); continue; }
+
+                System.Drawing.Point at = start;
+                long total = 0;
+                string legs = "";
+                foreach (MapExit exit in planned)
+                {
+                    long leg = WorldGraph.LegTiles(at, exit, 2_000_000) +
+                               (exit.FromMapIndex == from.Index ? 0 : Math.Max(0, d?.Invoke(exit.FromMapIndex) ?? 0));
+                    total += leg;
+                    legs += $" -> {exit.ToMapName}{(exit.IsTeleport ? $" [{exit.Teleport.NPC?.NPCName}, {exit.Cost:N0}g]" : "")} ({leg})";
+                    at = exit.Arrival;
+                }
+
+                Log.Write($"  L42 2M gold {label}: {from.Description}{legs} = ~{total} tiles");
             }
 
             int reachable = World.Reachable(from.Index, MirClass.Warrior, 14).Count;
@@ -477,6 +530,11 @@ namespace MirBot
                 return false;
             }
 
+            Notify = new Notifier(first.NotifyWebhookUrl, Log);
+            Log.Write(Notify.Enabled
+                ? "Notify: phone notifications on (Home Assistant webhook)."
+                : "Notify: no NotifyWebhookUrl in the first bot's ini - phone notifications off.");
+
             try
             {
                 GameDatabase.EnsureLoaded(first.DataPath);
@@ -544,6 +602,7 @@ namespace MirBot
             Deaths = new DeathMemory(Path.Combine(memory, "deaths.json"));
             Levels = new LevelMemory(Path.Combine(memory, "levels.json"));
             MapTrips = new MapTripMemory(Path.Combine(memory, "map-trips.json"));
+            Progress = new ProgressHistory(Path.Combine(memory, "progress.json"));
             Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));
             Xp = new XpLog(Path.Combine(memory, "xp.ndjson"));
 
@@ -625,8 +684,41 @@ namespace MirBot
                 // Derived from the file, not from a constant: a re-exported map must not keep
                 // serving last week's shape out of the browser cache.
                 Version = grid.Version,
-                Mask = grid.PackedMask
+                Mask = grid.PackedMask,
+                Doors = DoorsOn(mapIndex)
             };
+        }
+
+        /// <summary>
+        /// Walk-on exits, marked at the cell nearest each region's centre so the marker sits on the
+        /// door itself even when the region is L-shaped. NPC teleports are not doors.
+        /// </summary>
+        private List<MapDoor> DoorsOn(int mapIndex)
+        {
+            List<MapDoor> doors = new List<MapDoor>();
+
+            if (World == null) return doors;
+
+            foreach (MapExit exit in World.ExitsFrom(mapIndex))
+            {
+                if (exit.IsTeleport || exit.Cells == null || exit.Cells.Count == 0) continue;
+
+                double cx = exit.Cells.Average(c => c.X);
+                double cy = exit.Cells.Average(c => c.Y);
+                System.Drawing.Point centre = exit.Cells
+                    .OrderBy(c => (c.X - cx) * (c.X - cx) + (c.Y - cy) * (c.Y - cy))
+                    .First();
+
+                doors.Add(new MapDoor
+                {
+                    X = centre.X,
+                    Y = centre.Y,
+                    To = exit.ToMapName ?? "",
+                    Cells = exit.Cells.Count
+                });
+            }
+
+            return doors;
         }
 
         /// <summary>
@@ -967,13 +1059,21 @@ namespace MirBot
 
             _status = new StatusServer(StatusPort, Log, Snapshot, Command, TravelChoices, BotLogTail,
                 HuntingRows, Deaths.Snapshot, Levels.Snapshot, MapTrips.Snapshot, Gold.Read, MapMaskFor,
-                HostConfig, CommandAll, LootSearch,
+                HostConfig, CommandAll, LootSearch, Progress.Upgrades, Progress.Skills,
                 _instances.FirstOrDefault()?.Config?.StatusExtraHosts ?? "");
 
             // Icons are optional: the folder is normally absent, and the page falls back to
             // coloured tiles. Set here rather than in the constructor so the server needs no
             // opinion about where the bot keeps its memory.
             _status.IconPath = Path.Combine(MemoryFolder, "icons");
+            _status.NotifyStatus = () => new { enabled = Notify.Enabled, recent = Notify.Recent() };
+            _status.NotifyTest = () =>
+            {
+                if (!Notify.Enabled) return false;
+                Notify.Send("host", "MirBot", "test", "MirBot test",
+                    "Sent from the Notifications tab - phone notifications are working.", TimeSpan.Zero);
+                return true;
+            };
             _status.Start();
 
             Log.Write($"Host running with {_instances.Count} bot(s). Ctrl+C to stop.");
@@ -987,6 +1087,7 @@ namespace MirBot
                 Deaths.FlushIfDue();
                 Levels.FlushIfDue();
                 MapTrips.FlushIfDue();
+                Progress.FlushIfDue();
                 Thread.Sleep(500);
             }
 
@@ -1048,6 +1149,7 @@ namespace MirBot
             Deaths.Flush();
             Levels.Flush();
             MapTrips.Flush();
+            Progress.Flush();
         }
 
         public void RequestShutdown() => _shutdown.Cancel();

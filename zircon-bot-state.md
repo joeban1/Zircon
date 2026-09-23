@@ -4,6 +4,145 @@ Last updated: **2026-09-23**. Written as a handover so a fresh session has full 
 re-deriving it. Read [zircon-bot-inventory-model.md](zircon-bot-inventory-model.md) first if you
 are touching items, selling or the bag.
 
+## 2026-09-23 System.db Notice Board/fame update
+
+The active VM master, VM client, desktop client and MirBot data copy now hash-match patched
+`System.db` version `2026.09.23.2` (SHA-256
+`59B0059527480E6A061938B0658FAA92301B36C763E797264A7ABB56AB160E98`). It includes
+missing Bichon Notice Board quest children, donor fame buffs/rewards, and the operator's existing
+shoe PartCount edits from the newer VM master. MirBot PID 18200 loaded this version; after the
+operator restarted the game Server, all eight bots returned to Playing without a version mismatch. Full source,
+backup and validation detail is in [zircon-npc-authoring.md](zircon-npc-authoring.md).
+
+## 2026-09-23 poison restock and cave-descent journeys
+
+- **Jill never bought poison.** `TownTrip.ReagentNeeded` returned one type, amulets first, and one
+  reagent purchase per stop was allowed. Seven/Lennard sell Poison and Amulets on the SAME page and
+  a Taoist is always a few talismans short, so the stop's purchase was always talismans. Now
+  `ReagentsNeeded` returns every short type, the buy step latches per type per stop, and routing
+  adds a seller for each. Verified live: `300 x Green Poison` bought and equipped after the talisman
+  top-up at Seven (16:10:51), then `Cast (Poison Dust on Devouring Ghost)` at 16:15:52.
+- **Journeys died near deep-cave stairs** (22 "no route to the exit" + 30 "stuck N tiles" failures
+  across two log files). Dreadlord, 14:04-14:06: the 90-second fight-through hold was TOTAL time,
+  so it expired mid-pack; the next bumped move made every monster an A* obstacle; one failed search
+  aborted the journey; `EscapeOnScroll` scrolled out at 80% HP; the next choice re-rolled to Flea
+  Cave. Three changes, all only active while `Travel.Active` (on-map roaming untouched):
+  1. When the monster-aware route fails, retry on walls only. If that works and a target is
+     adjacent, fight (holding the stall watchdog only while `WinningFights`) instead of aborting.
+     If walls alone block, try the exit's other cells (`Journey.TryAnotherExitCell`) before
+     aborting.
+  2. `FightThroughSeconds` (90) is now measured from the latest kill; new `FightThroughMaxSeconds`
+     (600) caps one engagement.
+  3. An abandoned hunting journey (not deaths or planning failures) is remembered and resumed at
+     the next travel decision, up to `JourneyRetries` (3) within `JourneyRetryWindowMinutes` (60).
+  Log lines to watch: `boxed in by monsters`, `trying X,Y instead`, `will resume the journey`,
+  `resuming after N failed attempt(s)`, `reached X after N failed attempt(s)`. Not yet observed
+  live at deploy time.
+- 82/82 tests (6 new in `JourneyAndReagentTests`), zero warnings. Backups (runtime and source before
+  and after) are in `C:\HomeServer\mirbot-deploy-backups\2026-09-23-reagents-journey`. Host PID
+  34564, all eight bots Playing.
+- **Follow-up, 18:14 deploy: travelling loot filter.** Observed 17:02-18:10: fix 2 held fights
+  95-274s (past the old 90s cut-off) and Dreadlord reached Flea Cave Lv 2, but Wizzler's three
+  Deserted Mine Lv 2 runs each ended at 45/48 slots, 43-91 tiles from the stairs (up to 121
+  pickups per run) and restarted from the entrance. While `Travel.Active`, `ScriptedBrain.
+  FindWorthwhileLoot` now also requires `Backpack.WorthLootingOnJourney`: books, item parts, real
+  health/mana potions, town scrolls, gold, gear upgrades, or sale value >= `JourneyLootMinValue`
+  (1500). Off below `PoorGold` and while poverty recovery is active (`ScriptedBrain.InRecovery`).
+  Also logs fix 1's previously silent walls-only branch (`route blocked by creatures`). 84/84
+  tests; backups in `mirbot-deploy-backups\2026-09-23-journey-loot`; host PID 17200.
+- **18:27 refinement:** the first run still filled 20 slots in five minutes, mostly other-class
+  books (1,000 gold, one slot each) and weightless Zombie Bone. While travelling, books now pass
+  only with a `MagicBooks.Judge` verdict of Wanted/TooEarly; other books face the price rule.
+  The free pass is limited to `ItemType.Currency` and items that `OccupiesASlot` says take no slot.
+  86/86 tests; backups in `2026-09-23-journey-books`; host PID 18552.
+- **18:32:** Wizzler reached Deserted Mine Lv 2 in 3.5 minutes (11->12 slots) after four
+  bag-full failures earlier in the evening.
+- **19:24 deploy (stackables, doors, route line):** while travelling, any stackable
+  (`StackSize > 1`: bones, husks, gems, eggs; books and ores never stack here) is taken
+  regardless of price. `/api/map` now carries `doors` (walk-on `MapExit` regions: centre cell,
+  destination, cell count; NPC teleports excluded), drawn as labelled purple squares on the status
+  minimap. `/api/status` carries `route` (flattened x,y pairs of the A* path from
+  `ScriptedBrain.TrySteer`, trimmed to ~200 points, stale after 3s) and `routeKind`
+  (travel/town/target/roam/loot/move), drawn as a coloured line with the heading cross matching.
+  Page JS was syntax-checked with Node and rendered in headless Edge. 88/88 tests; backups in
+  `2026-09-23-map-route`; host PID 28328.
+- **20:44 deploy (Info filters):** Map selections and trips gained search, character,
+  destination and status (active/left/never arrived) filters over 2,000 rows; Recent deaths gained
+  search, character, map and killer filters over 500 rows. Dropdowns only rebuild when their
+  options change, so the 30s refresh no longer closes an open one. Verified by driving headless
+  Edge over CDP. Host PID 29476; backups in `2026-09-23-info-filters`.
+
+- **21:00 deploy (phone notifications):** new `Notifier` (queued background HTTP POST to a Home
+  Assistant webhook) hooked into level-up, confirmed upgrade, successful skill, death, terminal
+  fault/exception and a once-per-drought idle alert. Settings and setup are in the runbook's
+  "Phone notifications" section. 90/90 tests (2 new in `NotifierTests`); ini and binaries backed
+  up in `2026-09-23-notify`; host PID 55160.
+- **21:35 deploy (Notifications tab):** a dedicated tab with switches for each type, the
+  idle-minutes control, a test button and recent-notification history with outcomes. The first
+  build had a race: saving a switch re-read `/api/config` before the bots had applied the queued
+  change, so the switch flipped back and the next click inverted the setting. It now holds the new
+  value until the bots agree (10s cap). Fixed and verified through a temporary `status.html`,
+  then compiled in and the override removed. The Notify settings are back to their defaults.
+  Backups in `2026-09-23-notify-tab`; host PID 10704.
+
+- **22:10 deploy (route costing + trip deaths):** Mirbot died three times crossing Phantom Forest
+  (20:21, 20:24, 21:03) on the way to Zuma Temple Lv 1 / Red Moon Valley Lv 1. Two causes:
+  `WorldGraph.Route` was a BFS on map changes only, and on a tie walk-on exits (listed before
+  NPCs) won, so Banya -> Phantom Forest -> Zuma (~320 tiles) beat Banya -> Hexa Stone (3,000g) ->
+  Sabuk Keep -> Zuma (~160). And `Lethal()` exempts any map with a measured rate; since deaths
+  close the XP window, 4 minutes of kills between 3 deaths read as 1.46M exp/h, so the map was
+  never avoided. (The Phantom Forest -> Zuma exit is real - operator checked in game.)
+  Now `Route` is a cost search in estimated tiles: walk from entry point (new `MapExit.Arrival`)
+  to exit, +15 per hop, teleports +10 plus fare x 1000 / gold held, plus `Journey.DangerTiles`
+  for maps crossed = 150 per death of this class (`HuntingMemory.DeathsByMap`, own and previous
+  band, no has-paid exemption), capped at 1,500. `Lethal()`/`Avoid` and hunting choice unchanged.
+  `--check-travel` accepts `"Origin@x,y>Destination"` and prints L42/2M-gold routes with leg costs.
+  Map trips now close as `died on the way in <map> (<killer>)` or `died (<killer>)` at death.
+  Verified live at 22:11: Mirbot to Zuma Temple planned `Banya Village to Sabuk Keep via Hexa
+  Holy Stone for 3,000 gold`. 93/93 tests (3 new `RoutePlanningTests`); backups in
+  `2026-09-23-route-cost`; host PID 50052.
+
+## Bosses and mini-bosses in System.db (checked 2026-09-23)
+
+There is **no mini-boss flag**. `MonsterInfo.Flag` is `None` for all of them, and
+`IsBoss` is set on 68 monsters, 65 of which are also level 250 (the level is a boss marker, not
+difficulty). What separates mini-bosses from real bosses is the spawn data (read with the new
+`SPAWNDUMP_MONSTERFIELDS=1` mode, run against a copy of System.db):
+
+| Kind | Examples | HP | Spawns | Respawn |
+| --- | --- | --- | --- | --- |
+| Mini-boss | Ghoul Champion (Deserted Mine Lv 3), Skeleton Lord, Terror Spike, Oma Hero, Ant Commander | 330-7,700 | 2-8 | mostly 30 min |
+| Boss | Arch Lich Taedu, Zuma King, Emperor Sa'Woo, Uma King, Red Moon The Fallen | 13,000+ | 1 | 120-360 min |
+
+A workable rule: `IsBoss && spawnCount >= 2 && maxDelay <= 60` = mini-boss (Chaos Knight,
+1 spawn / 40 min / 6,600 HP, is the borderline case).
+- **Open:** after restart every bot logged `System.db version mismatch - bot has 2026.09.22.3,
+  server has 2026.09.23.1`. The 14:11 session had no warning, so the server master changed later
+  that day; the desktop client and MirBot copies are still the identical 09.22.3 file.
+
+## 2026-09-23 Info-tab progress logs and part lookup
+
+- The Info tab now has **Upgrades** and **Skills** tables, both filterable by character. Confirmed
+  equipment replacements are recorded only after a successful `S.ItemMove`, with prior/new item
+  names and the class-specific score delta; empty-slot equips and reagent merges are excluded.
+  Book attempts use the existing three-second outcome check and record success/failure with bot,
+  character, class and attempt time. Both feeds persist in `memory/progress.json` and are served by
+  `/api/upgrades` and `/api/skills-history`. The host's periodic and shutdown flush include it.
+- On first launch with no progress history, dated `LearnBook` and `Learned`/`LEARN REFUSED` pairs
+  are imported idempotently from the current bot log and its two rotations. This launch imported
+  19 skill outcomes. Undated lines are skipped. Historic `Equip` lines are **requests**, not server
+  verdicts, so they cannot safely be backfilled as confirmed upgrades.
+- The Loot decision now uses the ground packet's full item instance and `Backpack.Describe` to
+  name a part by its target, e.g. `Iron Shield (part 1/5)`, so future drop-lookup searches can find
+  it. Older `Loot ([Part])` lines lack target metadata and remain generic. The server's
+  `ItemObject.GetInfoPacket` sends the full client item, including added stats; the bot retains it
+  when later data packets update the ground object.
+- Deployment passed 76/76 tests and a warning-free Release build; the previous runtime binaries
+  are in `C:\HomeServer\mirbot-deploy-backups\2026-09-23-progress-history`. The hidden host was
+  restarted, and all eight bots returned to Playing with no reported faults. The served page
+  contains both tables and the Skills API returned 19 backfilled rows. A live future gear
+  replacement/part pickup has not yet occurred in this verification window.
+
 ## 2026-09-22 base bag-weight parity
 
 - The VM server master at `C:\ZirconBuild\Debug\Server\Database\System.db` was the source of

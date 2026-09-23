@@ -52,6 +52,8 @@ namespace MirBot
         private readonly Func<int, List<DeathRow>> _deaths;
         private readonly Func<int, List<LevelRow>> _levels;
         private readonly Func<int, List<MapTripEntry>> _mapTrips;
+        private readonly Func<int, List<ProgressEntry>> _upgrades;
+        private readonly Func<int, List<ProgressEntry>> _skills;
         private readonly Func<string, List<GoldPoint>> _gold;
         private readonly Func<int, MapMask> _map;
         private readonly Func<List<HostConfigField>> _config;
@@ -59,6 +61,11 @@ namespace MirBot
         private readonly Func<string, int, List<LootRow>> _loot;
         private readonly BotLog _hostLog;
         private readonly int _port;
+
+        /// <summary>Phone notifications: status/history for the Notifications tab, and a test send.
+        /// Set by the host after construction; the tab reports "unavailable" while null.</summary>
+        public Func<object> NotifyStatus;
+        public Func<bool> NotifyTest;
 
         private Thread _thread;
         private volatile bool _stopping;
@@ -78,6 +85,8 @@ namespace MirBot
             Func<List<HostConfigField>> config,
             Func<BotCommandKind, string, int> commandAll,
             Func<string, int, List<LootRow>> loot,
+            Func<int, List<ProgressEntry>> upgrades,
+            Func<int, List<ProgressEntry>> skills,
             string extraHosts = "")
         {
             _port = port;
@@ -91,6 +100,8 @@ namespace MirBot
             _deaths = deaths;
             _levels = levels;
             _mapTrips = mapTrips;
+            _upgrades = upgrades;
+            _skills = skills;
             _gold = gold;
             _map = map;
             _config = config;
@@ -299,6 +310,18 @@ namespace MirBot
                 return;
             }
 
+            if ((path == "/api/upgrades" || path == "/api/skills-history") && !post)
+            {
+                int take = 200;
+                string rawTake = context.Request.QueryString["take"];
+                if (rawTake != null && int.TryParse(rawTake, out int parsedTake))
+                    take = Math.Clamp(parsedTake, 1, 2000);
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(path == "/api/upgrades"
+                        ? _upgrades(take) : _skills(take), Json));
+                return;
+            }
+
             // WHERE DID THIS EVER DROP? Answered from the log, which is the only place a loot
             // event is recorded. Bounded by take and by the search string being non-empty, so an
             // accidental request cannot ask the host to serialise every loot it has ever seen.
@@ -381,6 +404,27 @@ namespace MirBot
 
                 Send(context, taken > 0 ? 202 : 503, "application/json; charset=utf-8",
                     JsonSerializer.Serialize(new { ok = taken > 0, key, value, bots = taken }, Json));
+                return;
+            }
+
+            if (path == "/api/notify" && !post)
+            {
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(NotifyStatus?.Invoke() ?? new { enabled = false, recent = Array.Empty<object>() }, Json));
+                return;
+            }
+
+            if (path == "/api/notify/test" && post)
+            {
+                if (!Authorised(context)) { TryFail(context, 403, "forbidden"); return; }
+
+                bool queued = NotifyTest?.Invoke() ?? false;
+                Send(context, queued ? 202 : 503, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(new
+                    {
+                        ok = queued,
+                        error = queued ? null : "notifications are not configured (no NotifyWebhookUrl)"
+                    }, Json));
                 return;
             }
 

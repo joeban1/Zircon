@@ -49,7 +49,9 @@ namespace MirBot
         private bool _boughtPotions;
         private bool _boughtMana;
         private bool _boughtTorch;
-        private bool _boughtReagents;
+        // Per reagent TYPE, per stop: one vendor page sells both amulets and poison, and a single
+        // flag let the amulet top-up use the stop's only reagent purchase every time.
+        private readonly HashSet<ItemType> _reagentsTried = new HashSet<ItemType>();
         private bool _repaired;
         private bool _repairedSpecial;
         private bool _boughtBook;
@@ -358,7 +360,7 @@ namespace MirBot
             _boughtPotions = false;
             _boughtMana = false;
             _boughtTorch = false;
-            _boughtReagents = false;
+            _reagentsTried.Clear();
             _boughtGear = false;
             _postBankSaleNeeded = false;
             _postBankSaleActive = false;
@@ -1076,14 +1078,12 @@ namespace MirBot
                     // Bought before books, because a spell we already own and cannot fire is worth
                     // more than one we do not own yet. Only for characters whose magics consume
                     // them, so a warrior never carries any.
-                    if (!_boughtReagents && _config.BuyReagents)
+                    if (_config.BuyReagents)
                     {
-                        _boughtReagents = true;
-
-                        ItemType needed = ReagentNeeded(world, items);
-
-                        if (needed != ItemType.Nothing)
+                        foreach (ItemType needed in ReagentsNeeded(world, items))
                         {
+                            if (!_reagentsTried.Add(needed)) continue;
+
                             NPCGood good = CheapestOfType(needed);
 
                             // Budgeted, not merely affordable. Buying every reagent the purse
@@ -1745,17 +1745,22 @@ namespace MirBot
             // itinerary past no poison vendor and carry on casting Poison Dust into an empty
             // equipment slot - the server consumes nothing, reports nothing, and the spell simply
             // does not happen.
-            ItemType reagent = ReagentNeeded(world, items);
-
-            if (_config.BuyReagents && reagent != ItemType.Nothing)
+            if (_config.BuyReagents)
             {
-                VendorEntry seller = _directory.BestSellerOf(reagent, mapIndex);
+                List<string> reagentPlan = new List<string>();
 
-                if (seller != null && !_itinerary.Contains(seller)) _itinerary.Enqueue(seller);
+                foreach (ItemType reagent in ReagentsNeeded(world, items))
+                {
+                    VendorEntry seller = _directory.BestSellerOf(reagent, mapIndex);
 
-                ReagentDiagnostic = seller == null
-                    ? $"short of {reagent} and nobody here sells it"
-                    : $"short of {reagent}, calling at {seller.NPC?.NPCName}";
+                    if (seller != null && !_itinerary.Contains(seller)) _itinerary.Enqueue(seller);
+
+                    reagentPlan.Add(seller == null
+                        ? $"short of {reagent} and nobody here sells it"
+                        : $"short of {reagent}, calling at {seller.NPC?.NPCName}");
+                }
+
+                if (reagentPlan.Count > 0) ReagentDiagnostic = string.Join("; ", reagentPlan);
             }
 
             foreach (VendorEntry restocker in restockers)
@@ -2218,7 +2223,7 @@ namespace MirBot
                 // a vendor, so it fires once per stop rather than once per dialogue page.
                 _sold = _boughtScrolls = _boughtPotions = _boughtGear = _boughtMana = false;
                 _boughtTorch = false;
-                _boughtReagents = false;
+                _reagentsTried.Clear();
                 _repaired = _repairedSpecial = false;
             }
         }
@@ -2412,21 +2417,24 @@ namespace MirBot
         /// which was not checked against anything at all.
         /// </summary>
         /// <summary>
-        /// The reagent this character is short of, or Nothing.
+        /// Every reagent this character is short of, amulets first.
         ///
         /// Driven by what it KNOWS, not by its class: a Taoist who has not learnt a summon or a
         /// poison yet has no use for either, and buying speculatively wastes gold a low-level
-        /// caster does not have. Amulets come first because far more spells consume them.
+        /// caster does not have. ALL short types are returned: a Taoist spends talismans every
+        /// trip, so a first-short-only answer said "Amulet" for ever and poison was never bought.
         /// </summary>
-        private ItemType ReagentNeeded(WorldModel world, Backpack items)
+        internal List<ItemType> ReagentsNeeded(WorldModel world, Backpack items)
         {
+            List<ItemType> needed = new List<ItemType>(2);
+
             if (NeedsAmulet(world) && items.CountReagent(ItemType.Amulet) < _config.ReagentReserve)
-                return ItemType.Amulet;
+                needed.Add(ItemType.Amulet);
 
             if (NeedsPoison(world) && items.CountReagent(ItemType.Poison) < _config.ReagentReserve)
-                return ItemType.Poison;
+                needed.Add(ItemType.Poison);
 
-            return ItemType.Nothing;
+            return needed;
         }
 
         /// <summary>

@@ -735,6 +735,8 @@ namespace MirBot
 
         /// <summary>Told when the server throws an equip or bank move out.</summary>
         public Action<string> OnMoveRefused;
+        /// <summary>Raised only after the server confirms a strictly better replacement.</summary>
+        public Action<string, string, int> OnUpgradeConfirmed;
 
         /// <summary>
         /// The server's verdict on an equip, deposit or withdraw. The ONLY thing that may apply one.
@@ -784,7 +786,17 @@ namespace MirBot
                 return;
             }
 
-            if (equip != null) Items.NoteEquipped(equip);
+            if (equip != null)
+            {
+                ClientUserItem previous = Items.Worn.FirstOrDefault(x => x.Key == equip.ToSlot).Value;
+                ClientUserItem incoming = Items.InSlot(equip.FromSlot);
+                int gain = previous != null && incoming != null
+                    ? Backpack.Score(incoming, World.Class) - Backpack.Score(previous, World.Class)
+                    : 0;
+                if (!equip.Merge && gain > 0)
+                    OnUpgradeConfirmed?.Invoke(previous.Info.ItemName, incoming.Info.ItemName, gain);
+                Items.NoteEquipped(equip);
+            }
             else if (deposit != null)
                 Items.NoteDeposited(deposit.Value.From, deposit.Value.To, deposit.Value.Parts,
                     deposit.Value.Merge);

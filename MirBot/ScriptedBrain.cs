@@ -287,6 +287,9 @@ namespace MirBot
         /// </summary>
         public bool FrugalRecoveryCombat;
 
+        /// <summary>Poverty recovery is active anywhere, not only on the recovery maps.</summary>
+        public bool InRecovery;
+
         public Decision Decide(WorldModel world, Backpack items, bool itemUsePending)
         {
             // Why this tick produced nothing, for the caller to surface. A bot that decides
@@ -760,7 +763,7 @@ namespace MirBot
                         // No route at all. Stand still rather than issue a move with no direction,
                         // and let TownTrip's own progress watchdog abort the trip - it is the only
                         // code that knows how to unwind one.
-                        if (!TrySteer(trip, world, trip.Destination, 0, remaining))
+                        if (!TrySteer(trip, world, trip.Destination, 0, remaining, routeKind: "town"))
                             return new Decision
                             {
                                 Action = BotAction.Idle,
@@ -822,9 +825,66 @@ namespace MirBot
 
                     leg.Action = BotAction.Approach;
 
-                    if (!TrySteer(leg, world, leg.Destination, 0, remaining))
+                    if (TrySteer(leg, world, leg.Destination, 0, remaining, routeKind: "travel"))
                     {
-                        Travel.Abort($"no route to the exit at {leg.Destination.X},{leg.Destination.Y}");
+                        _saidBoxedIn = false;
+                        _saidCrowdStep = false;
+                        return leg;
+                    }
+
+                    // A route that fails only because creatures fill the gaps is a crowd, not a
+                    // wall. After one bumped move every monster counts as an obstacle, so a bot
+                    // surrounded 41 tiles from Deserted Mine's stairs found "no route", abandoned
+                    // the journey and scrolled home at 80% HP while winning every fight.
+                    if (_blockedMoves > 0 &&
+                        TrySteer(leg, world, leg.Destination, 0, remaining, ignoreCreatures: true, routeKind: "travel"))
+                    {
+                        if (!AdjacentTarget(world))
+                        {
+                            if (!_saidCrowdStep)
+                            {
+                                _saidCrowdStep = true;
+                                BrainLog?.Invoke($"Travel: route blocked by creatures on " +
+                                                 $"{world.MapName} - stepping along the bare-map " +
+                                                 "route instead of abandoning the journey.");
+                            }
+
+                            return leg;
+                        }
+
+                        // Only a fight we are winning holds off the journey's stall watchdog;
+                        // one we are not still ends in "stuck" and the usual escape.
+                        if (WinningFights(world)) Travel.NoteFightingThrough();
+
+                        if (!_saidBoxedIn)
+                        {
+                            _saidBoxedIn = true;
+                            BrainLog?.Invoke($"Travel: boxed in by monsters on {world.MapName} " +
+                                             "- clearing a way rather than abandoning the journey.");
+                        }
+                        // Fall through to combat.
+                    }
+                    else
+                    {
+                        Point unreachable = leg.Destination;
+
+                        while (Travel.TryAnotherExitCell(world))
+                        {
+                            leg.Destination = Travel.Aim;
+                            remaining = WorldModel.Distance(world.Location, leg.Destination);
+
+                            if (!TrySteer(leg, world, leg.Destination, 0, remaining,
+                                    ignoreCreatures: true, routeKind: "travel"))
+                                continue;
+
+                            leg.Reason = $"{Travel.Status} ({remaining} tiles)";
+                            BrainLog?.Invoke($"Travel: no route to the exit cell at " +
+                                             $"{unreachable.X},{unreachable.Y} - trying " +
+                                             $"{leg.Destination.X},{leg.Destination.Y} instead.");
+                            return leg;
+                        }
+
+                        Travel.Abort($"no route to the exit at {unreachable.X},{unreachable.Y}");
                         return new Decision
                         {
                             Action = BotAction.Idle,
@@ -832,8 +892,6 @@ namespace MirBot
                             Subject = "travel failed"
                         };
                     }
-
-                    return leg;
                 }
             }
 
@@ -1194,7 +1252,7 @@ namespace MirBot
                 bool blocked = _blockedMoves >= 6;
                 bool futile = NoProgressTowards(target.ObjectID, distance);
                 bool noRoute = !blocked && !futile &&
-                               !TrySteer(approach, world, target.Location, 1, distance);
+                               !TrySteer(approach, world, target.Location, 1, distance, routeKind: "target");
 
                 if (blocked || futile || noRoute)
                 {
@@ -1395,8 +1453,60 @@ namespace MirBot
         /// sidestepping when blocked, and always returns true because it genuinely cannot tell.
         /// </summary>
         private bool TrySteer(Decision decision, WorldModel world, Point destination, int goalRange,
-            int straightDistance)
+            int straightDistance, bool ignoreCreatures = false, string routeKind = "move")
         {
+            bool steered = Steer(decision, world, destination, goalRange, straightDistance,
+                ignoreCreatures, out List<Point> path);
+
+            if (steered)
+            {
+                _route = RouteSnapshot(path, destination);
+                _routeKind = routeKind;
+                _routeAt = DateTime.UtcNow;
+            }
+
+            return steered;
+        }
+
+        private Point[] _route = Array.Empty<Point>();
+        private string _routeKind = "";
+        private DateTime _routeAt = DateTime.MinValue;
+
+        /// <summary>
+        /// The route the bot last steered along, for the status map: town, travel, target, roam,
+        /// loot or move. Empty once it is a few seconds old, so a bot that has stopped walking
+        /// does not keep showing where it used to be going.
+        /// </summary>
+        public (Point[] Cells, string Kind) CurrentRoute =>
+            DateTime.UtcNow - _routeAt < TimeSpan.FromSeconds(3)
+                ? (_route, _routeKind)
+                : (Array.Empty<Point>(), "");
+
+        /// <summary>
+        /// At most ~200 points so eight bots polled every second stay cheap: long routes keep every
+        /// Nth step plus the final cell. With no grid (straight-line steering) it is just the goal.
+        /// </summary>
+        internal static Point[] RouteSnapshot(List<Point> path, Point destination)
+        {
+            if (path == null) return new[] { destination };
+            if (path.Count == 0) return Array.Empty<Point>();
+
+            const int max = 200;
+            if (path.Count <= max) return path.ToArray();
+
+            int step = (path.Count + max - 1) / max;
+            List<Point> kept = new List<Point>(max + 1);
+
+            for (int i = 0; i < path.Count; i += step) kept.Add(path[i]);
+            if (kept[kept.Count - 1] != path[path.Count - 1]) kept.Add(path[path.Count - 1]);
+
+            return kept.ToArray();
+        }
+
+        private bool Steer(Decision decision, WorldModel world, Point destination, int goalRange,
+            int straightDistance, bool ignoreCreatures, out List<Point> route)
+        {
+            route = null;
             MapGrid grid = Maps?.For(world.MapIndex);
 
             if (grid != null)
@@ -1404,7 +1514,7 @@ namespace MirBot
                 // Only route around other creatures once something has actually stopped us. Doing
                 // it always makes a monster standing in a doorway look like a wall, and the extra
                 // set costs a full sweep of the object list on every decision.
-                HashSet<Point> avoid = _blockedMoves > 0
+                HashSet<Point> avoid = _blockedMoves > 0 && !ignoreCreatures
                     ? world.OccupiedCells(decision.TargetID)
                     : null;
 
@@ -1478,6 +1588,8 @@ namespace MirBot
                 List<Point> path = PathFinder.Find(grid, world.Location, destination, goalRange, avoid);
 
                 if (path == null) return false;
+
+                route = path;
 
                 // Already there - let the caller's own arrival handling deal with it.
                 if (path.Count == 0)
@@ -1639,7 +1751,7 @@ namespace MirBot
             };
 
             // No route to the spot we picked - it is not worth a second search, so hunt from here.
-            if (!TrySteer(step, world, _doorwayAim, 0, remaining))
+            if (!TrySteer(step, world, _doorwayAim, 0, remaining, routeKind: "roam"))
             {
                 _doorwayAim = Point.Empty;
                 return null;
@@ -1842,7 +1954,7 @@ namespace MirBot
                 Destination = spot
             };
 
-            if (!TrySteer(step, world, spot, 0, remaining)) return null;
+            if (!TrySteer(step, world, spot, 0, remaining, routeKind: "roam")) return null;
 
             KitesMade++;
             return step;
@@ -2140,7 +2252,7 @@ namespace MirBot
 
             // No route: the spot is walkable but walled off from here. Forget it and drift this
             // turn rather than searching again on the bot's own thread.
-            if (!TrySteer(step, world, _roamTarget, 0, remaining))
+            if (!TrySteer(step, world, _roamTarget, 0, remaining, routeKind: "roam"))
             {
                 if (IsCoverageTarget)
                     AbandonExploration(world, "no route", SweepSentence);
@@ -2255,6 +2367,8 @@ namespace MirBot
         /// <summary>When the current journey leg first had to stop and fight.</summary>
         private DateTime _fightingThroughSince = DateTime.MinValue;
         private bool _saidFightingThrough;
+        private bool _saidBoxedIn;
+        private bool _saidCrowdStep;
 
         /// <summary>
         /// Should travel stand down this tick and let combat run?
@@ -2372,13 +2486,42 @@ namespace MirBot
             if (_fightingThroughSince == DateTime.MinValue)
                 _fightingThroughSince = DateTime.UtcNow;
 
-            if (_config.FightThroughSeconds > 0 &&
-                DateTime.UtcNow - _fightingThroughSince >
-                    TimeSpan.FromSeconds(_config.FightThroughSeconds))
-                return false;   // still fighting, but stop shielding the journey from its watchdog
+            // Still fighting, but stop shielding the journey from its watchdog: after a stretch
+            // with no kill, or after the hard ceiling however well it is going.
+            if (!FightThroughProgressing(world, _fightingThroughSince, DateTime.UtcNow,
+                    _config.FightThroughSeconds, _config.FightThroughMaxSeconds))
+                return false;
 
             return true;
         }
+
+        /// <summary>
+        /// Is a fight-through still earning its hold on the journey? Measured from the later of
+        /// the engagement's start and the last kill, so a bot clearing a pack keeps its shield
+        /// and one trading blows with something it cannot kill loses it.
+        /// </summary>
+        internal static bool FightThroughProgressing(WorldModel world, DateTime since, DateTime now,
+            int idleSeconds, int maxSeconds)
+        {
+            if (maxSeconds > 0 && now - since > TimeSpan.FromSeconds(maxSeconds)) return false;
+            if (idleSeconds <= 0) return true;
+
+            DateTime progress = world.LastExperienceGainUtc > since
+                ? world.LastExperienceGainUtc
+                : since;
+
+            return now - progress <= TimeSpan.FromSeconds(idleSeconds);
+        }
+
+        /// <summary>Killed something recently enough that the fight is going our way.</summary>
+        private bool WinningFights(WorldModel world) =>
+            world.LastExperienceGainUtc != DateTime.MinValue &&
+            DateTime.UtcNow - world.LastExperienceGainUtc <=
+                TimeSpan.FromSeconds(_config.FightThroughSeconds > 0 ? _config.FightThroughSeconds : 90);
+
+        /// <summary>A live monster we could attack standing right next to us.</summary>
+        private static bool AdjacentTarget(WorldModel world) =>
+            world.Objects.Any(ob => ob.IsValidTarget && world.DistanceTo(ob.Location) <= 1);
 
         /// <summary>Nothing in contact: clear the fight-through clock and let travel proceed.</summary>
         private bool Settle()
@@ -2744,11 +2887,40 @@ namespace MirBot
                         _config.HealthPotionTarget(world.MaxBagWeight, unit),
                         _config.ManaPotionTarget(world.MaxBagWeight, unit),
                         world.Gold, _lootValue))
-                    return candidate;
+                {
+                    if (!JourneyLootFilter(world) ||
+                        _items.WorthLootingOnJourney(candidate.ItemInfo, candidate.Item, world.Class,
+                            _config.JourneyLootMinValue, Books, world))
+                        return candidate;
+
+                    if (!_saidJourneyLoot)
+                    {
+                        _saidJourneyLoot = true;
+                        BrainLog?.Invoke($"Travel: leaving cheap drops (e.g. {candidate.Name}) - " +
+                                         $"only learnable books, parts, stackables, potions, upgrades and items worth " +
+                                         $"{_config.JourneyLootMinValue:N0}+ gold while travelling.");
+                    }
+                }
 
                 skip.Add(candidate.ObjectID);
             }
         }
+
+        /// <summary>
+        /// Loot strictly while a journey is under way - unless poor, when every sale counts and
+        /// poverty recovery owns the decision.
+        /// </summary>
+        private bool JourneyLootFilter(WorldModel world)
+        {
+            bool on = Travel != null && Travel.Active && _config.JourneyLootMinValue > 0 &&
+                      !InRecovery && world.Gold >= _config.PoorGold;
+
+            if (!on) _saidJourneyLoot = false;
+
+            return on;
+        }
+
+        private bool _saidJourneyLoot;
 
         /// <summary>
         /// Stay on the current target until it dies, escapes, or proves unreachable. Only then pick
@@ -3105,7 +3277,7 @@ namespace MirBot
             };
 
             // goalRange 1: harvesting is done from an adjacent tile, facing the corpse.
-            if (!TrySteer(walk, world, corpse.Location, 1, best))
+            if (!TrySteer(walk, world, corpse.Location, 1, best, routeKind: "loot"))
             {
                 // Cannot reach it this tick. Spend an attempt rather than orbiting it for ever -
                 // the loot path learned this lesson the expensive way.
@@ -3152,7 +3324,10 @@ namespace MirBot
                     return null;
                 }
 
-                return new Decision { Action = BotAction.Loot, Reason = item.Name, Subject = item.Name };
+                // The ground packet carries the full instance, including ItemIndex for a [Part].
+                // Show its actual target rather than making every part drop look identical.
+                string lootName = item.Item != null ? Backpack.Describe(item.Item) : item.Name;
+                return new Decision { Action = BotAction.Loot, Reason = lootName, Subject = lootName };
             }
 
             Decision walk = new Decision
@@ -3165,7 +3340,7 @@ namespace MirBot
 
             // goalRange 0: PickUp works from where we stand, so we have to reach the tile itself.
             if (_blockedMoves >= 6 || NoProgressTowards(item.ObjectID, distance) ||
-                !TrySteer(walk, world, item.Location, 0, distance))
+                !TrySteer(walk, world, item.Location, 0, distance, routeKind: "loot"))
             {
                 // Could not get there THIS TICK. Usually something is standing in the way, and
                 // standing is a temporary condition - so the first sentence is short, or the bot

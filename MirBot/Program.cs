@@ -66,6 +66,15 @@ namespace MirBot
                 host.Load(directory);
                 if (!host.Prepare()) return 2;
 
+                // The dated action log can prove old book outcomes; equip requests alone cannot
+                // prove server acceptance, so historical upgrade rows start with this release.
+                if (host.Progress.Count == 0)
+                {
+                    int imported = ProgressBackfill.Run(logPath, host.Progress);
+                    log.Write($"Progress history: {imported} dated skill outcome(s) imported; " +
+                        "historical equip requests left unverified.");
+                }
+
                 if (backfillLevels)
                 {
                     var result = LevelBackfill.Run(directory, host.Levels);

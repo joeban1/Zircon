@@ -437,6 +437,33 @@ namespace MirBot
         }
 
         /// <summary>
+        /// Deaths per map for this class, this band and the one beneath it - WITHOUT Lethal's
+        /// "it has paid, so it is not lethal" exemption. For route costing, not hunting choice:
+        /// Phantom Forest showed a 1.4M exp/hour "rate" from four minutes of kills between three
+        /// deaths, which is no reason to walk a bot across it on the way somewhere else.
+        /// </summary>
+        public Dictionary<int, int> DeathsByMap(string mirClass, int level, int forgetAfterBands = 2)
+        {
+            Dictionary<int, int> deaths = new Dictionary<int, int>();
+
+            lock (Sync)
+            {
+                int band = BandOf(level);
+
+                foreach (HuntingEntry entry in Entries)
+                {
+                    if (entry.Class != mirClass || entry.Deaths <= 0) continue;
+                    if (entry.LevelBand > band || band - entry.LevelBand >= forgetAfterBands) continue;
+
+                    deaths.TryGetValue(entry.MapIndex, out int sofar);
+                    deaths[entry.MapIndex] = sofar + entry.Deaths;
+                }
+            }
+
+            return deaths;
+        }
+
+        /// <summary>
         /// How hard a death counts against a map. Each death divides the rate by (1 + n * this),
         /// so at 0.25 one death costs 20% and ten cost about 71%. Bounded and monotonic: a map
         /// that keeps killing us falls steadily rather than being struck off on a single accident.

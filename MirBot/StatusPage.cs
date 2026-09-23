@@ -249,6 +249,28 @@ namespace MirBot
   .cfgrow input[type=number] { width:110px; background:#262b34; color:var(--text);
         border:1px solid var(--line); border-radius:6px; padding:4px 8px; font-size:13px;
         font-variant-numeric:tabular-nums; }
+  /* --- notifications tab --- */
+  .ncard { background:var(--card); border:1px solid var(--line); border-radius:10px;
+           padding:12px 14px; margin-bottom:12px; }
+  .nrow { display:flex; align-items:center; gap:14px; padding:10px 0; border-top:1px solid var(--line); }
+  .nrow:first-child { border-top:none; }
+  .nrow .nl { flex:1; min-width:0; }
+  .nrow .nl b { display:block; font-weight:600; }
+  .nrow .nl span { color:var(--dim); font-size:12px; }
+  .nrow .mixed { color:var(--warn); font-size:11px; margin-left:6px; }
+  .nrow input[type=number] { width:70px; background:#262b34; color:var(--text);
+           border:1px solid var(--line); border-radius:6px; padding:4px 6px; }
+  .switch { position:relative; width:44px; height:24px; flex:none; display:inline-block; }
+  .switch input { opacity:0; width:0; height:0; position:absolute; }
+  .switch .sl { position:absolute; inset:0; background:#3a404c; border-radius:12px;
+           transition:background .15s; cursor:pointer; }
+  .switch .sl:before { content:""; position:absolute; width:18px; height:18px; left:3px; top:3px;
+           background:#fff; border-radius:50%; transition:transform .15s; }
+  .switch input:checked + .sl { background:var(--good); }
+  .switch input:checked + .sl:before { transform:translateX(20px); }
+  .switch input:focus-visible + .sl { outline:2px solid var(--accent); outline-offset:2px; }
+  .switch input:disabled + .sl { opacity:.5; cursor:wait; }
+  .out-sent { color:var(--good); } .out-failed { color:var(--bad); } .out-held { color:var(--dim); }
   .cfgrow input.dirty { border-color:var(--warn); }
   .cfgrow .reach { font-size:10px; color:var(--dim); }
   .cfgresult { margin-top:8px; font-size:12px; color:var(--good); }
@@ -260,6 +282,7 @@ namespace MirBot
   <button id="tab-bots" class="on">Bots</button>
   <button id="tab-info">Info</button>
   <button id="tab-settings">Settings</button>
+  <button id="tab-notify">Notifications</button>
 </div>
 <div id="page-bots">
 <div id="alerts"></div>
@@ -268,8 +291,15 @@ namespace MirBot
 </div>
 <div id="page-info" class="hide">
 <details class="mem" id="maptripmem"><summary>Map selections and trips</summary>
-  <div class="controls"><label>Character <select id="maptripchar"><option value="">all characters</option></select></label>
-    <span class="detail">Kills are positive XP awards on the selected map (a proxy; item or quest XP can also count). New rows begin with this build.</span></div>
+  <div class="controls">
+    <input type="search" id="maptripq" placeholder="search map, reason, character" autocomplete="off">
+    <label>Character <select id="maptripchar"><option value="">all characters</option></select></label>
+    <label>Destination <select id="maptripmap"><option value="">all maps</option></select></label>
+    <label>Status <select id="maptripstatus">
+      <option value="">any</option><option value="active">active</option>
+      <option value="left">left</option><option value="never">never arrived</option></select></label>
+    <span class="n" id="maptripcount"></span></div>
+  <div class="detail">Kills are positive XP awards on the selected map (a proxy; item or quest XP can also count).</div>
   <div id="maptriptable"></div></details>
 <details class="mem" id="huntmem"><summary>Hunting memory</summary>
   <div class="detail">Scores use the baseline 25% death penalty; an individual bot's loss-watch travel choice may use a higher penalty.</div>
@@ -283,11 +313,25 @@ namespace MirBot
   </div>
   <div id="hunttable"></div></details>
 <details class="mem" id="deathmem"><summary>Recent deaths</summary>
+  <div class="controls">
+    <input type="search" id="deathq" placeholder="search map, killer, character" autocomplete="off">
+    <label>Character <select id="deathchar"><option value="">all characters</option></select></label>
+    <label>Map <select id="deathmap"><option value="">all maps</option></select></label>
+    <label>Killer <select id="deathkiller"><option value="">all killers</option></select></label>
+    <span class="n" id="deathcount"></span></div>
   <div id="deathtable"></div></details>
 <details class="mem" id="levelmem"><summary>Level ups</summary>
   <div class="controls"><label>Character <select id="levelchar"><option value="">all characters</option></select></label>
     <span class="detail">Times shown in your local timezone; ≈ means a historical estimate.</span></div>
   <div id="leveltable"></div></details>
+<details class="mem" id="upgrademem"><summary>Upgrades</summary>
+  <div class="controls"><label>Character <select id="upgradechar"><option value="">all characters</option></select></label>
+    <span class="detail">Confirmed equipment replacements only; older equip requests have no server verdict in the retained log.</span></div>
+  <div id="upgradetable"></div></details>
+<details class="mem" id="skillmem"><summary>Skills</summary>
+  <div class="controls"><label>Character <select id="skillchar"><option value="">all characters</option></select></label>
+    <span class="detail">Book-learning attempts and outcomes. Older dated outcomes are backfilled; undated logs are excluded.</span></div>
+  <div id="skilltable"></div></details>
 <details class="mem" id="lootmem"><summary>Drop lookup</summary>
   <div class="controls">
     <input type="search" id="lootq" placeholder="item name, e.g. Fire Wall" autocomplete="off">
@@ -310,6 +354,20 @@ namespace MirBot
 
 <div id="tip"></div>
 <footer id="foot"></footer>
+<div id="page-notify" class="hide">
+  <div class="ncard">
+    <b>Phone notifications</b> <span class="detail" id="notifystate"></span>
+    <div class="detail" style="margin-top:4px">Sent to your phone through Home Assistant. Each
+      switch applies to every bot and is saved to each bot's ini, so it survives a restart.</div>
+    <div id="notifyswitches" style="margin-top:6px"></div>
+    <div class="controls"><button id="notifytest">Send test notification</button>
+      <span class="n" id="notifyresult"></span></div>
+  </div>
+  <div class="ncard">
+    <b>Recent notifications</b> <span class="detail">newest first, last 60 since the host started</span>
+    <div id="notifyrecent" style="margin-top:6px"></div>
+  </div>
+</div>
 <script>
 "use strict";
 
@@ -877,9 +935,11 @@ async function mapBitmap(index) {
   mapPending.add(index);
 
   try {
-    const m = await (await fetch("/api/map?index=" + index)).json();
+    // &doors=1 keeps a browser from serving an hour-cached payload from before doors existed.
+    const m = await (await fetch("/api/map?index=" + index + "&doors=1")).json();
     const off = document.createElement("canvas");
     off.width = m.width; off.height = m.height;
+    off.doors = m.doors || [];
 
     const ctx = off.getContext("2d");
     const img = ctx.createImageData(m.width, m.height);
@@ -931,8 +991,54 @@ async function drawMap(card, b) {
   // 200-wide town.
   const r = Math.max(2, Math.round(off.width / 160));
 
+  // The route the bot is actually walking (its own A* path), coloured by purpose.
+  const route = b.route || [];
+  const routeColour = ROUTE_COLOURS[b.routeKind] || "#e2b341";
+  if (route.length >= 2) {
+    ctx.strokeStyle = "#000";
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    const trace = () => {
+      ctx.beginPath();
+      ctx.moveTo(b.x + 0.5, b.y + 0.5);
+      for (let i = 0; i + 1 < route.length; i += 2) ctx.lineTo(route[i] + 0.5, route[i + 1] + 0.5);
+      ctx.stroke();
+    };
+    ctx.lineWidth = Math.max(2, r);          // dark casing so the line reads on light floor
+    trace();
+    ctx.strokeStyle = routeColour;
+    ctx.lineWidth = Math.max(1, r / 2);
+    trace();
+  }
+
+  // Doors: exits to other maps, labelled with where they lead.
+  const doors = off.doors || [];
+  if (doors.length) {
+    const font = Math.max(9, r * 4);
+    ctx.font = `${font}px sans-serif`;
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    for (const d of doors) {
+      ctx.fillStyle = "#c77dff";
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = Math.max(1, r / 2);
+      ctx.fillRect(d.x - r, d.y - r, r * 2, r * 2);
+      ctx.strokeRect(d.x - r, d.y - r, r * 2, r * 2);
+
+      // Keep labels on the canvas near the right and bottom edges.
+      const label = d.to;
+      const w = ctx.measureText(label).width;
+      const lx = d.x + r * 2 + w > off.width ? d.x - r * 2 - w : d.x + r * 2;
+      const ly = Math.min(Math.max(d.y, font), off.height - font);
+      ctx.lineWidth = Math.max(2, font / 4);
+      ctx.strokeText(label, lx, ly);
+      ctx.fillStyle = "#e9d5ff";
+      ctx.fillText(label, lx, ly);
+    }
+  }
+
   if (b.destX !== null && b.destX !== undefined) {
-    ctx.strokeStyle = "#e2b341";
+    ctx.strokeStyle = route.length >= 2 ? routeColour : "#e2b341";
     ctx.lineWidth = Math.max(1, r / 2);
     ctx.beginPath();
     ctx.moveTo(b.destX - r, b.destY - r); ctx.lineTo(b.destX + r, b.destY + r);
@@ -945,11 +1051,23 @@ async function drawMap(card, b) {
   ctx.arc(b.x, b.y, r, 0, Math.PI * 2);
   ctx.fill();
 
+  const doorNote = doors.length ? ` · ${doors.length} door${doors.length === 1 ? "" : "s"}` : "";
+  const routeNote = route.length >= 2
+    ? ` · route: ${ROUTE_NAMES[b.routeKind] || b.routeKind} (${route.length / 2} pts)` : "";
   text(card.el.legend,
-    (b.destX !== null && b.destX !== undefined)
+    ((b.destX !== null && b.destX !== undefined)
       ? `${off.width}x${off.height} · you ${b.x},${b.y} · heading ${b.destX},${b.destY}`
-      : `${off.width}x${off.height} · you ${b.x},${b.y}`);
+      : `${off.width}x${off.height} · you ${b.x},${b.y}`) + routeNote + doorNote);
 }
+
+const ROUTE_COLOURS = {
+  travel: "#f0abfc", town: "#e2b341", target: "#f87171",
+  roam: "#6ee7b7", loot: "#93c5fd", move: "#e5e7eb"
+};
+const ROUTE_NAMES = {
+  travel: "to exit", town: "town errand", target: "to monster",
+  roam: "roaming", loot: "to loot", move: "moving"
+};
 
 // --- memory views -----------------------------------------------------------------------------
 // --- memory views -----------------------------------------------------------------------------
@@ -1089,15 +1207,56 @@ for (const [id, field] of [["huntmine","mine"], ["huntlethal","hideLethal"],
   });
 }
 
+let deathRows = [];
+
+// Rebuild a filter dropdown from the rows, keeping whatever was chosen.
+function fillFilter(selectId, allLabel, pairs) {
+  const sel = document.getElementById(selectId), chosen = sel.value;
+  const unique = [...new Map(pairs.filter(([k]) => k)).entries()]
+    .sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+  const html = `<option value="">${esc(allLabel)}</option>` +
+    unique.map(([k, label]) => `<option value="${esc(k)}">${esc(label)}</option>`).join("");
+  // Rewriting the options closes a dropdown the user has open, so only when they changed.
+  if (sel.dataset.options === html) return;
+  sel.dataset.options = html;
+  sel.innerHTML = html;
+  sel.value = unique.some(([k]) => k === chosen) ? chosen : "";
+}
+
+function matchesQuery(q, fields) {
+  if (!q) return true;
+  const hay = fields.map(f => String(f ?? "")).join(" ").toLowerCase();
+  return q.toLowerCase().split(/\s+/).filter(Boolean).every(w => hay.includes(w));
+}
+
 async function loadDeaths() {
-  let rows;
-  try { rows = await (await fetch("/api/deaths?take=60", { cache:"no-store" })).json(); }
+  try { deathRows = await (await fetch("/api/deaths?take=500", { cache:"no-store" })).json(); }
   catch (e) { return; }
+
+  fillFilter("deathchar", "all characters", deathRows.map(d => [levelKey(d), d.character || d.bot]));
+  fillFilter("deathmap", "all maps", deathRows.map(d => [d.mapName, d.mapName]));
+  fillFilter("deathkiller", "all killers", deathRows.map(d => [d.killer, d.killer]));
+  renderDeaths();
+}
+
+function renderDeaths() {
+  const q = document.getElementById("deathq").value.trim();
+  const who = document.getElementById("deathchar").value;
+  const map = document.getElementById("deathmap").value;
+  const killer = document.getElementById("deathkiller").value;
+
+  const rows = deathRows.filter(d =>
+    (!who || levelKey(d) === who) && (!map || d.mapName === map) &&
+    (!killer || d.killer === killer) &&
+    matchesQuery(q, [d.character, d.bot, d.class, d.mapName, d.killer, d.level]));
+
+  document.getElementById("deathcount").textContent =
+    `${rows.length} of ${deathRows.length} death${deathRows.length === 1 ? "" : "s"}`;
 
   const box = document.getElementById("deathtable");
 
   if (!rows.length) {
-    box.innerHTML = "<div class='detail'>none recorded yet</div>";
+    box.innerHTML = `<div class='detail'>${deathRows.length ? "no deaths match" : "none recorded yet"}</div>`;
     return;
   }
 
@@ -1109,6 +1268,10 @@ async function loadDeaths() {
       "<td class='num'>" + group(d.gold) + "</td>" +
       "<td>" + d.x + "," + d.y + "</td></tr>").join("") + "</table>";
 }
+
+document.getElementById("deathq").addEventListener("input", renderDeaths);
+for (const id of ["deathchar", "deathmap", "deathkiller"])
+  document.getElementById(id).addEventListener("change", renderDeaths);
 
 // DROP LOOKUP.
 //
@@ -1166,12 +1329,78 @@ document.getElementById("lootq").addEventListener("keydown", e => {
 let memFetchedAt = 0;
 let levelRows = [];
 let mapTripRows = [];
+let upgradeRows = [];
+let skillRows = [];
+
+function fillProgressCharacters(selectId, rows) {
+  const sel = document.getElementById(selectId), chosen = sel.value;
+  const names = [...new Map(rows.map(r => [levelKey(r), r.character || r.bot])).entries()]
+    .sort((a,b) => a[1].localeCompare(b[1]));
+  sel.innerHTML = "<option value=''>all characters</option>" +
+    names.map(([key,name]) => `<option value="${esc(key)}">${esc(name)}</option>`).join("");
+  sel.value = chosen;
+}
+
+function renderUpgrades() {
+  const chosen = document.getElementById("upgradechar").value;
+  const rows = upgradeRows.filter(r => !chosen || levelKey(r) === chosen);
+  const box = document.getElementById("upgradetable");
+  if (!rows.length) { box.innerHTML = "<div class='detail'>none recorded yet</div>"; return; }
+  box.innerHTML = "<table><tr><th>Time (local)</th><th>Bot</th><th>Class</th>" +
+    "<th>Previous gear</th><th>New gear</th><th>Score increase</th></tr>" +
+    rows.map(r => "<tr><td>" + new Date(r.utc).toLocaleString() + "</td><td>" +
+      esc(r.character || r.bot) + "</td><td>" + esc(r.class) + "</td><td>" +
+      esc(r.previousGear) + "</td><td>" + esc(r.newGear) +
+      "</td><td class='num'>+" + r.scoreIncrease + "</td></tr>").join("") + "</table>";
+}
+
+async function loadUpgrades() {
+  try { upgradeRows = await (await fetch("/api/upgrades?take=1000", {cache:"no-store"})).json(); }
+  catch (e) { document.getElementById("upgradetable").textContent = "upgrade history unavailable"; return; }
+  fillProgressCharacters("upgradechar", upgradeRows);
+  renderUpgrades();
+}
+document.getElementById("upgradechar").addEventListener("change", renderUpgrades);
+
+function renderSkills() {
+  const chosen = document.getElementById("skillchar").value;
+  const rows = skillRows.filter(r => !chosen || levelKey(r) === chosen);
+  const box = document.getElementById("skilltable");
+  if (!rows.length) { box.innerHTML = "<div class='detail'>none recorded yet</div>"; return; }
+  box.innerHTML = "<table><tr><th>Time (local)</th><th>Skill</th><th>Bot</th>" +
+    "<th>Class</th><th>Result</th><th>Source</th></tr>" +
+    rows.map(r => "<tr><td>" + new Date(r.utc).toLocaleString() + "</td><td>" +
+      esc(r.skill) + "</td><td>" + esc(r.character || r.bot) + "</td><td>" +
+      esc(r.class) + "</td><td>" + (r.success ? "success" : "fail") +
+      "</td><td>" + esc(r.source) + "</td></tr>").join("") + "</table>";
+}
+
+async function loadSkills() {
+  try { skillRows = await (await fetch("/api/skills-history?take=1000", {cache:"no-store"})).json(); }
+  catch (e) { document.getElementById("skilltable").textContent = "skill history unavailable"; return; }
+  fillProgressCharacters("skillchar", skillRows);
+  renderSkills();
+}
+document.getElementById("skillchar").addEventListener("change", renderSkills);
+
+function tripStatus(r) { return !r.arrivedUtc ? (r.leftUtc ? "never" : "active") : (r.leftUtc ? "left" : "active"); }
 
 function renderMapTrips() {
   const chosen = document.getElementById("maptripchar").value;
-  const rows = mapTripRows.filter(r => !chosen || levelKey(r) === chosen);
+  const map = document.getElementById("maptripmap").value;
+  const status = document.getElementById("maptripstatus").value;
+  const q = document.getElementById("maptripq").value.trim();
+  const rows = mapTripRows.filter(r =>
+    (!chosen || levelKey(r) === chosen) && (!map || r.map === map) &&
+    (!status || tripStatus(r) === status) &&
+    matchesQuery(q, [r.map, r.selectionReason, r.leavingReason, r.character, r.bot, r.class]));
+  document.getElementById("maptripcount").textContent =
+    `${rows.length} of ${mapTripRows.length} trip${mapTripRows.length === 1 ? "" : "s"}`;
   const box = document.getElementById("maptriptable");
-  if (!rows.length) { box.innerHTML = "<div class='detail'>none recorded yet</div>"; return; }
+  if (!rows.length) {
+    box.innerHTML = `<div class='detail'>${mapTripRows.length ? "no trips match" : "none recorded yet"}</div>`;
+    return;
+  }
   box.innerHTML = "<table><tr><th>Selected (local)</th><th>Character</th><th>Class</th>" +
     "<th>Destination</th><th>Reason selected</th><th>Arrived</th><th>Kills*</th>" +
     "<th>Left (local)</th><th>Reason left</th></tr>" +
@@ -1185,17 +1414,15 @@ function renderMapTrips() {
 }
 
 async function loadMapTrips() {
-  try { mapTripRows = await (await fetch("/api/map-trips?take=500", {cache:"no-store"})).json(); }
+  try { mapTripRows = await (await fetch("/api/map-trips?take=2000", {cache:"no-store"})).json(); }
   catch (e) { return; }
-  const sel = document.getElementById("maptripchar"), chosen = sel.value;
-  const names = [...new Map(mapTripRows.map(r => [levelKey(r), r.character || r.bot])).entries()]
-    .sort((a,b) => a[1].localeCompare(b[1]));
-  sel.innerHTML = "<option value=''>all characters</option>" +
-    names.map(([key,name]) => `<option value="${esc(key)}">${esc(name)}</option>`).join("");
-  sel.value = chosen;
+  fillFilter("maptripchar", "all characters", mapTripRows.map(r => [levelKey(r), r.character || r.bot]));
+  fillFilter("maptripmap", "all maps", mapTripRows.map(r => [r.map, r.map]));
   renderMapTrips();
 }
-document.getElementById("maptripchar").addEventListener("change", renderMapTrips);
+for (const id of ["maptripchar", "maptripmap", "maptripstatus"])
+  document.getElementById(id).addEventListener("change", renderMapTrips);
+document.getElementById("maptripq").addEventListener("input", renderMapTrips);
 // Option values pass through the HTML parser, which replaces U+0000 with U+FFFD.
 // Keep this key HTML-safe so a selected character can match the JSON rows.
 function levelKey(r) { return encodeURIComponent(r.bot) + "|" + encodeURIComponent(r.character); }
@@ -1236,9 +1463,11 @@ async function loadMemory(bots) {
   if (document.getElementById("deathmem").open) loadDeaths();
   if (document.getElementById("levelmem").open) loadLevels();
   if (document.getElementById("maptripmem").open) loadMapTrips();
+  if (document.getElementById("upgrademem").open) loadUpgrades();
+  if (document.getElementById("skillmem").open) loadSkills();
 }
 
-for (const id of ["huntmem", "deathmem", "levelmem", "maptripmem"]) {
+for (const id of ["huntmem", "deathmem", "levelmem", "maptripmem", "upgrademem", "skillmem"]) {
   document.getElementById(id).addEventListener("toggle", () => { memFetchedAt = 0; });
 }
 
@@ -1376,18 +1605,168 @@ let activeTab = "bots";
 function showTab(name) {
   activeTab = name;
 
-  for (const id of ["bots", "info", "settings"]) {
+  for (const id of ["bots", "info", "settings", "notify"]) {
     document.getElementById("tab-" + id).classList.toggle("on", id === name);
     document.getElementById("page-" + id).classList.toggle("hide", id !== name);
   }
 
   if (name === "settings") { cfgFetchedAt = 0; loadConfig(); }
   if (name === "info") { memFetchedAt = 0; loadMemory(huntBots); }
+  if (name === "notify") loadNotify(true);
 }
 
 document.getElementById("tab-bots").addEventListener("click", () => showTab("bots"));
 document.getElementById("tab-info").addEventListener("click", () => showTab("info"));
 document.getElementById("tab-settings").addEventListener("click", () => showTab("settings"));
+document.getElementById("tab-notify").addEventListener("click", () => showTab("notify"));
+
+// --- notifications tab ------------------------------------------------------------------------
+//
+// A friendlier face on the Notify* settings: the same /api/config values the Settings tab edits,
+// as switches, plus a test button and what was actually sent (from /api/notify).
+
+const NOTIFY_TYPES = [
+  { key:"NotifyLevelUp", label:"Level-ups",      example:"Wizzler reached level 37 - Wizard on Deserted Mine Lv 2" },
+  { key:"NotifyUpgrade", label:"Gear upgrades",  example:"Jill equipped Platinum Ring - replaced Ring Of Discipline (score +8)" },
+  { key:"NotifySkill",   label:"Skills learned", example:"Jill learned Soul Shield" },
+  { key:"NotifyFault",   label:"Bot faults",     example:"Mirbot4 stopped - needs attention" },
+  { key:"NotifyDeath",   label:"Deaths",         example:"Sindo died - killed by Stone Golem on Desert (can be noisy)" }
+];
+
+let notifyFetchedAt = 0;
+let notifyBuilt = false;
+let notifyIdleLast = 20;
+
+// A change is queued to each bot and applied on its own thread, so /api/config still reports the
+// old value for a moment. Hold what the user chose until the bots agree (or 10s pass), otherwise
+// the next refresh flips the switch straight back.
+const notifyPending = new Map();
+
+function notifyValue(field, key) {
+  const want = notifyPending.get(key);
+  if (want && Date.now() < want.until && (!field || String(field.value) !== want.value)) return want.value;
+  notifyPending.delete(key);
+  return field ? String(field.value) : "";
+}
+
+function buildNotify() {
+  const rows = NOTIFY_TYPES.map(t => `
+    <div class="nrow">
+      <label class="switch"><input type="checkbox" data-nkey="${t.key}"><span class="sl"></span></label>
+      <div class="nl"><b>${esc(t.label)}<span class="mixed" data-nmixed="${t.key}"></span></b>
+        <span>e.g. ${esc(t.example)}</span></div>
+    </div>`).join("") + `
+    <div class="nrow">
+      <label class="switch"><input type="checkbox" id="notifyidleon"><span class="sl"></span></label>
+      <div class="nl"><b>Idle bots<span class="mixed" data-nmixed="NotifyIdleMinutes"></span></b>
+        <span>A bot has earned no XP for this many minutes - once per dry spell</span></div>
+      <input type="number" id="notifyidlemin" min="1" max="600" step="1"> <span class="detail">min</span>
+    </div>`;
+  document.getElementById("notifyswitches").innerHTML = rows;
+
+  for (const box of document.querySelectorAll("#notifyswitches input[data-nkey]"))
+    box.addEventListener("change", () => saveNotify(box, box.dataset.nkey, box.checked ? "true" : "false"));
+
+  const idleOn = document.getElementById("notifyidleon");
+  const idleMin = document.getElementById("notifyidlemin");
+  idleOn.addEventListener("change", () => {
+    const minutes = Math.min(600, Math.max(1, parseInt(idleMin.value, 10) || notifyIdleLast));
+    saveNotify(idleOn, "NotifyIdleMinutes", idleOn.checked ? String(minutes) : "0");
+  });
+  idleMin.addEventListener("change", () => {
+    const minutes = parseInt(idleMin.value, 10);
+    if (!(minutes >= 1 && minutes <= 600)) { notifyResult("idle minutes must be 1-600", true); return; }
+    if (idleOn.checked) saveNotify(idleMin, "NotifyIdleMinutes", String(minutes));
+    else notifyIdleLast = minutes;
+  });
+
+  document.getElementById("notifytest").addEventListener("click", sendNotifyTest);
+  notifyBuilt = true;
+}
+
+function notifyResult(text, bad) {
+  const el = document.getElementById("notifyresult");
+  el.textContent = text;
+  el.style.color = bad ? "var(--bad)" : "";
+}
+
+async function saveNotify(input, key, value) {
+  input.disabled = true;
+  const r = await setConfigAll(key, value);
+  input.disabled = false;
+  if (r.error) notifyResult(`${key}: ${r.error}`, true);
+  else {
+    notifyPending.set(key, { value, until: Date.now() + 10000 });
+    notifyResult(`saved for ${r.bots} bot${r.bots === 1 ? "" : "s"}`);
+  }
+  setTimeout(() => loadNotify(true), 1500);
+}
+
+async function sendNotifyTest() {
+  const button = document.getElementById("notifytest");
+  button.disabled = true;
+  try {
+    const r = await fetch("/api/notify/test", { method:"POST", headers:{ "X-MirBot":"1" }, body:"" });
+    const body = await r.json().catch(() => ({}));
+    notifyResult(r.ok ? "test queued - check your phone" : (body.error || "test failed"), !r.ok);
+  } catch (e) {
+    notifyResult("could not reach the host", true);
+  }
+  button.disabled = false;
+  setTimeout(() => loadNotify(true), 1500);
+}
+
+async function loadNotify(force) {
+  if (!force && Date.now() - notifyFetchedAt < 5000) return;
+  notifyFetchedAt = Date.now();
+
+  let status;
+  try {
+    [cfgFields, status] = await Promise.all([
+      fetch("/api/config", { cache:"no-store" }).then(r => r.json()),
+      fetch("/api/notify", { cache:"no-store" }).then(r => r.json())
+    ]);
+  } catch (e) { return; }
+
+  if (!notifyBuilt) buildNotify();
+
+  const field = key => cfgFields.find(f => f.key === key);
+  const mixedNote = f => f && f.mixed ? " mixed across bots" : "";
+
+  for (const t of NOTIFY_TYPES) {
+    const f = field(t.key), box = document.querySelector(`input[data-nkey="${t.key}"]`);
+    if (f && box && !box.disabled) box.checked = notifyValue(f, t.key).toLowerCase() === "true";
+    document.querySelector(`[data-nmixed="${t.key}"]`).textContent = mixedNote(f);
+  }
+
+  const idle = field("NotifyIdleMinutes");
+  const minutes = parseInt(notifyValue(idle, "NotifyIdleMinutes"), 10) || 0;
+  if (minutes > 0) notifyIdleLast = minutes;
+  const idleOn = document.getElementById("notifyidleon"), idleMin = document.getElementById("notifyidlemin");
+  if (!idleOn.disabled) idleOn.checked = minutes > 0;
+  if (document.activeElement !== idleMin && !idleMin.disabled)
+    idleMin.value = minutes > 0 ? minutes : notifyIdleLast;
+  document.querySelector('[data-nmixed="NotifyIdleMinutes"]').textContent = mixedNote(idle);
+
+  const state = document.getElementById("notifystate");
+  state.textContent = status.enabled
+    ? "- on"
+    : "- not configured: add NotifyWebhookUrl under [Notify] in bot-Mirbot.ini and restart the host";
+  state.style.color = status.enabled ? "var(--good)" : "var(--warn)";
+  document.getElementById("notifytest").disabled = !status.enabled;
+
+  const rows = status.recent || [];
+  const box = document.getElementById("notifyrecent");
+  if (!rows.length) { box.innerHTML = "<div class='detail'>nothing sent since the host started</div>"; return; }
+  box.innerHTML = "<table><tr><th>When (local)</th><th>Character</th><th>Type</th><th>Title</th>" +
+    "<th>Message</th><th>Outcome</th></tr>" + rows.map(n => {
+      const cls = /^sent/.test(n.outcome) ? "out-sent"
+                : /^(failed|dropped)/.test(n.outcome) ? "out-failed" : "out-held";
+      return "<tr><td>" + new Date(n.utc).toLocaleString() + "</td><td>" + esc(n.character || n.bot) +
+        "</td><td>" + esc(n.kind) + "</td><td>" + esc(n.title) + "</td><td>" + esc(n.message) +
+        "</td><td class='" + cls + "'>" + esc(n.outcome) + "</td></tr>";
+    }).join("") + "</table>";
+}
 
 // --- items ------------------------------------------------------------------------------------
 //
@@ -1680,6 +2059,7 @@ function render(h) {
   loadGold(selected ? [selected] : []);
   loadMemory(h.bots);
   if (activeTab === "settings") loadConfig();
+  if (activeTab === "notify") loadNotify(false);
 
   for (const [id, mini] of minis) {
     if (seen.has(id)) continue;

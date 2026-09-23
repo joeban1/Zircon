@@ -34,6 +34,7 @@ namespace MirBot
         private DateTime _lastProgress = DateTime.MinValue;
         private int _crossAttempts;
         private int _legStartMap = -1;
+        private readonly HashSet<Point> _unroutableCells = new HashSet<Point>();
 
         // A teleport leg is a conversation rather than a step, so it needs its own little state:
         // the buttons still to press, and a deadline, because an NPC that never answers would
@@ -66,6 +67,13 @@ namespace MirBot
 
         /// <summary>Share of current gold a single fare may cost. See BotConfig.TeleportMaxGoldPercent.</summary>
         public int MaxGoldPercent;
+
+        /// <summary>
+        /// Extra route cost, in tiles, for crossing a map - set by BotInstance from this class's
+        /// recent deaths there. Unlike Avoid it never forbids a route, it only makes a safer one of
+        /// similar length win.
+        /// </summary>
+        public Func<int, int> DangerTiles;
 
         public JourneyPhase Phase { get; private set; } = JourneyPhase.Idle;
         public string Status { get; private set; } = "";
@@ -101,7 +109,8 @@ namespace MirBot
             Gold = world.Gold;
 
             List<MapExit> route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class,
-                world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent, Avoid);
+                world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent, Avoid,
+                world.Location, DangerTiles);
 
             // Stranded beats dead, but not always: if the only way there is through somewhere that
             // has killed us, going the long way round is not an option that exists. Say so out loud
@@ -110,7 +119,8 @@ namespace MirBot
             if ((route == null || route.Count == 0) && Avoid != null && Avoid.Count > 0)
             {
                 route = _graph.Route(world.MapIndex, destinationMapIndex, world.Class,
-                    world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent);
+                    world.Level, Gold, GoldFloor, world.PKPoints, MaxGoldPercent, null,
+                    world.Location, DangerTiles);
 
                 if (route != null && route.Count > 0)
                     Detour = $"no route to {destinationName} avoiding {Avoid.Count} map(s) " +
@@ -168,6 +178,7 @@ namespace MirBot
             _lastProgress = DateTime.MinValue;
             _crossAttempts = 0;
             _legStartMap = -1;
+            _unroutableCells.Clear();
             _buttonPath.Clear();
             _talkDeadline = DateTime.MinValue;
             _called = false;
@@ -192,6 +203,7 @@ namespace MirBot
             _lastProgress = DateTime.UtcNow;
             _crossAttempts = 0;
             _legStartMap = world.MapIndex;
+            _unroutableCells.Clear();
             _buttonPath.Clear();
             _talkDeadline = DateTime.MinValue;
             _called = false;
@@ -236,6 +248,32 @@ namespace MirBot
         public void NoteFightingThrough()
         {
             _lastProgress = DateTime.UtcNow;
+        }
+
+        /// <summary>The trigger cell this leg is currently walking to.</summary>
+        public Point Aim => _aim;
+
+        /// <summary>
+        /// The current aim cannot be routed to even on the bare map; switch to the nearest other
+        /// cell of the same exit. Deserted Mine Lv 1's stairs are three cells, and a failed route
+        /// to 311,33 used to end the journey with 312,33 and 312,34 never tried. False when every
+        /// cell has been written off for this leg.
+        /// </summary>
+        public bool TryAnotherExitCell(WorldModel world)
+        {
+            if (_route == null || _leg >= _route.Count || _route[_leg].IsTeleport) return false;
+
+            _unroutableCells.Add(_aim);
+
+            Point next = Nearest(
+                _route[_leg].Cells.Where(x => !_unroutableCells.Contains(x)).ToList(),
+                world.Location);
+
+            if (next == Point.Empty) return false;
+
+            _aim = next;
+            _bestDistance = int.MaxValue;
+            return true;
         }
 
         public Decision Next(WorldModel world)

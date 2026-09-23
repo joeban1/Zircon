@@ -238,6 +238,13 @@ namespace MirBot
         public int? DestX { get; init; }
         public int? DestY { get; init; }
 
+        /// <summary>
+        /// The A* route the bot is walking, flattened x,y pairs from the next step to the goal,
+        /// and what it is for: town, travel, target, roam, loot or move. Empty when not walking.
+        /// </summary>
+        public int[] Route { get; init; } = Array.Empty<int>();
+        public string RouteKind { get; init; } = "";
+
         /// <summary>none | local | map-wide. Fallback sweep/random roaming report none.</summary>
         public string ExplorationMode { get; init; } = "none";
         public int ExplorationVisitedSectors { get; init; }
@@ -417,6 +424,18 @@ namespace MirBot
         public int Height { get; init; }
         public string Version { get; init; } = "";
         public string Mask { get; init; } = "";
+
+        /// <summary>Walk-on exits to other maps (cave stairs, gates), one per movement region.</summary>
+        public List<MapDoor> Doors { get; init; } = new List<MapDoor>();
+    }
+
+    /// <summary>One exit region: its centre cell, destination and size in cells.</summary>
+    public sealed record MapDoor
+    {
+        public int X { get; init; }
+        public int Y { get; init; }
+        public string To { get; init; } = "";
+        public int Cells { get; init; }
     }
 
     /// <summary>

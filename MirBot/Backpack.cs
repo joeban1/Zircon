@@ -1354,6 +1354,69 @@ namespace MirBot
             return WorthSelling(info, instance, heavy, gold, value);
         }
 
+        /// <summary>
+        /// The stricter bar while a journey is under way, applied on top of WorthLooting.
+        ///
+        /// Fighting through the pack guarding Deserted Mine's stairs filled Wizzler's bag to 45 of
+        /// 48 slots three runs in a row, each ending in a scroll home and a 200-tile walk back.
+        /// Cargo is what a journey cannot afford, so only books this character can learn, item
+        /// parts, stackables, real potions, town scrolls, gold, gear upgrades and drops selling for
+        /// at least minSaleValue are taken.
+        ///
+        /// Slots, not weight, are what run out: a weightless Zombie Bone still takes one, and
+        /// Deserted Mine's other-class books (1,000 each, one slot apiece) were the bulk of a bag
+        /// that filled in five minutes. Other-class and already-learnt books are judged on price.
+        /// </summary>
+        public bool WorthLootingOnJourney(ItemInfo info, ClientUserItem instance, MirClass mirClass,
+            long minSaleValue, MagicBooks books = null, WorldModel world = null)
+        {
+            if (info == null) return false;
+
+            ClientUserItem probe = instance?.Info != null
+                ? instance
+                : new ClientUserItem { Info = info, Count = 1 };
+
+            if (info.ItemType == ItemType.Currency || !OccupiesASlot(probe)) return true;
+
+            if (info.ItemType == ItemType.ItemPart) return true;
+
+            // Stackable materials (Zombie Bone: 400 each, stacks) cost one slot for the whole
+            // stack, so a pile of them is worth carrying even when a single drop is not.
+            if (info.StackSize > 1) return true;
+
+            if (info.ItemType == ItemType.Book)
+            {
+                BookVerdict verdict = books?.Judge(probe, mirClass, world?.Level ?? 0,
+                                          world?.PlayerStats ?? new Stats(), world)
+                                      ?? BookVerdict.Junk;
+
+                if (RetainUnlearnedBook(verdict)) return true;
+            }
+
+            if (info.ItemType == ItemType.Consumable)
+            {
+                if (info.Shape == TownTeleportShape) return true;
+                if (IsHealthPotion(probe) || IsManaPotion(probe)) return true;
+            }
+
+            if (SlotFor(info.ItemType) != null)
+            {
+                int candidate = instance != null
+                    ? Score(instance, mirClass)
+                    : ScoreInfo(info, mirClass);
+
+                if (BeatsWeakestSlot(info.ItemType, candidate, mirClass)) return true;
+            }
+
+            return SaleValue(info, instance) >= minSaleValue;
+        }
+
+        /// <summary>What a vendor would pay for this drop, whole stack included.</summary>
+        private static long SaleValue(ItemInfo info, ClientUserItem instance) =>
+            instance?.Info != null
+                ? instance.Price(Math.Max(1L, instance.Count))
+                : (long)(info.Price * info.SellRate);
+
         /// <summary>Weight this drop would actually add, which for a stack means the whole stack.</summary>
         private static int WeightOf(ItemInfo info, ClientUserItem instance)
         {
@@ -1379,12 +1442,7 @@ namespace MirBot
             // No rule configured - fall back to the old behaviour rather than looting nothing.
             if (value == null) return !heavy;
 
-            long price;
-
-            if (instance?.Info != null)
-                price = instance.Price(Math.Max(1L, instance.Count));
-            else
-                price = (long)(info.Price * info.SellRate);
+            long price = SaleValue(info, instance);
 
             // Quest items and the like are flagged Worthless and sell for nothing.
             if (price <= 0) return false;

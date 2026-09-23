@@ -244,6 +244,17 @@ namespace MirBot
         // - not "no book seller here" but "no vendors anywhere" - so her trips aborted and she
         // could not even buy the scroll that would have let her leave.
         public string TownMaps = "Bichon Town,Banya Village,Lost Paradise";
+
+        // Phone notifications. The URL is HOST-WIDE (read off the first bot's ini) and is kept out
+        // of ConfigSchema on purpose: the status page has no authentication and the webhook id is
+        // the only secret guarding the Home Assistant automation. Empty disables notifications.
+        public string NotifyWebhookUrl = "";
+        public bool NotifyLevelUp = true;
+        public bool NotifyUpgrade = true;
+        public bool NotifySkill = true;
+        public bool NotifyDeath = false;
+        public bool NotifyFault = true;
+        public int NotifyIdleMinutes = 20;
         // No vendor is named: VendorDirectory derives who buys what from System.db.
         // NOTE: ScrollIfFurtherThan was removed. It decided whether to scroll to shorten a walk
         // to a vendor on the SAME map - but a town scroll does not shorten a walk, it teleports to
@@ -690,15 +701,38 @@ namespace MirBot
         public int FightThroughRange = 1;
 
         /// <summary>
-        /// Seconds of fighting a single leg may absorb before the journey's stall watchdog is
-        /// allowed to fire again. 0 means never pause it.
+        /// Seconds of fighting WITHOUT A KILL before the journey's stall watchdog is allowed to
+        /// fire again. 0 means never pause it.
         ///
         /// Fighting does not close the distance to the exit, so without this the 30-second
         /// no-progress watchdog would abort a journey precisely because the bot did the right
-        /// thing. But the pause cannot be unconditional either, or a bot swamped on a map it
-        /// cannot cross would fight there for ever instead of giving up and scrolling out.
+        /// thing. It used to be total fight time, which released a winning assassin into a
+        /// 35-monster pack beside Deserted Mine's stairs mid-fight. Measured from the latest kill
+        /// now, and capped overall by FightThroughMaxSeconds.
         /// </summary>
         public int FightThroughSeconds = 90;
+
+        /// <summary>
+        /// Hard ceiling on one fight-through engagement however well it is going, so a respawn
+        /// point cannot hold a journey for ever. 0 means no ceiling.
+        /// </summary>
+        public int FightThroughMaxSeconds = 600;
+
+        /// <summary>
+        /// How many times an abandoned journey to the same hunting ground is resumed (after the
+        /// scroll-out and town trip) before the bot makes a fresh choice. 0 disables resuming.
+        /// </summary>
+        public int JourneyRetries = 3;
+
+        /// <summary>Failures older than this no longer count against JourneyRetries.</summary>
+        public int JourneyRetryWindowMinutes = 60;
+
+        /// <summary>
+        /// While travelling, ordinary drops must sell for at least this much to be picked up;
+        /// books, item parts, potions, town scrolls, gold and gear upgrades are always taken.
+        /// Suspended below PoorGold and during poverty recovery. 0 disables.
+        /// </summary>
+        public long JourneyLootMinValue = 1500;
 
         /// <summary>
         /// Monster AI numbers that never start a fight, so crossing a map need not stop for them.
@@ -972,6 +1006,13 @@ namespace MirBot
                 case "dropreplacedstarterkit": config.DropReplacedStarterKit = bool.Parse(value); break;
                 case "unlocktosell": config.UnlockToSell = bool.Parse(value); break;
                 case "townmaps": config.TownMaps = value; break;
+                case "notifywebhookurl": config.NotifyWebhookUrl = value; break;
+                case "notifylevelup": config.NotifyLevelUp = bool.Parse(value); break;
+                case "notifyupgrade": config.NotifyUpgrade = bool.Parse(value); break;
+                case "notifyskill": config.NotifySkill = bool.Parse(value); break;
+                case "notifydeath": config.NotifyDeath = bool.Parse(value); break;
+                case "notifyfault": config.NotifyFault = bool.Parse(value); break;
+                case "notifyidleminutes": config.NotifyIdleMinutes = int.Parse(value); break;
                 case "returnwithin": config.ReturnWithin = int.Parse(value); break;
                 case "detoursteps": config.DetourSteps = int.Parse(value); break;
                 case "mappath": config.MapPath = value; break;
@@ -1010,6 +1051,10 @@ namespace MirBot
                 case "unproductiveminutes": config.UnproductiveMinutes = int.Parse(value); break;
                 case "fightthroughrange": config.FightThroughRange = int.Parse(value); break;
                 case "fightthroughseconds": config.FightThroughSeconds = int.Parse(value); break;
+                case "fightthroughmaxseconds": config.FightThroughMaxSeconds = int.Parse(value); break;
+                case "journeyretries": config.JourneyRetries = int.Parse(value); break;
+                case "journeyretrywindowminutes": config.JourneyRetryWindowMinutes = int.Parse(value); break;
+                case "journeylootminvalue": config.JourneyLootMinValue = long.Parse(value); break;
                 case "harmlessais": config.HarmlessAIs = value; break;
                 case "fightthroughharmlesspercent": config.FightThroughHarmlessPercent = int.Parse(value); break;
                 case "fightthroughlevelsbelow": config.FightThroughLevelsBelow = int.Parse(value); break;

@@ -365,6 +365,9 @@ namespace MirBot
                 LastError = reason;
                 _state = BotRunState.Faulted;
                 _log.Write($"{reason} - not retrying. Fix it and press Start.");
+                if (Config.NotifyFault)
+                    Notify("fault", $"{Id} stopped", reason + " - needs attention.",
+                        TimeSpan.FromMinutes(30));
             }
         }
 
@@ -430,6 +433,24 @@ namespace MirBot
                     Bot = Id, Character = world.Name, Class = world.Class.ToString(),
                     FromLevel = from, ToLevel = to, Utc = DateTime.UtcNow
                 });
+                if (Config.NotifyLevelUp)
+                    Notify("level", $"{world.Name} reached level {to}",
+                        $"{world.Class} on {world.MapName}", TimeSpan.FromMinutes(2));
+            };
+            _connection.OnUpgradeConfirmed = (previous, next, gain) =>
+            {
+                WorldModel world = _connection.World;
+                _host.Progress.Record(new ProgressEntry
+                {
+                    Kind = "upgrade", Bot = Id, Character = world.Name,
+                    Class = world.Class.ToString(), Utc = DateTime.UtcNow,
+                    PreviousGear = previous, NewGear = next, ScoreIncrease = gain
+                });
+                if (Config.NotifyUpgrade)
+                    Notify("upgrade", $"{world.Name} equipped {next}",
+                        string.IsNullOrEmpty(previous)
+                            ? $"new gear (score +{gain})"
+                            : $"replaced {previous} (score +{gain})", TimeSpan.FromMinutes(1));
             };
             _recovery.Reset();
             _lastFrugalRecoveryCombat = false;
@@ -460,6 +481,7 @@ namespace MirBot
                 OnFailed = message =>
                 {
                     _log.Write($"Travel: {message}");
+                    NoteJourneyFailure(message);
                     EscapeOnScroll(message);
                 },
                 TalkRange = Config.VendorTalkRange,
@@ -574,6 +596,7 @@ namespace MirBot
                                        .Contains(_connection.World.MapIndex);
 
             _brain.FrugalRecoveryCombat = frugalRecovery;
+            _brain.InRecovery = _recovery.Active;
 
             if (frugalRecovery != _lastFrugalRecoveryCombat)
             {
@@ -665,6 +688,7 @@ namespace MirBot
 
             SampleExperience();
             ConsiderTravel();
+            CheckIdleNotify();
 
             _lastDecision = decision;
             _history.Record(decision);
@@ -1322,11 +1346,60 @@ namespace MirBot
             if (_connection.World.KnownMagicCount > _magicsBeforeLearn)
             {
                 _log.Write($"Learned {book} - now {_connection.World.KnownMagicCount} skills.");
+                RecordSkillAttempt(book, true);
                 return;
             }
 
             _log.Write($"LEARN REFUSED: {book} taught us nothing - still " +
                        $"{_magicsBeforeLearn} skills. The book is gone and the skill is not.");
+            RecordSkillAttempt(book, false);
+        }
+
+        private void RecordSkillAttempt(string book, bool success)
+        {
+            WorldModel world = _connection.World;
+            _host.Progress.Record(new ProgressEntry
+            {
+                Kind = "skill", Bot = Id, Character = world.Name,
+                Class = world.Class.ToString(), Utc = _learnAt,
+                Skill = book, Success = success
+            });
+
+            if (success && Config.NotifySkill)
+                Notify("skill", $"{world.Name} learned {book}",
+                    $"{world.Class}, level {world.Level}", TimeSpan.FromMinutes(1));
+        }
+
+        private void Notify(string kind, string title, string message, TimeSpan cooldown) =>
+            _host.Notify.Send(Id, _connection?.World?.Name ?? Config.CharacterName ?? Id, kind,
+                title, message, cooldown);
+
+        private bool _idleNotified;
+
+        /// <summary>
+        /// One alert per drought: fires once the bot has gone NotifyIdleMinutes without experience
+        /// while in game, and re-arms only after it earns again.
+        /// </summary>
+        private void CheckIdleNotify()
+        {
+            if (Config.NotifyIdleMinutes <= 0 || _connection == null ||
+                _connection.Stage != BotStage.InGame || _connection.World.Dead) return;
+
+            TimeSpan idle = DateTime.UtcNow - UnproductiveSince();
+
+            if (idle < TimeSpan.FromMinutes(Config.NotifyIdleMinutes))
+            {
+                _idleNotified = false;
+                return;
+            }
+
+            if (_idleNotified) return;
+            _idleNotified = true;
+
+            WorldModel world = _connection.World;
+            Notify("idle", $"{world.Name} has earned nothing for {(int)idle.TotalMinutes} min",
+                $"on {world.MapName} at {world.Location.X},{world.Location.Y} - " +
+                $"{_lastDecision?.Action.ToString() ?? "no decision"}", TimeSpan.FromMinutes(60));
         }
 
         private bool TryExplore(WorldModel world, string mirClass, Dictionary<int, int> hops,
@@ -1572,6 +1645,92 @@ namespace MirBot
         private DateTime _nextUnproductiveCheck = DateTime.MinValue;
         private DateTime _nextScrollEscape = DateTime.MinValue;
 
+        /// <summary>The hunting ground the current journey is heading for.</summary>
+        private JourneyTarget _journeyTarget;
+
+        /// <summary>An abandoned hunting journey still to be resumed, or null.</summary>
+        private JourneyTarget _resume;
+
+        private sealed class JourneyTarget
+        {
+            public int MapIndex;
+            public string MapName = "";
+            public string Why = "";
+            public string DisplayReason;
+            public int Failures;
+            public DateTime FirstFailureUtc;
+        }
+
+        /// <summary>
+        /// Remember a hunting journey that was abandoned on the way, so the next travel decision
+        /// resumes it instead of re-rolling. Every failed descent used to end in a fresh weighted
+        /// draw after the scroll-out: an assassin forty tiles from Deserted Mine Lv 2's stairs
+        /// scrolled home and was sent to Flea Cave, and the deeper floor was never reached.
+        ///
+        /// Deaths are excluded - the danger memory owns that verdict - and so are planning
+        /// failures, which a retry cannot change.
+        /// </summary>
+        private void NoteJourneyFailure(string message)
+        {
+            if (_journeyTarget == null || Config.JourneyRetries <= 0) return;
+            if (!message.StartsWith("journey abandoned", StringComparison.Ordinal)) return;
+            if (message.Contains("died on the way")) return;
+
+            DateTime now = DateTime.UtcNow;
+
+            if (_resume == null || _resume.MapIndex != _journeyTarget.MapIndex ||
+                now - _resume.FirstFailureUtc > TimeSpan.FromMinutes(Config.JourneyRetryWindowMinutes))
+            {
+                _resume = new JourneyTarget
+                {
+                    MapIndex = _journeyTarget.MapIndex,
+                    MapName = _journeyTarget.MapName,
+                    Why = _journeyTarget.Why,
+                    DisplayReason = _journeyTarget.DisplayReason,
+                    FirstFailureUtc = now
+                };
+            }
+
+            _resume.Failures++;
+
+            if (_resume.Failures > Config.JourneyRetries)
+            {
+                _log.Write($"Travel: {_resume.Failures} failed journeys to {_resume.MapName} in " +
+                           $"{Config.JourneyRetryWindowMinutes} minutes - choosing somewhere else.");
+                _resume = null;
+                return;
+            }
+
+            _log.Write($"Travel: will resume the journey to {_resume.MapName} at the next " +
+                       $"travel decision (failure {_resume.Failures} of {Config.JourneyRetries} " +
+                       "allowed).");
+        }
+
+        /// <summary>Start the remembered journey again, if there is one worth resuming.</summary>
+        private bool TryResumeJourney()
+        {
+            JourneyTarget resume = _resume;
+
+            if (resume == null) return false;
+
+            if (_connection.World.MapIndex == resume.MapIndex ||
+                DateTime.UtcNow - resume.FirstFailureUtc >
+                    TimeSpan.FromMinutes(Config.JourneyRetryWindowMinutes))
+            {
+                _resume = null;
+                return false;
+            }
+
+            Begin(resume.MapIndex, resume.MapName,
+                $"resuming after {resume.Failures} failed attempt(s): {resume.Why}",
+                displayReason: resume.DisplayReason);
+
+            if (_brain.Travel.Active) return true;
+
+            _resume = null;
+            return false;
+        }
+
         /// <summary>
         /// Since when have we earned nothing: the last experience gain, or failing that, the
         /// moment we entered the world.
@@ -1645,6 +1804,14 @@ namespace MirBot
             _tripWasActive = active;
 
             if (tripJustFinished) SampleGold(force: true, tripCompleted: true);
+
+            if (_resume != null && _connection != null &&
+                _connection.World.MapIndex == _resume.MapIndex)
+            {
+                _log.Write($"Travel: reached {_resume.MapName} after {_resume.Failures} failed " +
+                           "attempt(s).");
+                _resume = null;
+            }
 
             UpdateRecoveryState(tripJustFinished);
 
@@ -1780,6 +1947,15 @@ namespace MirBot
             // trip started from may be a stopover rather than a hunting ground, and starting a
             // competing return would abandon the real destination.
             if (_brain?.Travel != null && _brain.Travel.Active)
+            {
+                _town?.ClearReturn();
+                return;
+            }
+
+            // A hunting journey abandoned on the way (usually followed by a scroll-out and this
+            // town trip) is resumed before any fresh choice. Not while recovering: poverty
+            // recovery owns the destination then.
+            if (!_recovery.Active && TryResumeJourney())
             {
                 _town?.ClearReturn();
                 return;
@@ -1978,10 +2154,31 @@ namespace MirBot
             // and of what has happened since - both of which move.
             _brain.Travel.Avoid = _host.Hunting.Lethal(_connection.World.Class.ToString(),
                 _connection.World.Level);
+
+            // Deaths make a map costly to CROSS (150 tiles each, capped), so a safe route of
+            // similar length wins. Snapshot now: the planner runs once per journey or re-plan.
+            Dictionary<int, int> deaths = _host.Hunting.DeathsByMap(
+                _connection.World.Class.ToString(), _connection.World.Level);
+            _brain.Travel.DangerTiles = map =>
+                deaths.TryGetValue(map, out int n) ? Math.Min(n * 150, 1500) : 0;
             _brain.Travel.Detour = "";
 
             if (_brain.Travel.Begin(_connection.World, mapIndex, mapName))
             {
+                // Only hunting grounds are resumed after a failure; storage and return errands are
+                // re-derived from state anyway. A different hunting choice supersedes a pending one.
+                _journeyTarget = farmingChoice && _brain.Travel.Active
+                    ? new JourneyTarget
+                    {
+                        MapIndex = mapIndex,
+                        MapName = mapName ?? "",
+                        Why = why ?? "",
+                        DisplayReason = displayReason ?? why
+                    }
+                    : null;
+
+                if (farmingChoice && _resume != null && _resume.MapIndex != mapIndex) _resume = null;
+
                 if (farmingChoice)
                     NoteFarmingChoice(mapIndex, mapName, displayReason ?? why);
                 if (!string.IsNullOrEmpty(_brain.Travel.Detour))
@@ -2119,8 +2316,21 @@ namespace MirBot
                 Utc = DateTime.UtcNow
             });
 
+            if (Config.NotifyDeath)
+                Notify("death", $"{world.Name} died",
+                    $"killed by {killer} on {world.MapName} at level {world.Level}",
+                    TimeSpan.FromMinutes(10));
+
             // The window is void: time spent dead and running back is not hunting.
             ResetExperienceSample();
+
+            // Close the selected-map trip with the death in it. A death before arrival used to
+            // leave the row open until the next choice, which then closed it as "new selection" -
+            // Mirbot died twice crossing Phantom Forest and the trips table showed neither.
+            if (_mapTrip != null)
+                CloseMapTrip(_mapTrip.ArrivedUtc.HasValue && world.MapIndex == _mapTrip.MapIndex
+                    ? $"died ({killer})"
+                    : $"died on the way in {world.MapName} ({killer})");
 
             // Whatever we were travelling to, we are no longer on our way there.
             if (_brain?.Travel != null && _brain.Travel.Active)
@@ -2323,6 +2533,8 @@ namespace MirBot
         {
             LastError = ex.Message;
             _log.Write("FAULT: " + ex);
+            if (Config.NotifyFault)
+                Notify("fault", $"{Id} faulted", ex.Message, TimeSpan.FromMinutes(30));
 
             try { Teardown("faulted"); } catch { }
 
@@ -2680,6 +2892,9 @@ namespace MirBot
                 ? _lastDecision.Destination
                 : _brain?.RoamTarget ?? System.Drawing.Point.Empty;
 
+            (System.Drawing.Point[] Cells, string Kind) route =
+                _brain?.CurrentRoute ?? (Array.Empty<System.Drawing.Point>(), "");
+
             double? percent = null;
             if (world.MaxExperienceKnown && world.MaxExperience > 0)
                 percent = Math.Round((double)(world.Experience / world.MaxExperience) * 100, 2);
@@ -2847,6 +3062,8 @@ namespace MirBot
                 FarmingDestinationReason = _farmingDestinationReason,
                 DestX = destination == System.Drawing.Point.Empty ? (int?)null : destination.X,
                 DestY = destination == System.Drawing.Point.Empty ? (int?)null : destination.Y,
+                Route = route.Cells.SelectMany(p => new[] { p.X, p.Y }).ToArray(),
+                RouteKind = route.Kind,
                 ExplorationMode = _brain?.ExplorationMode ?? "none",
                 ExplorationVisitedSectors = exploration.VisitedSectors,
                 ExplorationTotalSectors = exploration.TotalSectors,
