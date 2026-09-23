@@ -63,13 +63,14 @@ namespace MirBot
         /// The caller decides WHEN - see BotInstance, which samples before publishing its snapshot
         /// so a motionless bot still produces points.
         /// </summary>
-        public void Append(string bot, long gold, DateTime utc)
+        public void Append(string bot, long gold, DateTime utc, long capitalSpent = 0)
         {
             if (string.IsNullOrWhiteSpace(_path)) return;
 
             string line = "{\"bot\":" + Quote(bot) +
                           ",\"utc\":\"" + utc.ToString("o", CultureInfo.InvariantCulture) +
-                          "\",\"gold\":" + gold.ToString(CultureInfo.InvariantCulture) + "}";
+                          "\",\"capitalSpent\":" + capitalSpent.ToString(CultureInfo.InvariantCulture) +
+                          ",\"gold\":" + gold.ToString(CultureInfo.InvariantCulture) + "}";
 
             lock (_sync)
             {
@@ -159,10 +160,20 @@ namespace MirBot
             string bot = Between(line, "\"bot\":\"", "\"");
             string utc = Between(line, "\"utc\":\"", "\"");
             string gold = Between(line, "\"gold\":", "}");
+            string capital = Between(line, "\"capitalSpent\":", ",");
 
             if (bot == null || utc == null || gold == null) return null;
 
-            return new GoldPoint { Bot = bot, Utc = utc, Gold = gold.Trim() };
+            if (!long.TryParse(gold.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture,
+                out long parsedGold) || parsedGold < 0 ||
+                !DateTime.TryParse(utc, CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out _)) return null;
+            long spent = 0;
+            if (capital != null && (!long.TryParse(capital.Trim(), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out spent) || spent < 0)) return null;
+
+            return new GoldPoint { Bot = bot, Utc = utc, Gold = parsedGold.ToString(CultureInfo.InvariantCulture),
+                CapitalSpent = spent, HasCapitalSpent = capital != null };
         }
 
         private static string Between(string text, string open, string close)

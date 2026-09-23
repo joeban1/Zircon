@@ -40,6 +40,9 @@ namespace MirBot
         public MagicType Magic = MagicType.None;
         public int BuyIndex;
         public long BuyAmount;
+        /// <summary>Only gear and skill-book orders count as capital spending after confirmation.</summary>
+        public bool CapitalPurchase;
+        public int BuyItemIndex;
         public System.Drawing.Point Point;
 
         /// <summary>WalkTo: where we are heading.</summary>
@@ -101,6 +104,7 @@ namespace MirBot
         public ButcherIndex Butcher { set => _butcher = value; }
 
         private DateTime _nextAction = DateTime.MinValue;
+        private DateTime _nextAssassinRanged = DateTime.MinValue;
         private DateTime _nextPotion = DateTime.MinValue;
 
         /// <summary>Emergency scrolls are one per emergency - see the escape branch.</summary>
@@ -780,7 +784,29 @@ namespace MirBot
             // 2b. Cross-map travel. Below the town trip, because arriving somewhere new with a
             //     full bag and no potions is how a journey ends in a corpse; above fighting,
             //     because a bot that stops to kill everything never gets anywhere.
-            if (Travel != null && Travel.Active)
+            //
+            //     EXCEPT WHEN SOMETHING IS IN CONTACT. See BotConfig.FightThroughRange. A monster
+            //     standing next to us is not a fight we are choosing - it is hitting us, and it is
+            //     occupying the cell we are trying to walk through. Running is not an option the
+            //     server will grant, so the choice is really "fight it" or "shuffle against it
+            //     while it kills us", and the bot spent fourteen seconds picking the second one.
+            if (Travel != null && Travel.Active && FightingThrough(world))
+            {
+                Travel.NoteFightingThrough();
+
+                // Said once per leg, not once per tick: this is the interesting moment, and the
+                // old behaviour was invisible precisely because nothing ever mentioned it.
+                if (!_saidFightingThrough)
+                {
+                    _saidFightingThrough = true;
+                    BrainLog?.Invoke($"Travel: hostiles in contact on {world.MapName} - holding " +
+                                     $"the journey until nothing is within " +
+                                     $"{Math.Max(_config.FightThroughRange, _config.FightThroughClearRange)} " +
+                                     "tiles rather than walking deeper into them.");
+                }
+                // Fall through to combat; the journey resumes once nothing is in contact.
+            }
+            else if (Travel != null && Travel.Active)
             {
                 Decision leg = Travel.Next(world);
 
@@ -956,6 +982,43 @@ namespace MirBot
                 //    from ten tiles rather than after a walk.
                 // Poison first: it ticks for the rest of the fight, so a turn spent applying it
                 // early is worth more than the same turn spent on one direct hit.
+                // Summon Puppet is a short-lived explosive decoy. Unlike Summon Skeleton it
+                // appears as a player object, moves us a few cells and dies after five seconds;
+                // treating it as a persistent pet would cause endless resummoning.
+                ClientUserMagic puppet = FrugalRecoveryCombat ? null :
+                    Spells.ChoosePuppet(world, target, distance);
+                if (puppet != null)
+                {
+                    Spells.PuppetIssued();
+                    return new Decision
+                    {
+                        Action = BotAction.Cast,
+                        Reason = $"summoning an explosive puppet near {target.Name}",
+                        Subject = puppet.Info.Name,
+                        TargetID = 0,
+                        Direction = WorldModel.DirectionTo(world.Location, target.Location),
+                        Point = world.Location,
+                        Magic = puppet.Info.Magic
+                    };
+                }
+
+                ClientUserMagic wraith = FrugalRecoveryCombat ? null :
+                    Spells.ChooseWraithGrip(world, target, distance);
+                if (wraith != null)
+                {
+                    Spells.WraithIssued(target.ObjectID);
+                    return new Decision
+                    {
+                        Action = BotAction.Cast,
+                        Reason = $"{wraith.Info.Name} on {target.Name} at {distance}",
+                        Subject = wraith.Info.Name,
+                        TargetID = target.ObjectID,
+                        Direction = WorldModel.DirectionTo(world.Location, target.Location),
+                        Point = target.Location,
+                        Magic = wraith.Info.Magic
+                    };
+                }
+
                 ClientUserMagic venom = FrugalRecoveryCombat
                     ? null
                     : Spells.ChoosePoison(world, items, target, distance);
@@ -976,11 +1039,19 @@ namespace MirBot
                     };
                 }
 
-                ClientUserMagic spell = FrugalRecoveryCombat
+                // Assassins with melee skills need to close the gap. Hell Fire remains useful
+                // as an opening hit, but casting it every two seconds kept Sindo permanently
+                // at range and made every AttackMagic skill unreachable.
+                bool assassinMelee = Skills.HasAssassinMelee(world);
+                bool rangedWindow = !assassinMelee ||
+                    (distance > 1 && DateTime.UtcNow >= _nextAssassinRanged);
+                SpellBook.AreaAim? area = FrugalRecoveryCombat || !rangedWindow ? null :
+                    Spells.ChooseArea(world, target, Maps?.For(world.MapIndex));
+                ClientUserMagic spell = FrugalRecoveryCombat || !rangedWindow
                     ? null
                     : Spells.Choose(world, target, distance);
 
-                if (spell != null)
+                if (area != null || spell != null)
                 {
                     // IS THIS GOING ANYWHERE? The identical question the melee branch asks below,
                     // and the reason it is asked here too.
@@ -1009,6 +1080,25 @@ namespace MirBot
                         };
                     }
 
+                    if (assassinMelee)
+                        _nextAssassinRanged = DateTime.UtcNow.AddSeconds(12);
+
+                    if (area != null)
+                    {
+                        SpellBook.AreaAim aim = area.Value;
+                        return new Decision
+                        {
+                            Action = BotAction.Cast,
+                            Reason = $"{aim.Magic.Info.Name} at {aim.Point.X},{aim.Point.Y} " +
+                                     $"{aim.Direction}; covers {aim.Covered} hostiles (predicted)",
+                            Subject = aim.Magic.Info.Name,
+                            TargetID = target.ObjectID,
+                            Direction = aim.Direction,
+                            Point = aim.Point,
+                            Magic = aim.Magic.Info.Magic
+                        };
+                    }
+
                     return new Decision
                     {
                         Action = BotAction.Cast,
@@ -1023,7 +1113,8 @@ namespace MirBot
 
                 // 3a-i. Hold the range. A caster that has something to throw should be throwing
                 //       it from a distance, not letting the target close and then meleeing.
-                Decision back = FrugalRecoveryCombat ? null : Kite(world, target, distance);
+                Decision back = FrugalRecoveryCombat || assassinMelee
+                    ? null : Kite(world, target, distance);
                 if (back != null) return back;
 
                 // 3b. In contact. Either standing beside it, or - Mir allows this - standing on
@@ -1173,7 +1264,9 @@ namespace MirBot
             if (Nav == null || !_config.LearnBlockedCells) return;
             if (!_lastMoveWasSingleStep) return;
             if (_lastMoveTarget == Point.Empty) return;
-            if (world.SomethingAt(_lastMoveTarget, 0)) return;
+            // MovableThingAt, not SomethingAt: a tree standing on the cell is a reason to learn
+            // it, not a reason to assume the blockage is temporary. See WorldModel.SceneryCells.
+            if (world.MovableThingAt(_lastMoveTarget, 0)) return;
 
             if (Nav.Refused(world.MapIndex, world.MapName, _lastMoveTarget,
                     _config.BlockedCellEvidence))
@@ -1327,6 +1420,30 @@ namespace MirBot
                     {
                         avoid = new HashSet<Point>(avoid);
                         avoid.UnionWith(learned);
+                    }
+                }
+
+                // Scenery is avoided on sight rather than after a refusal. Learning works, but it
+                // costs a blocked move per cell to get there and a tree is wide: the bot would
+                // discover the trunk one cell at a time while shuffling in front of it. These are
+                // visible in the world model already, so there is no reason to find out the hard
+                // way.
+                HashSet<Point> scenery = world.SceneryCells();
+
+                if (scenery.Count > 0)
+                {
+                    // Never avoid the cell we are actually heading for - if the destination IS a
+                    // scenery cell, refusing to route to it would strand the caller entirely.
+                    scenery.Remove(destination);
+
+                    if (scenery.Count > 0)
+                    {
+                        if (avoid == null) avoid = scenery;
+                        else
+                        {
+                            avoid = new HashSet<Point>(avoid);
+                            avoid.UnionWith(scenery);
+                        }
                     }
                 }
 
@@ -1702,6 +1819,9 @@ namespace MirBot
             // mana, the mana floor, cooldowns - so the retreat is only ever made for a spell that
             // could actually follow it.
             if (!Spells.CanCastNow(world)) return null;
+            if (!Spells.CanCastSingleNow(world) &&
+                Spells.ChooseArea(world, target, Maps?.For(world.MapIndex),
+                    ignoreGlobalDelay: true) == null) return null;
 
             MapGrid grid = Maps?.For(world.MapIndex);
             if (grid == null) return null;
@@ -2131,6 +2251,142 @@ namespace MirBot
         /// thread, and a handful of darts finds open ground on any map that has any.
         /// </summary>
         private bool _sweeping;
+
+        /// <summary>When the current journey leg first had to stop and fight.</summary>
+        private DateTime _fightingThroughSince = DateTime.MinValue;
+        private bool _saidFightingThrough;
+
+        /// <summary>
+        /// Should travel stand down this tick and let combat run?
+        ///
+        /// True only while something is genuinely in contact, and only for as long as
+        /// FightThroughSeconds allows. Past that the bot stops defending the leg and lets the
+        /// journey's own stall watchdog abort it, which hands the problem to the re-plan and,
+        /// failing that, to the town-scroll escape.
+        /// </summary>
+        /// <summary>AI numbers that never start a fight. See BotConfig.HarmlessAIs.</summary>
+        private HashSet<int> _harmlessAI;
+
+        private HashSet<int> HarmlessAI()
+        {
+            if (_harmlessAI != null) return _harmlessAI;
+
+            _harmlessAI = new HashSet<int>();
+
+            foreach (string part in (_config.HarmlessAIs ?? "").Split(','))
+                if (int.TryParse(part.Trim(), out int ai)) _harmlessAI.Add(ai);
+
+            return _harmlessAI;
+        }
+
+        /// <summary>
+        /// The nearest monster in range that is actually worth stopping a journey for.
+        ///
+        /// Three tests, cheapest first: the always-passive AI list, then what the thing has
+        /// actually done to us, then - only when we have never been hit by it - its level.
+        /// </summary>
+        private WorldObject NearestRealThreat(WorldModel world, int range)
+        {
+            WorldObject best = null;
+            int bestDistance = int.MaxValue;
+
+            foreach (WorldObject ob in world.Objects)
+            {
+                if (!ob.IsValidTarget) continue;
+                if (_unreachable.ContainsKey(ob.ObjectID)) continue;
+                if (HarmlessAI().Contains(ob.AI)) continue;
+
+                int distance = world.DistanceTo(ob.Location);
+                if (distance > range || distance >= bestDistance) continue;
+
+                if (Danger != null && Danger.Harmless(ob.Name, world.MaxHealth,
+                        _config.FightThroughHarmlessPercent, _config.DangerMinimumHits))
+                    continue;
+
+                if (BeneathUs(world, ob)) continue;
+
+                best = ob;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
+
+        /// <summary>
+        /// Level fallback, used ONLY where the damage record is silent.
+        ///
+        /// WorldObject carries no level - the spawn packet does not send one - so it comes from
+        /// the monster database via the index the packet does carry.
+        /// </summary>
+        private bool BeneathUs(WorldModel world, WorldObject ob)
+        {
+            if (_config.FightThroughLevelsBelow <= 0) return false;
+            // Only stand down when the damage record can actually answer. A monster that has
+            // hit us once tells us nothing, and treating that as "we have data" was what kept a
+            // level 27 wizard fighting its way across a starter town.
+            if (Danger != null && Danger.Judged(ob.Name, _config.DangerMinimumHits)) return false;
+
+            Library.SystemModels.MonsterInfo info = BotConnection.Monsters?.Find(ob.MonsterIndex);
+
+            if (info == null || info.Level <= 0) return false;
+
+            return info.Level + _config.FightThroughLevelsBelow <= world.Level;
+        }
+
+        private bool FightingThrough(WorldModel world)
+        {
+            if (_config.FightThroughRange <= 0 || world.InSafeZone) return Settle();
+
+            bool engaged = _fightingThroughSince != DateTime.MinValue;
+
+            // ENTER on contact; LEAVE only when the area is clear.
+            //
+            // Two different ranges on purpose. Starting a fight is about what is on top of us;
+            // ending one is about whether walking away would simply restart it. Using the contact
+            // range for both made travel resume the instant the adjacent monster died, with the
+            // rest of the room still coming - see BotConfig.FightThroughClearRange.
+            int range = engaged && _config.FightThroughClearRange > 0
+                ? Math.Max(_config.FightThroughRange, _config.FightThroughClearRange)
+                : _config.FightThroughRange;
+
+            if (NearestRealThreat(world, range) == null)
+            {
+                // NOTHING LEFT TO FIGHT - BUT PICK UP WHAT WE KILLED FIRST.
+                //
+                // Loot sits below travel in this method, so a journey resuming the instant the
+                // last monster dies walks away from every drop the fight produced. That makes
+                // fighting through pure cost: the mana and potions are spent, the corpses are
+                // left behind, and the bot arrives poorer than if it had run past.
+                //
+                // Only after a fight (engaged), only for loot the value rule actually wants, and
+                // still bounded by FightThroughSeconds below - so a field of junk cannot hold a
+                // journey indefinitely.
+                bool heavy = world.MaxBagWeight > 0 &&
+                             world.WeightPercent >= _config.HeavyWeightPercent;
+                bool full = world.MaxBagWeight > 0 && world.WeightPercent >= 100;
+
+                if (!engaged || FindWorthwhileLoot(world, heavy, full) == null)
+                    return Settle();
+            }
+
+            if (_fightingThroughSince == DateTime.MinValue)
+                _fightingThroughSince = DateTime.UtcNow;
+
+            if (_config.FightThroughSeconds > 0 &&
+                DateTime.UtcNow - _fightingThroughSince >
+                    TimeSpan.FromSeconds(_config.FightThroughSeconds))
+                return false;   // still fighting, but stop shielding the journey from its watchdog
+
+            return true;
+        }
+
+        /// <summary>Nothing in contact: clear the fight-through clock and let travel proceed.</summary>
+        private bool Settle()
+        {
+            _fightingThroughSince = DateTime.MinValue;
+            _saidFightingThrough = false;
+            return false;
+        }
 
         /// <summary>Closest we have been to the current sweep target, and when.</summary>
         private int _sweepBest = int.MaxValue;
@@ -3003,6 +3259,8 @@ namespace MirBot
                     // (Globals.MagicDelay) is SpellBook's own, because it applies to casting and
                     // not to moving or drinking.
                     Spells.Issued();
+                    Spells.ReserveIssued(decision.Magic, world, decision.Point,
+                        decision.Direction, Maps?.For(world.MapIndex));
                     _nextAction = DateTime.Now + CastTime + Margin;
                     break;
                 case BotAction.Logout:

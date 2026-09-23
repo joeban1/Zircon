@@ -28,6 +28,7 @@ namespace MirBot
         /// <summary>MonsterInfo.Index, so a summon can be told from any other monster of the same
         /// owner. Ownership alone cannot say WHICH pet this is.</summary>
         public int MonsterIndex = -1;
+        public bool IsSummonedPuppet;
 
         /// <summary>
         /// The owning character's NAME, or null/empty for a wild monster.
@@ -89,7 +90,8 @@ namespace MirBot
         /// silently refuses attacks on an owned monster, so swinging at one is a decision that can
         /// never succeed and produces no error to learn from.
         /// </summary>
-        public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet && !IsSceneryNode;
+        public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet &&
+                                     !IsSceneryNode && !IsSummonedPuppet;
 
         public override string ToString() => $"{Kind}:{Name}#{ObjectID}@{Location.X},{Location.Y}" +
                                              (Dead ? " (dead)" : "");
@@ -255,6 +257,10 @@ namespace MirBot
 
         /// <summary>Every point of experience gained this session, never reset by a level-up.</summary>
         public decimal TotalExperienceGained;
+        /// <summary>Positive XP packets, a useful but imperfect proxy for credited kills.</summary>
+        public long PositiveExperienceAwards;
+        /// <summary>Signed packet total for real throughput; unlike hunting XP it includes losses.</summary>
+        public decimal TotalExperienceNet;
 
         /// <summary>
         /// When experience last arrived. MinValue until the first gain of the session.
@@ -295,6 +301,7 @@ namespace MirBot
         public void ApplyExperienceGain(decimal amount)
         {
             Experience += amount;       // a delta, not an absolute
+            TotalExperienceNet += amount;
 
             // Separate running total. Experience itself is overwritten by LevelChanged, so it
             // cannot be differenced across a level-up - and a sampling window that happens to
@@ -302,6 +309,7 @@ namespace MirBot
             if (amount > 0)
             {
                 TotalExperienceGained += amount;
+                PositiveExperienceAwards++;
                 LastExperienceGainUtc = DateTime.UtcNow;
             }
 
@@ -397,6 +405,49 @@ namespace MirBot
         }
 
         /// <summary>Is any object standing on this cell, other than the one named?</summary>
+        /// <summary>
+        /// Cells held by something that will NEVER move: scenery - trees, stones, boxes.
+        ///
+        /// The pathfinder works from the map's walkability, which describes terrain and knows
+        /// nothing about objects standing on it. A monster on a walkable cell is a temporary
+        /// obstruction and routing through it is right, because it will wander off. Scenery will
+        /// not. Lost Paradise town has a tree between two vendors and the bots walked into it,
+        /// were refused, re-planned the identical route and walked into it again, back and forth,
+        /// for as long as the trip lasted.
+        /// </summary>
+        public HashSet<Point> SceneryCells()
+        {
+            HashSet<Point> cells = new HashSet<Point>();
+
+            foreach (WorldObject ob in _objects.Values)
+                if (ob.Kind == ObjectKind.Monster && ob.IsSceneryNode && !ob.Dead)
+                    cells.Add(ob.Location);
+
+            return cells;
+        }
+
+        /// <summary>
+        /// Is something that CAN move standing here?
+        ///
+        /// The question LearnRefusal actually needs. Asking "is anything here" answered yes for a
+        /// tree and so refused to learn the cell, on the reasoning that the obstruction was
+        /// temporary - which is exactly backwards for the one kind of obstruction that is not.
+        /// </summary>
+        public bool MovableThingAt(Point location, uint except)
+        {
+            foreach (WorldObject ob in _objects.Values)
+            {
+                if (ob.ObjectID == except || ob.ObjectID == SelfID) continue;
+                if (ob.Kind == ObjectKind.Item) continue;
+                if (ob.Location != location) continue;
+                if (ob.Kind == ObjectKind.Monster && ob.IsSceneryNode) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
         public bool SomethingAt(Point location, uint except)
         {
             foreach (WorldObject ob in _objects.Values)
@@ -536,6 +587,35 @@ namespace MirBot
         public WorldObject Find(uint objectID) =>
             _objects.TryGetValue(objectID, out WorldObject ob) ? ob : null;
 
+        /// <summary>
+        /// The nearest live monster that would actually fight back, ignoring the passive animals.
+        ///
+        /// Used by the fight-through rule: "something is in contact" should mean something
+        /// dangerous, not a pig standing in the corridor.
+        /// </summary>
+        public WorldObject NearestThreat(int maxDistance, ICollection<int> harmlessAI,
+            ICollection<uint> exclude = null)
+        {
+            WorldObject best = null;
+            int bestDistance = int.MaxValue;
+
+            foreach (WorldObject ob in _objects.Values)
+            {
+                if (!ob.IsValidTarget) continue;
+                if (exclude != null && exclude.Contains(ob.ObjectID)) continue;
+                if (harmlessAI != null && harmlessAI.Contains(ob.AI)) continue;
+
+                int distance = DistanceTo(ob.Location);
+
+                if (distance > maxDistance || distance >= bestDistance) continue;
+
+                best = ob;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
+
         public WorldObject NearestLiveMonster(int maxDistance, ICollection<uint> exclude = null)
         {
             WorldObject best = null;
@@ -641,6 +721,13 @@ namespace MirBot
             ob.Direction = direction;
             ob.Dead = dead;
             ob.PetOwner = petOwner;
+            // Zircon's Puppet sometimes arrives without PetOwner even though it belongs to an
+            // assassin. It is a five-second decoy and the server refuses its owner's attack;
+            // do not let a newly summoned puppet displace the hostile we were fighting.
+            ob.IsSummonedPuppet = string.Equals(name, "SummonPuppet",
+                StringComparison.OrdinalIgnoreCase) ||
+                monsterIndex >= 0 && Globals.MonsterInfoList?.Binding?.Any(info =>
+                    info.Index == monsterIndex && info.Flag == MonsterFlag.SummonPuppet) == true;
 
             // Null means "this packet does not carry poison" - S.DataObjectMonster has no such
             // field. Writing None for it would erase a state the server has already told us about

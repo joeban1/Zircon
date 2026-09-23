@@ -54,6 +54,9 @@ namespace MirBot
         private bool _repairedSpecial;
         private bool _boughtBook;
         private bool _boughtGear;
+        /// <summary>Banking reclaimed obsolete items after the vendor circuit; sell them before leaving.</summary>
+        private bool _postBankSaleNeeded;
+        private bool _postBankSaleActive;
 
         /// <summary>
         /// The book stop on this trip, while it is still AHEAD of us. Cleared on arrival, not on
@@ -357,6 +360,8 @@ namespace MirBot
             _boughtTorch = false;
             _boughtReagents = false;
             _boughtGear = false;
+            _postBankSaleNeeded = false;
+            _postBankSaleActive = false;
             _boughtBook = false;
             _bookSeller = null;
             _repaired = false;
@@ -824,6 +829,24 @@ namespace MirBot
                             };
                     }
 
+                    if (_postBankSaleActive)
+                    {
+                        // This second circuit exists solely to sell what banking withdrew.
+                        // Buying again here would turn cleanup into another full shopping trip.
+                        if (_itinerary.Count > 0)
+                        {
+                            _target = _itinerary.Dequeue();
+                            Enter(TownPhase.Travelling, $"next reclaimed-item buyer: {_target.NPC.NPCName}");
+                            return new Decision { Action = BotAction.NPCClose,
+                                Reason = $"sold reclaimed items, on to {_target.NPC.NPCName}" };
+                        }
+
+                        _postBankSaleActive = false;
+                        Enter(TownPhase.Banking, "reclaimed-item sale complete");
+                        return new Decision { Action = BotAction.NPCClose,
+                            Reason = "reclaimed-item sale complete" };
+                    }
+
                     // Repair is driven off the LIVE page, not the routing metadata: the page
                     // governs what the server will accept, and a stale System.db read could differ.
                     //
@@ -935,7 +958,7 @@ namespace MirBot
 
                         if (good != null && needed > 0 && wanted <= 0)
                             SupplyRefused($"cannot afford {good.Item.ItemName} at " +
-                                          $"{good.Item.Price} each with {world.Gold} gold");
+                                          $"{CostOf(good)} each with {world.Gold} gold");
 
                         if (good != null && wanted > 0)
                         {
@@ -995,7 +1018,7 @@ namespace MirBot
                         // enough behind to still buy a potion, or the light is being paid for
                         // with the bot's life - see TorchGoldFloor.
                         if (good != null &&
-                            world.Gold - good.Item.Price >= _config.TorchGoldFloor)
+                            world.Gold - CostOf(good) >= _config.TorchGoldFloor)
                             return new Decision
                             {
                                 Action = BotAction.NPCBuy,
@@ -1005,7 +1028,7 @@ namespace MirBot
                             };
 
                         if (good != null)
-                            SupplyDiagnostic = $"not replacing the torch at {good.Item.Price} " +
+                            SupplyDiagnostic = $"not replacing the torch at {CostOf(good)} " +
                                                $"with {world.Gold:N0} gold - keeping " +
                                                $"{_config.TorchGoldFloor:N0} back for potions";
                     }
@@ -1032,7 +1055,7 @@ namespace MirBot
                                 : $"not buying {good.Item.ItemName}: room {room} " +
                                   $"(load {items.ManaPotionLoad()} of budget " +
                                   $"{_config.ManaPotionTarget(world.MaxBagWeight)}), " +
-                                  $"budget {PotionGold(world):N0} gold at {good.Item.Price} each";
+                                  $"budget {PotionGold(world):N0} gold at {CostOf(good)} each";
 
                         if (good != null && wanted > 0)
                         {
@@ -1174,7 +1197,7 @@ namespace MirBot
                             {
                                 BookDiagnostic =
                                     $"{good.Item.ItemName} at {_target?.NPC?.NPCName} costs " +
-                                    $"{good.Item.Price:N0} and we have {world.Gold:N0}";
+                                    $"{CostOf(good):N0} and we have {world.Gold:N0}";
                             }
                             else if (good != null)
                             {
@@ -1192,7 +1215,9 @@ namespace MirBot
                                     Action = BotAction.NPCBuy,
                                     Reason = $"1 x {good.Item.ItemName}",
                                     BuyIndex = good.Index,
-                                    BuyAmount = 1     // one per trip: a bought book is Locked and
+                                    BuyAmount = 1,    // one per trip: a bought book is Locked and
+                                    CapitalPurchase = true,
+                                    BuyItemIndex = good.Item.Index
                                                       // NonRefinable, so a wrong one is dead weight
                                 };
                             }
@@ -1216,16 +1241,41 @@ namespace MirBot
                     // A spell is worth more than a marginal weapon to a character that cannot cast,
                     // and the book seller is the stop most likely to be last, so the purse is held
                     // until that stop has had its turn.
-                    if (!_boughtGear && _config.BuyGear && _bookSeller != null)
+                    // RESERVE THE BOOK'S PRICE, NOT THE WHOLE PURSE.
+                    //
+                    // Holding everything back until the book stop "has had its turn" became
+                    // holding everything back FOR EVER, because the itinerary deliberately queues
+                    // the book seller LAST - for the same spending-priority reason. Two individually
+                    // correct rules deadlocked: a level 16 warrior with 46,000 gold walked past the
+                    // armour seller on every trip, reached the book seller at the end, and the trip
+                    // finished. It wore its level-1 starter outfit the whole time, and said nothing,
+                    // because the diagnostic is identical at every stop and the log only writes on
+                    // change.
+                    //
+                    // Reserving the BOOK'S cost instead protects exactly what the rule was written
+                    // to protect, and leaves everything above it free to spend.
+                    //
+                    // AND ONLY WHEN THE BOOK IS ACTUALLY REACHABLE. Potion Mastery costs 2,500,000
+                    // at the vendor; reserving that would re-create the deadlock in a form no
+                    // low-level character could ever escape. A book we cannot afford on this trip
+                    // is not a claim on this trip's gold.
+                    long bookHold = _bookSeller != null && _bookReserve > 0 &&
+                                    world.Gold - _config.GoldReserve >= _bookReserve
+                        ? _bookReserve
+                        : 0;
+
+                    if (!_boughtGear && _config.BuyGear && bookHold > 0 &&
+                        world.Gold - _config.GoldReserve - bookHold <= 0)
                     {
                         GearDiagnostic =
-                            $"holding gold for {_bookSeller.NPC?.NPCName}, who sells books we want";
+                            $"holding {bookHold:N0} for {_bookSeller.NPC?.NPCName}, who sells a " +
+                            $"book we want, and {world.Gold:N0} leaves nothing over";
                     }
                     else if (!_boughtGear && _config.BuyGear)
                     {
                         _boughtGear = true;
 
-                        NPCGood good = BestUpgradeOnPage(world, items, out string why);
+                        NPCGood good = BestUpgradeOnPage(world, items, bookHold, out string why);
 
                         if (good != null)
                         {
@@ -1236,7 +1286,9 @@ namespace MirBot
                                 Action = BotAction.NPCBuy,
                                 Reason = $"1 x {good.Item.ItemName}",
                                 BuyIndex = good.Index,
-                                BuyAmount = 1
+                                BuyAmount = 1,
+                                CapitalPurchase = true,
+                                BuyItemIndex = good.Item.Index
                             };
                         }
 
@@ -1320,6 +1372,7 @@ namespace MirBot
 
                     if (StuckIn(TimeSpan.FromSeconds(20)))
                     {
+                        if (_postBankSaleNeeded && PlanPostBankSale(world, items)) return null;
                         Enter(TownPhase.Returning, "banking done");
                         return null;
                     }
@@ -1357,6 +1410,9 @@ namespace MirBot
                         else
                         {
                             Backpack.Reclaim take = reclaims[0];
+
+                            if (take.Why.Contains("selling", StringComparison.OrdinalIgnoreCase))
+                                _postBankSaleNeeded = true;
 
                             BankDiagnostic = $"reclaiming {take.Item.Info.ItemName} ({take.Why}), " +
                                              $"{reclaims.Count - 1} more to follow";
@@ -1422,7 +1478,7 @@ namespace MirBot
                     // Stow what we cannot use yet but will.
                     foreach (KeyValuePair<int, ClientUserItem> carried in items.Carried.ToList())
                     {
-                        if (!Backpack.WorthStoring(carried.Value, world.Class, world.Gender,
+                        if (!items.ShouldBank(carried.Value, world.Class, world.Gender,
                                 world.Level, world.PlayerStats, _books, world)) continue;
 
                         // Parts go to their own grid. The server keeps PartsStorage separate from
@@ -1464,6 +1520,8 @@ namespace MirBot
                     if (string.IsNullOrEmpty(BankDiagnostic))
                         BankDiagnostic = $"nothing to move: {items.StoredCount} stored, " +
                                          "none usable yet and nothing worth storing";
+
+                    if (_postBankSaleNeeded && PlanPostBankSale(world, items)) return null;
 
                     Enter(TownPhase.Returning, "banking done");
                     return null;
@@ -1512,6 +1570,53 @@ namespace MirBot
         /// caller has to branch on all three, and the Teleporting case must not fall through into
         /// stale phase logic after this has moved Phase and _target.</summary>
         private enum PlanOutcome { Travelling, Banking, NothingToDo }
+
+        /// <summary>
+        /// Banking follows shopping, so obsolete withdrawals need one last seller visit. This is
+        /// sell-only: do not re-run the full shopping plan and buy another round of supplies.
+        /// </summary>
+        private bool PlanPostBankSale(WorldModel world, Backpack items)
+        {
+            _postBankSaleNeeded = false;
+            _itinerary.Clear();
+
+            List<ItemType> uncovered = items
+                .DisposableSlots(world.Class, world.Gender, world.Level, world.PlayerStats,
+                    _config.HealthPotionTarget(world.MaxBagWeight),
+                    _config.ManaPotionTarget(world.MaxBagWeight),
+                    _config.TownScrollReserve, _books, world)
+                .Select(slot => items.InSlot(slot)?.Info)
+                .Where(info => info != null)
+                .Select(info => info.ItemType)
+                .Distinct()
+                .ToList();
+
+            while (uncovered.Count > 0)
+            {
+                VendorEntry buyer = _directory.BestBuyerFor(uncovered, world.MapIndex,
+                    world.MapIndex);
+                if (buyer == null) break;
+                int before = uncovered.Count;
+                uncovered.RemoveAll(buyer.Buys.Contains);
+                if (uncovered.Count == before) break;
+                if (!_itinerary.Contains(buyer)) _itinerary.Enqueue(buyer);
+            }
+
+            if (_itinerary.Count == 0)
+            {
+                BankDiagnostic = "reclaimed items need selling but no buyer exists on this map";
+                return false;
+            }
+
+            _target = _itinerary.Dequeue();
+            _postBankSaleActive = true;
+            _currentPage = null;
+            _buttonPath.Clear();
+            _sold = false;
+            Enter(TownPhase.Travelling, "selling reclaimed gear at " + _target.NPC.NPCName);
+            BankDiagnostic = "returning to a vendor to sell reclaimed obsolete gear";
+            return true;
+        }
 
         /// <summary>
         /// Build an itinerary for ONE map - the map the trip will actually be spent on.
@@ -1789,6 +1894,12 @@ namespace MirBot
                 if (bookSeller != null) _itinerary.Enqueue(bookSeller);
 
                 _bookSeller = bookSeller;
+
+                // What the pending book actually costs, so gear can reserve THAT rather than the
+                // entire purse. Cheapest wanted book on the seller's pages: if we can afford any
+                // of them the trip is worth protecting, and the cheapest is the one we would buy
+                // first.
+                _bookReserve = bookSeller == null ? 0 : CheapestWantedBook(bookSeller, wanted);
 
                 BookDiagnostic = $"{wanted.Count} skills wanted at level {world.Level}, " +
                                  $"seller: {bookSeller?.NPC.NPCName ?? "none"}";
@@ -2194,13 +2305,14 @@ namespace MirBot
         /// Only the definition is known for something on a shelf, so the score is a floor. That is
         /// the right way round: we may under-rate a shop item, never over-rate it.
         /// </summary>
-        private NPCGood BestUpgradeOnPage(WorldModel world, Backpack items, out string why)
+        private NPCGood BestUpgradeOnPage(WorldModel world, Backpack items, long bookHold,
+            out string why)
         {
             why = "";
 
             if (_currentPage?.Goods == null) { why = "page sells nothing"; return null; }
 
-            long spendable = world.Gold - _config.GoldReserve;
+            long spendable = world.Gold - _config.GoldReserve - Math.Max(0, bookHold);
 
             if (spendable <= 0)
             {
@@ -2219,7 +2331,9 @@ namespace MirBot
 
                 if (info == null) continue;
                 if (_target?.NPC != null && good.GoodsIndex != _target.NPC.GoodsIndex) continue;
-                if (info.Price <= 0 || info.Price > spendable) continue;
+                long cost = CostOf(good);
+
+                if (cost <= 0 || cost > spendable) continue;
 
                 int gain = items.UpgradeGain(info, world.Class, world.Gender, world.Level,
                     world.PlayerStats);
@@ -2262,7 +2376,7 @@ namespace MirBot
                 // suspicion in the duplicate case above is that the slot was read as EMPTY - an
                 // empty slot makes anything wearable a gain of its whole score - and the log could
                 // neither confirm nor rule that out. It can now.
-                why = $"+{bestGain} for {best.Item.Price:N0} gold, {world.Gold:N0} held " +
+                why = $"+{bestGain} for {CostOf(best):N0} gold, {world.Gold:N0} held " +
                       $"(vs {items.DescribeWornFor(best.Item.ItemType, world.Class)})";
                 return best;
             }
@@ -2346,7 +2460,7 @@ namespace MirBot
             foreach (NPCGood good in _currentPage.Goods)
             {
                 if (good?.Item == null || good.Item.ItemType != type) continue;
-                if (best == null || good.Item.Price < best.Item.Price) best = good;
+                if (best == null || CostOf(good) < CostOf(best)) best = good;
             }
 
             return best;
@@ -2452,6 +2566,38 @@ namespace MirBot
         /// </summary>
         private int _scrollFailedHere = -1;
 
+        /// <summary>What the pending book stop is expected to cost. See the gear branch.</summary>
+        private long _bookReserve;
+
+        /// <summary>
+        /// The cheapest wanted book this seller stocks, priced as the server prices it.
+        ///
+        /// Returns 0 when nothing can be found, which makes the gear branch stop holding - an
+        /// unknown cost is not a reason to freeze spending indefinitely.
+        /// </summary>
+        private long CheapestWantedBook(VendorEntry seller, List<int> wanted)
+        {
+            if (seller?.Page?.Goods == null || _books == null) return 0;
+
+            long cheapest = 0;
+
+            foreach (NPCGood good in seller.Page.Goods)
+            {
+                if (good?.Item == null) continue;
+                if (good.Item.ItemType != ItemType.Book) continue;
+
+                MagicInfo magic = _books.For(good.Item);
+
+                if (magic == null || !wanted.Contains(magic.Index)) continue;
+
+                long cost = CostOf(good);
+
+                if (cost > 0 && (cheapest == 0 || cost < cheapest)) cheapest = cost;
+            }
+
+            return cheapest;
+        }
+
         /// <summary>Set when the server confirms the town scroll was actually consumed.</summary>
         private bool _scrollConsumed;
 
@@ -2502,7 +2648,7 @@ namespace MirBot
         {
             if (good?.Item == null || amount <= 0) return;
 
-            _potionGoldSpent += (long)good.Item.Price * amount;
+            _potionGoldSpent += CostOf(good) * amount;
         }
 
         /// <summary>
@@ -2598,7 +2744,7 @@ namespace MirBot
         {
             if (good?.Item == null || wanted <= 0) return 0;
 
-            long price = Math.Max(1, good.Item.Price);
+            long price = Math.Max(1, CostOf(good));
 
             return (int)Math.Min(wanted, gold / price);
         }
@@ -2663,7 +2809,7 @@ namespace MirBot
             // is expensive then expensive is what we buy, because not drinking is worse.
             double GoldPerHeal(NPCGood g) =>
                 Restores(g) <= 0 ? double.MaxValue
-                                 : Math.Max(0, (double)g.Item.Price) / Restores(g);
+                                 : Math.Max(0, (double)CostOf(g)) / Restores(g);
 
             // max(1, weight) so a weightless item cannot set the bar at zero and strike out
             // everything else - the same trap the ranking fell into.
@@ -2798,7 +2944,8 @@ namespace MirBot
 
                 if (want <= 0) want = 1;
 
-                long canBuy = good.Item.Price > 0 ? spendable / good.Item.Price : want;
+                long cost = CostOf(good);
+                long canBuy = cost > 0 ? spendable / cost : want;
 
                 // Enough to be worth the walk, or the whole remaining target if that is smaller.
                 if (canBuy >= Math.Min(want, Math.Max(1, _config.MinUsefulPotionBuy))) return good;
@@ -2810,9 +2957,35 @@ namespace MirBot
             NPCGood cheapest = candidates[0];
 
             foreach (NPCGood good in candidates)
-                if (good.Item.Price < cheapest.Item.Price) cheapest = good;
+                if (CostOf(good) < CostOf(cheapest)) cheapest = good;
 
             return cheapest;
+        }
+
+        /// <summary>
+        /// What this vendor ACTUALLY charges, which is not ItemInfo.Price.
+        ///
+        /// The server bills NPCGood.Cost (PlayerObject.cs:9440,
+        /// `price = Math.Max(1, good.Cost * currency.ExchangeRate)`). ItemInfo.Price is the item's
+        /// nominal value and the two routinely disagree - Potion Mastery is listed at 1,000 and
+        /// sold at 2,500,000 - and Cost varies BY VENDOR for the same item, which a single field
+        /// on ItemInfo structurally cannot express: Healing Potion (IV) is 1,250 at one shop and
+        /// 2,500 at another.
+        ///
+        /// Every purchase decision in this file priced from ItemInfo.Price, so affordability
+        /// checks, the potion gold budget and the upgrade bar were all computed against a number
+        /// the server never uses. A level 31 warrior with a million gold ordered Potion Mastery
+        /// twice believing it cost a thousand; both orders were silently refused, and because
+        /// nothing learned the real price it would have kept trying indefinitely.
+        ///
+        /// Falls back to ItemInfo.Price only when Cost is unset, so a good with no explicit price
+        /// still prices sensibly rather than as free.
+        /// </summary>
+        private static long CostOf(NPCGood good)
+        {
+            if (good?.Item == null) return 0;
+
+            return good.Cost > 0 ? good.Cost : good.Item.Price;
         }
 
         private static bool IsManaPotion(ItemInfo info) =>

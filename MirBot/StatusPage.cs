@@ -258,13 +258,21 @@ namespace MirBot
 <h1>MirBot — <span id="host"></span></h1>
 <div class="tabs">
   <button id="tab-bots" class="on">Bots</button>
+  <button id="tab-info">Info</button>
   <button id="tab-settings">Settings</button>
 </div>
 <div id="page-bots">
 <div id="alerts"></div>
 <div id="strip" class="strip"></div>
 <div id="botdetail"></div>
+</div>
+<div id="page-info" class="hide">
+<details class="mem" id="maptripmem"><summary>Map selections and trips</summary>
+  <div class="controls"><label>Character <select id="maptripchar"><option value="">all characters</option></select></label>
+    <span class="detail">Kills are positive XP awards on the selected map (a proxy; item or quest XP can also count). New rows begin with this build.</span></div>
+  <div id="maptriptable"></div></details>
 <details class="mem" id="huntmem"><summary>Hunting memory</summary>
+  <div class="detail">Scores use the baseline 25% death penalty; an individual bot's loss-watch travel choice may use a higher penalty.</div>
   <div class="controls">
     <input type="search" id="huntq" placeholder="search map or class" autocomplete="off">
     <select id="huntclass"><option value="">all classes</option></select>
@@ -276,6 +284,17 @@ namespace MirBot
   <div id="hunttable"></div></details>
 <details class="mem" id="deathmem"><summary>Recent deaths</summary>
   <div id="deathtable"></div></details>
+<details class="mem" id="levelmem"><summary>Level ups</summary>
+  <div class="controls"><label>Character <select id="levelchar"><option value="">all characters</option></select></label>
+    <span class="detail">Times shown in your local timezone; ≈ means a historical estimate.</span></div>
+  <div id="leveltable"></div></details>
+<details class="mem" id="lootmem"><summary>Drop lookup</summary>
+  <div class="controls">
+    <input type="search" id="lootq" placeholder="item name, e.g. Fire Wall" autocomplete="off">
+    <button id="lootgo">Search</button>
+    <span class="detail" id="lootnote">Searches the bot log and its rotations.</span>
+  </div>
+  <div id="loottable"></div></details>
 </div>
 
 <div id="page-settings" class="hide">
@@ -389,13 +408,18 @@ const CARD_HTML = `
       <div><div class="k">MP</div><div class="v" data-r="mp"></div>
            <div class="bar mp"><i data-r="mpbar"></i></div></div>
       <div><div class="k">Experience</div><div class="v" data-r="xp"></div>
-           <div class="bar xp"><i data-r="xpbar"></i></div></div>
+           <div class="bar xp"><i data-r="xpbar"></i></div>
+           <div class="detail" data-r="xppace"></div>
+           <div class="detail" data-r="xpeta"></div></div>
       <div><div class="k">Gold</div><div class="v" data-r="gold"></div>
            <svg class="spark" data-r="spark" preserveAspectRatio="none" viewBox="0 0 100 26">
              <path class="fill" data-r="sparkfill"></path><path data-r="sparkline"></path></svg></div>
       <div><div class="k">Bag</div><div class="v" data-r="bag"></div></div>
       <div><div class="k">Location</div><div class="v" data-r="loc"></div>
            <div class="detail" data-r="locdetail"></div></div>
+      <div class="wide"><div class="k">Farming destination (last choice)</div>
+           <div class="v" data-r="farmdest"></div>
+           <div class="detail" data-r="farmreason"></div></div>
       <div><div class="k">Coverage</div><div class="v" data-r="coverage"></div>
            <div class="detail" data-r="coverdetail"></div></div>
       <div><div class="k">Town trip</div><div class="v" data-r="trip"></div>
@@ -421,9 +445,14 @@ const CARD_HTML = `
     <div class="pane"><h4 data-r="storehead">Storage</h4>
       <div class="scroll cells" data-r="storelist"></div></div>
 
+    <div class="pane"><h4 data-r="skillshead">Skills</h4>
+      <div class="scroll"><table><tr><th>Skill</th><th class="num">Lvl</th><th>Progress</th></tr>
+        <tbody data-r="skills"></tbody></table></div></div>
+
     <div class="pane"><h4 data-r="petshead">Pets</h4>
       <div class="scroll"><table><tr><th>Pet</th><th>HP</th><th>Away</th></tr>
         <tbody data-r="pets"></tbody></table></div></div>
+
 
     <div class="pane"><h4>History</h4>
       <div class="scroll"><table><tr><th>Action</th><th>Subject</th><th>When</th></tr>
@@ -602,6 +631,7 @@ function dotFor(b) {
 }
 
 const WHY = [
+  ["moneyDiagnostic",   "Money"],
   ["sellDiagnostic",    "Selling"],
   ["weightDiagnostic",  "Weight"],
   ["supplyDiagnostic",  "Supplies"],
@@ -659,6 +689,20 @@ function patch(card, b) {
     ? (b.atMaxLevel ? "max level" : "—")
     : `${b.experiencePercent}%`);
   el.xpbar.style.width = (b.experiencePercent ?? 0) + "%";
+  const coverage = b.xpCoverageSeconds || 0;
+  text(el.xppace, b.xpRatePerHour == null
+    ? `XP/hour: warming up (${Math.floor(coverage / 60)}/20m)`
+    : `XP/hour (last ${Math.round(coverage / 60)}m of 2h): ${group(b.xpRatePerHour)}`);
+  const eta = b.estimatedNextLevelSeconds;
+  const etaText = b.atMaxLevel ? "max level" :
+    b.experiencePercent === null ? "—" :
+    b.xpRatePerHour == null ? "warming up" :
+    Number(b.xpRatePerHour) <= 0 ? "not progressing" :
+    eta == null ? "—" :
+    eta >= 86400 ? `${Math.floor(eta / 86400)}d ${Math.floor(eta % 86400 / 3600)}h` :
+    eta >= 3600 ? `${Math.floor(eta / 3600)}h ${Math.ceil(eta % 3600 / 60)}m` :
+    `${Math.ceil(eta / 60)}m`;
+  text(el.xpeta, `Est. next level: ${etaText}`);
 
   // Gold arrives as a STRING because it can exceed 2^53 - see the comment on BotStatus. Grouping
   // is done on the digits themselves rather than via Number(), which would quietly round it.
@@ -670,6 +714,9 @@ function patch(card, b) {
   text(el.loc, `${b.mapName || ("map " + b.mapIndex)} · ${b.x},${b.y}` +
                (b.inSafeZone ? " · safe" : ""));
   text(el.locdetail, "map " + b.mapIndex);
+  text(el.farmdest, b.farmingDestinationName || "—");
+  text(el.farmreason, b.farmingDestinationReason ||
+    "No hunting-ground choice recorded since this host started.");
   text(el.coverage, b.explorationTotalSectors
     ? `${b.explorationVisitedSectors}/${b.explorationTotalSectors} sectors`
     : "—");
@@ -707,6 +754,31 @@ function patch(card, b) {
   renderSlots(card, el.equip, b.equipment);
   renderCells(card, "bag", el.baglist, b.inventory, 48);
   renderCells(card, "store", el.storelist, storage, 0);
+
+  // SKILLS. Two levels are shown and they are not the same thing: `Lvl` is the SKILL's own
+  // level (1-3, trained on its own experience track), and the greyed-out rows are spells the
+  // character has learnt that the BOT cannot use. That second case is not hypothetical - Wizzler
+  // learnt Fire Wall and has never cast it, because ground-targeted spells need a location in the
+  // packet and the cast path only sends a target. A skill list that hid that would be lying.
+  const skills = b.skills || [];
+  const unusable = skills.filter(s => s.use === "unused").length;
+
+  text(el.skillshead, skills.length
+    ? `Skills (${skills.length}${unusable ? `, ${unusable} unused` : ""})`
+    : "Skills");
+
+  rows(card, "skills", el.skills, skills.length
+    ? skills.map(s => `<tr title="${esc(s.castable
+          ? s.school + (s.needLevel ? ` - next level at character level ${s.needLevel}` : "")
+          : s.why)}" style="${s.use === "unused" ? "opacity:.45" : ""}">
+        <td>${esc(s.name)}${s.use === "active" ? ""
+              : ` <span class="count">${s.use}</span>`}</td>
+        <td class="num">${s.level}</td>
+        <td>${s.nextExperience > 0
+              ? `<span class="count">${group(s.experience)}/${group(s.nextExperience)}</span>`
+              : `<span class="count">max</span>`}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="3" style="color:var(--dim)">none learnt</td></tr>`);
 
   // PETS. The heading carries the standing order, because a pet doing nothing is far more often
   // the mode than the pet: PetMode.Move and PetMode.None make the server null its target outright
@@ -1038,18 +1110,135 @@ async function loadDeaths() {
       "<td>" + d.x + "," + d.y + "</td></tr>").join("") + "</table>";
 }
 
+// DROP LOOKUP.
+//
+// Searched on demand rather than polled: the host reads up to three 32MB log files to answer, so
+// this must never join the one-second refresh. Deliberately NOT wired to the memory auto-refresh
+// below for the same reason.
+async function loadLoot() {
+  const q = document.getElementById("lootq").value.trim();
+  const box = document.getElementById("loottable");
+  const note = document.getElementById("lootnote");
+
+  if (q.length < 2) {
+    box.innerHTML = "<div class='detail'>type at least two characters</div>";
+    return;
+  }
+
+  note.textContent = "searching...";
+
+  let rows;
+  try { rows = await (await fetch("/api/loot?take=400&item=" + encodeURIComponent(q),
+                                  { cache:"no-store" })).json(); }
+  catch (e) { note.textContent = "search failed"; return; }
+
+  note.textContent = `${rows.length} result(s) for "${q}"`;
+
+  if (!rows.length) {
+    box.innerHTML = "<div class='detail'>never looted in the retained log. " +
+      "Note the log rotates, so this is not proof it has never dropped.</div>";
+    return;
+  }
+
+  // A per-map tally first: "where does this come from" is the question being asked far more often
+  // than "list every instance", and scrolling 400 rows to count them by eye is not an answer.
+  const byMap = {};
+  for (const r of rows) byMap[r.mapName || "?"] = (byMap[r.mapName || "?"] || 0) + 1;
+
+  const summary = Object.entries(byMap).sort((a, b) => b[1] - a[1])
+    .map(([m, n]) => `${esc(m)} <span class="count">x${n}</span>`).join(" &middot; ");
+
+  box.innerHTML = "<div class='detail' style='margin:6px 0'>" + summary + "</div>" +
+    "<table><tr><th>When</th><th>Item</th><th>Who</th><th>Class</th><th class='num'>Lvl</th>" +
+    "<th>Map</th><th>Where</th></tr>" +
+    rows.map(r => "<tr><td>" + esc(r.time) + "</td><td>" + esc(r.item) + "</td>" +
+      "<td>" + esc(r.character || r.bot) + "</td><td>" + esc(r.class || "—") +
+      "</td><td class='num'>" + r.level + "</td>" +
+      "<td>" + esc(r.mapName) + "</td>" +
+      "<td>" + r.x + "," + r.y + "</td></tr>").join("") + "</table>";
+}
+
+document.getElementById("lootgo").addEventListener("click", loadLoot);
+document.getElementById("lootq").addEventListener("keydown", e => {
+  if (e.key === "Enter") loadLoot();
+});
+
 let memFetchedAt = 0;
+let levelRows = [];
+let mapTripRows = [];
+
+function renderMapTrips() {
+  const chosen = document.getElementById("maptripchar").value;
+  const rows = mapTripRows.filter(r => !chosen || levelKey(r) === chosen);
+  const box = document.getElementById("maptriptable");
+  if (!rows.length) { box.innerHTML = "<div class='detail'>none recorded yet</div>"; return; }
+  box.innerHTML = "<table><tr><th>Selected (local)</th><th>Character</th><th>Class</th>" +
+    "<th>Destination</th><th>Reason selected</th><th>Arrived</th><th>Kills*</th>" +
+    "<th>Left (local)</th><th>Reason left</th></tr>" +
+    rows.map(r => "<tr><td>" + new Date(r.selectedUtc).toLocaleString() + "</td><td>" +
+      esc(r.character || r.bot) + "</td><td>" + esc(r.class || "—") + "</td><td>" +
+      esc(r.map) + "</td><td>" + esc(r.selectionReason) + "</td><td>" +
+      (r.arrivedUtc ? new Date(r.arrivedUtc).toLocaleString() : "—") +
+      "</td><td class='num'>" + r.creditedKills + "</td><td>" +
+      (r.leftUtc ? new Date(r.leftUtc).toLocaleString() : "active") + "</td><td>" +
+      esc(r.leavingReason || "—") + "</td></tr>").join("") + "</table>";
+}
+
+async function loadMapTrips() {
+  try { mapTripRows = await (await fetch("/api/map-trips?take=500", {cache:"no-store"})).json(); }
+  catch (e) { return; }
+  const sel = document.getElementById("maptripchar"), chosen = sel.value;
+  const names = [...new Map(mapTripRows.map(r => [levelKey(r), r.character || r.bot])).entries()]
+    .sort((a,b) => a[1].localeCompare(b[1]));
+  sel.innerHTML = "<option value=''>all characters</option>" +
+    names.map(([key,name]) => `<option value="${esc(key)}">${esc(name)}</option>`).join("");
+  sel.value = chosen;
+  renderMapTrips();
+}
+document.getElementById("maptripchar").addEventListener("change", renderMapTrips);
+// Option values pass through the HTML parser, which replaces U+0000 with U+FFFD.
+// Keep this key HTML-safe so a selected character can match the JSON rows.
+function levelKey(r) { return encodeURIComponent(r.bot) + "|" + encodeURIComponent(r.character); }
+
+function renderLevels() {
+  const chosen = document.getElementById("levelchar").value;
+  const rows = levelRows.filter(r => !chosen || levelKey(r) === chosen);
+  const box = document.getElementById("leveltable");
+  if (!rows.length) { box.innerHTML = "<div class='detail'>none recorded yet</div>"; return; }
+  box.innerHTML = "<table><tr><th>When (local)</th><th>Character</th><th>Class</th>" +
+    "<th>Level reached</th><th>Time since previous level-up</th><th>Source</th></tr>" +
+    rows.map(r => "<tr><td>" + new Date(r.utc).toLocaleString() + "</td><td>" +
+      esc(r.character || r.bot) + "</td><td>" + esc(r.class || "—") + "</td><td>" +
+      r.toLevel + "</td><td>" + (r.interval ? (r.intervalApproximate ? "≈ " : "") + esc(r.interval) : "—") +
+      "</td><td>" + esc(r.source) + "</td></tr>").join("") + "</table>";
+}
+
+async function loadLevels() {
+  try { levelRows = await (await fetch("/api/levels?take=2000", {cache:"no-store"})).json(); }
+  catch (e) { return; }
+  const sel = document.getElementById("levelchar"), chosen = sel.value;
+  const names = [...new Map(levelRows.map(r => [levelKey(r), r.character])).entries()]
+    .sort((a,b) => a[1].localeCompare(b[1]));
+  sel.innerHTML = "<option value=''>all characters</option>" +
+    names.map(([key,name]) => `<option value="${esc(key)}">${esc(name)}</option>`).join("");
+  sel.value = chosen;
+  renderLevels();
+}
+document.getElementById("levelchar").addEventListener("change", renderLevels);
 
 async function loadMemory(bots) {
+  if (activeTab !== "info") return;
   const now = Date.now();
   if (now - memFetchedAt < 30000) return;
   memFetchedAt = now;
 
   if (document.getElementById("huntmem").open) loadHunting(bots);
   if (document.getElementById("deathmem").open) loadDeaths();
+  if (document.getElementById("levelmem").open) loadLevels();
+  if (document.getElementById("maptripmem").open) loadMapTrips();
 }
 
-for (const id of ["huntmem", "deathmem"]) {
+for (const id of ["huntmem", "deathmem", "levelmem", "maptripmem"]) {
   document.getElementById(id).addEventListener("toggle", () => { memFetchedAt = 0; });
 }
 
@@ -1187,15 +1376,17 @@ let activeTab = "bots";
 function showTab(name) {
   activeTab = name;
 
-  for (const id of ["bots", "settings"]) {
+  for (const id of ["bots", "info", "settings"]) {
     document.getElementById("tab-" + id).classList.toggle("on", id === name);
     document.getElementById("page-" + id).classList.toggle("hide", id !== name);
   }
 
   if (name === "settings") { cfgFetchedAt = 0; loadConfig(); }
+  if (name === "info") { memFetchedAt = 0; loadMemory(huntBots); }
 }
 
 document.getElementById("tab-bots").addEventListener("click", () => showTab("bots"));
+document.getElementById("tab-info").addEventListener("click", () => showTab("info"));
 document.getElementById("tab-settings").addEventListener("click", () => showTab("settings"));
 
 // --- items ------------------------------------------------------------------------------------

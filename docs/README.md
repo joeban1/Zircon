@@ -18,5 +18,6 @@ Read [AGENTS](../AGENTS.md) first, then one router → one detailed section → 
 | Graphics / assets | [RENDERING_AND_ASSETS](RENDERING_AND_ASSETS.md) |
 | Content tools | [CONTENT_AND_EDITORS](CONTENT_AND_EDITORS.md) |
 | Editor plugins | [PLUGINS](PLUGINS.md) |
+| Headless MirBot and tests | [BOT_STATE](../zircon-bot-state.md) → [inventory packet model](../zircon-bot-inventory-model.md) or [bot design](../zircon-llm-bot-design.md) as needed |
 
 Current rendering ownership and historical-proposal status: [RENDERING_AND_ASSETS](RENDERING_AND_ASSETS.md#migration-context-and-checks).

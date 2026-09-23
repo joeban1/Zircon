@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
 using Library;
 
 namespace MirBot
@@ -34,6 +36,18 @@ namespace MirBot
     /// </summary>
     public sealed class SpellBook
     {
+        public readonly record struct AreaAim(ClientUserMagic Magic, Point Point,
+            MirDirection Direction, int Covered);
+
+        private readonly record struct AreaReservation(int MapIndex, HashSet<Point> Cells,
+            DateTime ExpiresUtc);
+        private readonly List<AreaReservation> _areaReservations = new List<AreaReservation>();
+        private int _areaMapIndex = -1;
+
+        private static bool DamageSpell(MagicType type) =>
+            Castable.Contains(type) || AoeGeometry.Shapes.ContainsKey(type);
+        private bool EnabledAttackType(MagicType type) =>
+            Castable.Contains(type) || _config.AoeEnabled && AoeGeometry.Shapes.ContainsKey(type);
         /// <summary>
         /// Spells that take a single hostile target and hurt it.
         ///
@@ -64,6 +78,82 @@ namespace MirBot
             MagicType.Hemorrhage, MagicType.FlamingDaggers, MagicType.Shredding,
             MagicType.HellFire
         };
+
+        /// <summary>
+        /// Can the bot cast this type of spell AT ALL?
+        ///
+        /// Asked by the status page so a skill the character has learnt but the bot cannot use is
+        /// visible as such. Wizzler learnt Fire Wall and cast Cyclone 8,685 times instead, and
+        /// nothing in the UI could show why: ground-targeted spells need a location in the packet
+        /// and this cast path only sends a target. That is a real limitation and it should be on
+        /// the screen rather than in a comment.
+        /// </summary>
+        public static bool IsCastable(MagicType type) => DamageSpell(type);
+
+        /// <summary>
+        /// Does the bot have ANY path that uses this magic, and if not, why not?
+        ///
+        /// Broader than IsCastable because damage is not the only thing a skill can be for: the
+        /// self-buffs, the poison path and the two spells the brain drives directly (Heal and
+        /// Summon Skeleton) all live outside Castable and are all genuinely used.
+        ///
+        /// The reason string is the useful half. "Not castable" on a learnt skill invites the
+        /// conclusion that something is broken, when the honest answer is usually that this
+        /// particular spell shape was never implemented.
+        /// </summary>
+        /// <summary>
+        /// Always-on skills that need no action from anybody.
+        ///
+        /// Kept separate from "the bot drives it" because the honest answer for these is neither
+        /// yes nor no: there is nothing to drive. Swordsmanship applies on every swing whether or
+        /// not it is named (SkillSet's own comment says so), and Potion Mastery changes what a
+        /// potion restores when it is drunk. Reporting either as "unused" would be wrong, and
+        /// reporting them as driven would be equally wrong.
+        /// </summary>
+        private static readonly HashSet<MagicType> Passive = new HashSet<MagicType>
+        {
+            MagicType.Swordsmanship, MagicType.PotionMastery,
+            MagicType.WillowDance, MagicType.BloodyFlower,
+            MagicType.PledgeOfBlood, MagicType.GhostWalk,
+            MagicType.TouchOfTheDeparted
+        };
+
+        public static bool IsSupported(MagicType type, out string why)
+        {
+            why = "";
+
+            if (DamageSpell(type)) return true;
+            if (SkillSet.Drives(type)) return true;
+
+            foreach ((MagicType magic, BuffType? _, bool __) in SelfBuffs)
+                if (magic == type) return true;
+
+            switch (type)
+            {
+                case MagicType.Heal:
+                case MagicType.PoisonDust:
+                case MagicType.SummonSkeleton:
+                case MagicType.SummonPuppet:
+                case MagicType.WraithGrip:
+                    return true;
+            }
+
+            if (Passive.Contains(type))
+            {
+                why = type == MagicType.PledgeOfBlood || type == MagicType.GhostWalk
+                    ? "passive - augments Cloak or Summon Puppet"
+                    : type == MagicType.TouchOfTheDeparted
+                    ? "passive - augments Wraith Grip"
+                    : "passive - always on, nothing to cast";
+                return false;
+            }
+
+            why = "the bot has no path for this spell shape";
+            return false;
+        }
+
+        /// <summary>Is this an always-on skill rather than something the bot failed to use?</summary>
+        public static bool IsPassive(MagicType type) => Passive.Contains(type);
 
         /// <summary>
         /// Self-buffs worth keeping up, and the BuffType each one grants.
@@ -141,6 +231,8 @@ namespace MirBot
         /// the suppressing and a second record could only drift out of step with it.
         /// </summary>
         private readonly Dictionary<uint, DateTime> _poisonPending = new Dictionary<uint, DateTime>();
+        private readonly Dictionary<uint, DateTime> _wraithPending = new Dictionary<uint, DateTime>();
+        private DateTime _nextPuppet = DateTime.MinValue;
 
         private static readonly TimeSpan PoisonConfirmWindow = TimeSpan.FromSeconds(8);
 
@@ -182,11 +274,13 @@ namespace MirBot
 
             foreach (ClientUserMagic magic in world.Magics)
             {
-                if (magic?.Info == null || !Castable.Contains(magic.Info.Magic)) continue;
+                if (magic?.Info == null || !EnabledAttackType(magic.Info.Magic)) continue;
                 if (magic.ItemRequired) continue;
 
                 names.Add(world.Level >= magic.Info.NeedLevel1
-                    ? $"{magic.Info.Name} ({magic.Cost} mana)"
+                    ? $"{magic.Info.Name} ({magic.Cost} mana" +
+                      (AoeGeometry.Shapes.ContainsKey(magic.Info.Magic) &&
+                       !Castable.Contains(magic.Info.Magic) ? ", area" : "") + ")"
                     : $"{magic.Info.Name} (needs level {magic.Info.NeedLevel1})");
             }
 
@@ -205,7 +299,7 @@ namespace MirBot
                 if (magic?.Info == null) continue;
 
                 string why = magic.ItemRequired ? "needs an item"
-                    : !Castable.Contains(magic.Info.Magic) ? "not a castable type"
+                    : !EnabledAttackType(magic.Info.Magic) ? "not an enabled castable type"
                     : world.Level < magic.Info.NeedLevel1 ? $"needs level {magic.Info.NeedLevel1}"
                     : "castable";
 
@@ -245,7 +339,9 @@ namespace MirBot
                 if (magic.Cost <= 0) continue;
                 if (world.Level < magic.Info.NeedLevel1) continue;
 
-                if (Castable.Contains(magic.Info.Magic)) return true;
+                if (EnabledAttackType(magic.Info.Magic) ||
+                    magic.Info.Magic == MagicType.WraithGrip ||
+                    magic.Info.Magic == MagicType.SummonPuppet) return true;
 
                 foreach ((MagicType Magic, BuffType? Buff, bool AtOwnFeet) self in SelfBuffs)
                     if (self.Magic == magic.Info.Magic) return true;
@@ -259,7 +355,7 @@ namespace MirBot
             foreach (ClientUserMagic magic in world.Magics)
             {
                 if (magic?.Info == null || magic.ItemRequired) continue;
-                if (!Castable.Contains(magic.Info.Magic)) continue;
+                if (!EnabledAttackType(magic.Info.Magic)) continue;
                 if (world.Level < magic.Info.NeedLevel1) continue;
 
                 return true;
@@ -294,7 +390,7 @@ namespace MirBot
             foreach (ClientUserMagic magic in world.Magics)
             {
                 if (magic?.Info == null || magic.ItemRequired) continue;
-                if (!Castable.Contains(magic.Info.Magic)) continue;
+                if (!EnabledAttackType(magic.Info.Magic)) continue;
                 if (world.Level < magic.Info.NeedLevel1) continue;
 
                 if (_cooldowns.TryGetValue(magic.InfoIndex, out DateTime until) &&
@@ -306,6 +402,17 @@ namespace MirBot
                 return true;
             }
 
+            return false;
+        }
+
+        /// <summary>Unlike CanCastNow, area-only magic does not count without a viable cluster.</summary>
+        public bool CanCastSingleNow(WorldModel world)
+        {
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            DateTime now = DateTime.UtcNow;
+            foreach (ClientUserMagic magic in world.Magics)
+                if (magic?.Info != null && Castable.Contains(magic.Info.Magic) &&
+                    EligibleDamage(world, magic, floor, now)) return true;
             return false;
         }
 
@@ -322,7 +429,113 @@ namespace MirBot
             _buffRetry.Clear();
             _buffTries.Clear();
             _poisonPending.Clear();
+            _wraithPending.Clear();
+            _nextPuppet = DateTime.MinValue;
+            _areaReservations.Clear();
+            _areaMapIndex = -1;
             _nextCast = DateTime.MinValue;
+        }
+
+        private bool EligibleDamage(WorldModel world, ClientUserMagic magic, int floor,
+            DateTime now)
+        {
+            if (magic?.Info == null || magic.ItemRequired ||
+                world.Level < magic.Info.NeedLevel1 ||
+                world.Mana - magic.Cost < floor) return false;
+            return !_cooldowns.TryGetValue(magic.InfoIndex, out DateTime until) || now >= until;
+        }
+
+        /// <summary>Best legal area opportunity; a geometric hit count, not guaranteed damage.</summary>
+        public AreaAim? ChooseArea(WorldModel world, WorldObject committed, MapGrid grid,
+            bool ignoreGlobalDelay = false)
+        {
+            if (!_config.AoeEnabled || !_config.CastSpells || committed == null || grid == null ||
+                world.KnownMagicCount == 0) return null;
+            DateTime now = DateTime.UtcNow;
+            if (!ignoreGlobalDelay && now < _nextCast) return null;
+            if (_areaMapIndex != world.MapIndex)
+            {
+                _areaReservations.Clear();
+                _areaMapIndex = world.MapIndex;
+            }
+            _areaReservations.RemoveAll(r => r.ExpiresUtc <= now);
+
+            WorldObject[] hostiles = world.Objects.Where(x => x.IsValidTarget).ToArray();
+            if (hostiles.Length < Math.Clamp(_config.AoeMinimumTargets, 1, 10)) return null;
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            int range = Math.Min(_config.CastRange, 10);
+            AreaAim? best = null;
+            int bestCost = int.MaxValue;
+
+            foreach (ClientUserMagic magic in world.Magics.OrderBy(m => m?.Info?.Magic))
+            {
+                if (magic?.Info == null || !AoeGeometry.Shapes.TryGetValue(magic.Info.Magic,
+                    out AoeShape shape) || !EligibleDamage(world, magic, floor, now)) continue;
+
+                // Rays ignore the supplied location; the server advances from the caster.
+                var centres = new HashSet<Point>();
+                if (AoeGeometry.Directional(shape)) centres.Add(world.Location);
+                else
+                    foreach (WorldObject ob in hostiles)
+                        for (int dx = -3; dx <= 3; dx++)
+                            for (int dy = -3; dy <= 3; dy++)
+                            {
+                                Point p = new Point(ob.Location.X + dx, ob.Location.Y + dy);
+                                // The server accepts an aim on an unwalkable centre if its
+                                // surrounding cells exist; only footprint cells need to exist.
+                                if (p.X >= 0 && p.Y >= 0 && p.X < grid.Width && p.Y < grid.Height &&
+                                    WorldModel.Distance(world.Location, p) <= range)
+                                    centres.Add(p);
+                            }
+
+                foreach (Point centre in centres)
+                {
+                    int directions = AoeGeometry.Directional(shape) ? 8 : 1;
+                    for (int d = 0; d < directions; d++)
+                    {
+                        MirDirection direction = AoeGeometry.Directional(shape)
+                            ? (MirDirection)d : WorldModel.DirectionTo(world.Location, centre);
+                        Point aim = AoeGeometry.Directional(shape)
+                            ? WorldModel.Step(world.Location, direction) : centre;
+                        HashSet<Point> cells = AoeGeometry.Footprint(shape, world.Location, aim,
+                            direction, grid.Width, grid.Height, grid.Walkable);
+                        if (!cells.Contains(committed.Location)) continue;
+                        if (AoeGeometry.Persistent(magic.Info.Magic) &&
+                            _areaReservations.Any(r => r.MapIndex == world.MapIndex &&
+                                AoeGeometry.SubstantiallyOverlaps(cells, r.Cells)))
+                            continue;
+
+                        int covered = hostiles.Count(x => cells.Contains(x.Location) &&
+                            (shape != AoeShape.Meteor || WorldModel.Distance(world.Location, x.Location) <= 10));
+                        if (shape == AoeShape.Meteor) covered = Math.Min(covered, 6 + magic.Level);
+                        if (covered < Math.Clamp(_config.AoeMinimumTargets, 1, 10)) continue;
+                        if (best != null && (covered < best.Value.Covered ||
+                            covered == best.Value.Covered && magic.Cost >= bestCost)) continue;
+                        best = new AreaAim(magic, aim, direction, covered);
+                        bestCost = magic.Cost;
+                    }
+                }
+            }
+            return best;
+        }
+
+        /// <summary>Predictive protection: no spell-object confirmation is available to this bot.</summary>
+        public void ReserveIssued(MagicType type, WorldModel world, Point aim,
+            MirDirection direction, MapGrid grid)
+        {
+            if (!AoeGeometry.Persistent(type) || grid == null ||
+                !AoeGeometry.Shapes.TryGetValue(type, out AoeShape shape)) return;
+            if (_areaMapIndex != world.MapIndex)
+            {
+                _areaReservations.Clear();
+                _areaMapIndex = world.MapIndex;
+            }
+            ClientUserMagic magic = world.Magics.FirstOrDefault(m => m?.Info?.Magic == type);
+            int ticks = ((magic?.Level ?? 0) + 2) * 5;
+            HashSet<Point> cells = AoeGeometry.Footprint(shape, world.Location, aim, direction,
+                grid.Width, grid.Height, grid.Walkable);
+            _areaReservations.Add(new AreaReservation(world.MapIndex, cells,
+                DateTime.UtcNow.AddSeconds(ticks * 2 + 2)));
         }
 
         /// <summary>
@@ -489,6 +702,52 @@ namespace MirBot
             PoisonsCast++;
         }
 
+        /// <summary>Apply the assassin's damage-over-time/paralysis skill once per target.</summary>
+        public ClientUserMagic ChooseWraithGrip(WorldModel world, WorldObject target, int distance)
+        {
+            if (!_config.CastSpells || target == null ||
+                distance > Math.Min(_config.CastRange, 10) || DateTime.UtcNow < _nextCast)
+                return null;
+            if (target.Poison.HasFlag(PoisonType.WraithGrip))
+            {
+                _wraithPending.Remove(target.ObjectID);
+                return null;
+            }
+            if (target.Level > world.Level + 15) return null; // server refuses over-level mobs
+            if (_wraithPending.TryGetValue(target.ObjectID, out DateTime pending) &&
+                DateTime.UtcNow < pending) return null;
+            if (!world.TryGetMagic(MagicType.WraithGrip, out ClientUserMagic magic) ||
+                magic.Info == null || magic.ItemRequired || world.Level < magic.Info.NeedLevel1)
+                return null;
+            if (_cooldowns.TryGetValue(magic.InfoIndex, out DateTime ready) &&
+                DateTime.UtcNow < ready) return null;
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            return world.Mana - magic.Cost >= floor ? magic : null;
+        }
+
+        public void WraithIssued(uint targetID) =>
+            _wraithPending[targetID] = DateTime.UtcNow.AddSeconds(10);
+
+        /// <summary>
+        /// Puppet is a five-second explosive decoy, not a persistent pet. The server also moves
+        /// the caster a few cells and applies Cloak, so use it only in close combat and throttle
+        /// it independently of the server's spell cooldown.
+        /// </summary>
+        public ClientUserMagic ChoosePuppet(WorldModel world, WorldObject target, int distance)
+        {
+            if (!_config.CastSpells || target == null || distance > 2 ||
+                DateTime.UtcNow < _nextCast || DateTime.UtcNow < _nextPuppet) return null;
+            if (!world.TryGetMagic(MagicType.SummonPuppet, out ClientUserMagic magic) ||
+                magic.Info == null || magic.ItemRequired || world.Level < magic.Info.NeedLevel1)
+                return null;
+            if (_cooldowns.TryGetValue(magic.InfoIndex, out DateTime ready) &&
+                DateTime.UtcNow < ready) return null;
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            return world.Mana - magic.Cost >= floor ? magic : null;
+        }
+
+        public void PuppetIssued() => _nextPuppet = DateTime.UtcNow.AddSeconds(60);
+
         /// <summary>Choose our lowest visible pet that Heal can help right now.</summary>
         public ClientUserMagic ChoosePetHeal(WorldModel world, out WorldObject target)
         {
@@ -547,10 +806,15 @@ namespace MirBot
         public void ForgetPoison(uint targetID)
         {
             _poisonPending.Remove(targetID);
+            _wraithPending.Remove(targetID);
             _petHealRetry.Remove(targetID);
         }
 
-        public void ForgetAllPoison() => _poisonPending.Clear();
+        public void ForgetAllPoison()
+        {
+            _poisonPending.Clear();
+            _wraithPending.Clear();
+        }
 
         /// <summary>The buff landed, so the backoff it accumulated is meaningless.</summary>
         public void BuffConfirmed(ClientUserMagic magic)

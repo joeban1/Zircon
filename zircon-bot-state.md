@@ -1,8 +1,240 @@
 # MirBot — current state and open issues
 
-Last updated: **2026-09-21**. Written as a handover so a fresh session has full context without
+Last updated: **2026-09-23**. Written as a handover so a fresh session has full context without
 re-deriving it. Read [zircon-bot-inventory-model.md](zircon-bot-inventory-model.md) first if you
 are touching items, selling or the bag.
+
+## 2026-09-22 base bag-weight parity
+
+- The VM server master at `C:\ZirconBuild\Debug\Server\Database\System.db` was the source of
+  truth; a newer mob-spawn edit made its initial SHA-256
+  `C6E42FBB225AE92EAE1447544254CB3070CF29930DD5A6930332BF876778CC03`, unlike the older
+  desktop client copy. A scoped `BaseStat.BagWeight` patch copied the Warrior value to Wizard,
+  Taoist and Assassin at each matching level 1-90 (264 differing rows). No level rows were
+  missing or duplicated. Read-back found zero differences. The canonical respawn/region
+  fingerprint was unchanged: `1F246DB9AEB26BC758E971D52382D1ABE6BD9ECD0560211BE40527C2F50327A6`.
+- With the Server application closed and port 7000 down, the patched file was copied to the VM
+  server and VM client, desktop client, and MirBot data directory. All four hashes match SHA-256
+  `BE24361B90CD8C12B1B38DA56D0A3B8EE2EEEB82F8BE26CB1661FFE7391757D0` (database
+  version `2026.09.22.3`). Source, patched copy, audit tool and desktop backups are in
+  `C:\HomeServer\bagweight-sync-20260922`; VM master/client backups are in
+  `C:\ZirconBuild\BagWeightStage-20260922`. Bot host was restarted to load the new database,
+  but the Server remained stopped awaiting the operator's restart.
+- After the operator restarted the Server, TCP 7000 was reachable and all eight bots returned to
+  `Playing`; the host API reported database version `2026.09.22.3`.
+
+## 2026-09-23 gear-targeted hunting
+
+- The bot now indexes normal monster equipment drops per map and checks each bot's current
+  class, gender, level, worn score, bag and storage before treating a drop as an upgrade. A
+  target needs a meaningful score gain and enough ordinary spawn/drop opportunity; boss,
+  event, seasonal and over-level sources do not qualify. A target retires automatically when the item
+  is acquired or no longer beats the worn equipment.
+- With at least four maps measured, the normal 15% exploration chance rises to 25% when an
+  affordable, safe, reachable unmeasured map has a worthwhile upgrade. Exploration keeps the
+  existing level and death checks, shallow-floor rule and near-town preference. Ordinary
+  measured hunts receive up to a 50% bounded score bonus, scaled by upgrade value and drop
+  opportunity. Gear-priority choices stop after two consecutive selections, and gear priority
+  is suspended during poverty recovery or loss watch. Book maps keep their existing separate
+  choice rule.
+- A gear-driven choice now fills **Farming destination (last choice)** with the chosen map and
+  `looking for gear upgrade: <item> (score +N)`. This is the reason in both the status API and
+  selected bot GUI; the current location remains separate. The field is blank after restart
+  until that bot makes a new destination choice.
+- The final release build passed 55/55 tests with no warnings. The prior binaries were backed up at
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-23-gear-hunt`; the final host started on
+  2026-09-23 at 07:24 local time, PID 23492. At 135 seconds of host uptime `/api/status`
+  reported all eight bots Playing on database version `2026.09.22.3`. Live GUI reasons included
+  Wizzler choosing Flea Cave Lv 1 for Wooden Shield and Sindo choosing Phantom Forest for Iron
+  Shield; the interim build had shown Wizzler choosing Phantom Forest for Signet Of Vigor.
+
+## 2026-09-23 assassin skill coverage and capacity sample
+
+- Sindo and XxXDreadLordXxX each knew 16 assassin skills. The status page called many "unused"
+  because its supported-skill list only covered Hell Fire, Poisonous Cloud and two attack
+  toggles. Server source shows Pledge Of Blood and Ghost Walk augment Cloak/Summon Puppet,
+  Touch Of The Departed augments Wraith Grip, and Willow Dance/Bloody Flower are passive
+  stats. These now report as passive with the relevant explanation.
+- Summon Puppet is a five-second explosive decoy represented as a player object, not a
+  persistent monster pet. It teleports and cloaks the caster. The bot now casts it in close
+  combat with a 60-second local throttle. Wraith Grip now applies to valid targets once per
+  pending/confirmed poison window. Both are suppressed during frugal recovery combat.
+  Pledge Of Blood can level from Puppet's Cloak application; it is not cast on its own.
+  The standalone Cloak remains unautomated: the server charges health, rejects it for ten
+  seconds after combat, and an ordinary attack removes it. Live status now shows it is the
+  only remaining "unused" skill on either assassin; automating it needs a separate stealth
+  travel decision rather than a combat cast.
+- Full Bloom, White Lotus, Red Lotus and Sweetbrier are C.Attack AttackMagic skills selected
+  by the real client, not C.Magic spells or MagicToggle skills. The bot now selects them,
+  respects server cooldown packets, and favours their buff chain. Calamity Of Full Moon is
+  included among server-armed melee skills. Assassins with melee skills now cast Hell Fire
+  as an occasional opening hit then close to melee, instead of staying at spell range.
+- The initial build passed 58/58 tests, zero warnings. The previous binaries were backed up at
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-23-assassin-skills`; the interim host started
+  at 07:48 local time (PID 25656). At 07:49 Sindo cast Wraith Grip and Summon Puppet,
+  used Full Bloom and White Lotus as melee AttackMagic, and Pledge Of Blood experience
+  rose from 0 to 8. This proves the augment actually activated on the server. The live log
+  also exposed Sindo briefly attacking its own Puppet: it arrived without `PetOwner`, so the
+  ordinary pet exclusion missed it. `WorldModel.IsValidTarget` now excludes monsters identified
+  as Summon Puppet by name or database flag. The final build passed 59/59 tests, zero warnings;
+  the interim binaries were backed up at
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-23-puppet-target`. The final host started at
+  07:53 local time (PID 49952). At 126 seconds of uptime `/api/status` showed all eight
+  bots Playing on DB `2026.09.22.3`. At 07:55 XxXDreadLordXxX summoned a Puppet, then
+  cast Wraith Grip and attacked a Wolf with White Lotus; the immediate follow-up log had
+  no attack on Puppet. Its Pledge Of Blood experience was 28. This verifies the final
+  build's use of the skill paths and the Puppet exclusion in that observed fight.
+- Capacity snapshot with eight bots: desktop 12 logical CPUs, about 17.6 GiB RAM free and
+  2% aggregate CPU at one instant; MirBot used 170 MiB and 0.094 CPU seconds over a 10-second
+  sample (about 0.08% of all 12 logical processors). VM WMI reported 100% CPU at one instant;
+  its QEMU process showed 105% of one Ubuntu CPU over its lifetime. VM memory was 12.27 million
+  KiB total, 7.93 million KiB free. This suggests the VM CPU is the capacity constraint, but
+  neither sample establishes a safe maximum bot count.
+
+## 2026-09-22 Banya Temple gear-targeting review
+
+- Mirbot was level 39 after the database restart and wore Medium Armour (M): AC 4-9, MR 2-3.
+  Iron Plate Armour (M) is wearable from level 33 and has AC 5-15, MR 3-4, but no NPC stocks
+  it. Banya Temple's normal minotaurs are level 45 and drop each gender's Iron Plate Armour at
+  1/6000 per monster drop definition. Banya Temple Lv 1 has 696 configured normal spawns.
+- Before the 2026-09-23 change the bot did not target equipment drops. An unmeasured map passes
+  `MapProfile.WorthExploring` only if its median monster level is at most character level plus
+  `ExploreLevelsAbove=3`, so Mirbot at 39 cannot pick the level-45 Temple. It first qualifies
+  at level 42. After four measured maps, exploration is only a 15% draw at each destination
+  choice; wanted drop-only books compete via a 70% book-goal draw. There is thus no guarantee
+  that reaching level 42 will promptly produce a Temple trip or the armour. The new gear goal
+  improves the chance once the level gate permits it; it does not guarantee a rare drop or
+  override the level gate.
+
+## 2026-09-22 farming-destination GUI, pets and stranded potion
+
+- The selected bot card now has a separate **Farming destination (last choice)** field with the
+  accepted map and the reason (book priority, hunting score, exploration or poverty). Town trips
+  do not overwrite it. It starts blank after a host restart until that bot makes another hunting
+  choice; current location remains independent. Source: `BotInstance`, `BotStatus`, `StatusPage`.
+- The GUI's permanent “no pet summoned” was a snapshot omission: `WorldModel.OwnPets` was used by
+  combat, but `BotInstance.Build` never filled `BotStatus.Pets` or `PetMode`. Both are now copied
+  into the snapshot. After deployment Toby's live API reported one Skeleton at distance 2 and
+  pet mode Both; all eight bots reconnected. Jill had no visible pet in that same snapshot.
+- Sindo had 29 Healing Potions in regular storage slot 1. This was already present in the oldest
+  retained current log snapshot (21:31 on the previous log day); the actual deposit is not in
+  retained logs, so its historical cause cannot be proven. Current `WorthStoring` would not choose
+  a normal potion, but `StorageReclaims` skipped it too because it is usable and has no equipment
+  slot. Consumables are now explicitly excluded from future deposits, and stored health/mana
+  potions are reclaimed through the normal server-confirmed withdrawal path. Book, gear and part
+  storage paths are otherwise unchanged. Sindo's live bank diagnostic now reports one banked
+  item usable, then withdrew the stack at 19:27:31; live storage slot 1 became empty and carried
+  tier-one Healing Potions increased to 33.
+- The tested build (53/53 tests) was deployed with backup
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-22-pets-storage`; new host PID 10904. All eight
+  bots returned to Playing. The server-confirmed potion withdrawal was subsequently witnessed.
+
+## 2026-09-22 weapon-score and quest audit
+
+- Mirbot's Power Axe is 0-22 DC and scores 220 under `Backpack.ScoreFrom` for a warrior weapon
+  (`10 * MaxDC + MinDC`). Sword Of Purification is 10-16 DC and scores 170, so the bot does not
+  equip it. The log confirms Mirbot looted the sword at 08:03:48 and kept Power Axe; Banner's
+  prior equip log also explicitly calls Power Axe (222) an upgrade over that sword (170). At
+  neutral luck, the server's `MapObject.GetDC` rolls uniformly from min to max inclusive, making
+  the weapon-only averages 11 and 13 respectively. Thus the current max-heavy score does **not**
+  optimize mean melee damage. This is a scoring-policy question, not an equip-packet failure; no
+  scoring change has been deployed yet. Positive Luck increases the value of maximum DC, so a
+  future change should account for Luck and attack modifiers rather than simply swapping weights.
+- Comparison of the VM's 2025 Joe donor `System.db` with the current master found five Joeban
+  quests missing four `KillMonster` tasks and five requirement rows (including their level gates).
+  The scoped repair tool in `C:\HomeServer\quest-audit-20260922` was tested on a copy, then
+  deployed with the Server application closed on 2026-09-22. The original live master and both
+  desktop copies were backed up there. All four deployed `System.db` copies hash-match SHA-256
+  `BC4CB9B91238AD6383DC526DD5EA044189C7517CF9B1B28A605A4B55C84D5A38`. Read-back
+  reports zero missing rows. The server was restarted; the old MirBot host logged an in-memory
+  DB mismatch (`2026.09.21.7` versus server `2026.09.22.1`). On request, all eight bots were
+  stopped through their normal API, their memory banks flushed, and the orphaned host process
+  replaced with a fresh one. The new host loaded `2026.09.22.1`, logged no version mismatch,
+  and all eight bots returned to `Playing`. See `zircon-npc-authoring.md` for rows.
+
+## 2026-09-22 dated logs and book-map choice
+
+- `BotLog` now prefixes every new line with local date and time (`yyyy-MM-dd HH:mm:ss.fff`).
+  Historical time-only lines remain unchanged. `LevelBackfill` reads both formats, including
+  dated lines without a host-open anchor. The Info loot lookup displays the new full timestamp.
+- Book-bearing measured maps no longer hard-restrict exploitation. When both book and ordinary
+  eligible maps exist, a per-bot goal draw chooses a book hunt 70% of the time, or 20% while the
+  sustained-loss watch is active. After two book-priority choices, the next eligible ordinary
+  hunt is forced. Map scoring and the top-three weighted draw then run WITHIN the chosen goal's
+  pool, so the book bonus cannot remove ordinary alternatives from the shortlist. Recovery,
+  safety, affordability, and exploration still run before this choice. Settings are
+  `BookHuntChancePercent`, `LossBookHuntChancePercent`, `MaxConsecutiveBookHunts`.
+- Both releases were deployed separately with hash checks and backups at
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-22-dated-logs-stage` and
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-22-book-goal-stage`. The suite passed 48 tests;
+  all eight bots reconnected. The goal-selection rule is deployed but has not yet been observed
+  on a live travel decision.
+- Current observation: level-30 Wizzler was sent to Banya Village by `TryExplore` because it was
+  unmeasured and zero hops from a town. `HuntLevelsBelow=0` disables the lower-level exploration
+  filter, so a starter town remains eligible at level 30. Banner's planned journeys out of Banya
+  were interrupted by deployment relogs. Both had healthy gold and positive adjusted gold trends,
+  not poverty recovery. The new book-goal rule does not address this exploration behavior.
+
+## 2026-09-22 starter-town and exploration follow-up
+
+- The vendor-sold Potion Mastery book does **not** exempt a town from the new outgrown rule.
+  `BookDropIndex.Wanted` includes only books that cannot be bought from a real NPC; the town
+  exception requires such a wanted book to actually drop from monsters on that map.
+- `TownHuntLevelGap=10` defers shopping towns whose median monster level trails the character by
+  ten or more, when healthy and outside recovery. It applies to unmeasured exploration, measured
+  exploitation, and the in-place outgrown trigger after a relog/town trip. It does not block
+  shopping, through-travel, manual destinations, lower-level caves or poverty recovery. Deferred
+  towns remain a fallback when no safer/reachable alternative exists; a bot already on an
+  outgrown town stays put rather than bouncing to another equally outgrown town.
+- Unmeasured exploration now uses the same book-goal draw (70% normally, 20% during loss watch) and
+  two-book-choice streak guard as measured exploitation. The old hard restriction on unmeasured
+  book maps is removed. The goal is picked before the nearest-from-town distance ring so zero-hop
+  towns do not automatically eliminate a desired book map.
+- 50 tests passed. The build was deployed after backing up binaries to
+  `C:\HomeServer\mirbot-deploy-backups\2026-09-22-town-explore-stage`; all eight bots reconnected.
+  Live evidence: Jill, level 30, relogged in Bichon Town; the new trigger logged the typical
+  level-10 monsters as outgrown and planned Ant Cave North. Her arrival there was not yet checked.
+- Banya Stone Cave Lv 1 is one hop from Banya Village and has 350 spawns of level-35 monsters;
+  levels 2-5 are also median 35. No hunting-rate sample or past travel log entry was found.
+  `ExploreLevelsAbove=3` means level-30 bots are ineligible; currently only level-38 Mirbot and
+  level-32 Sindo meet that median-level test. Exploration is still a 15% residual draw once enough
+  maps are measured, then chooses the nearest unmeasured map from town. Banya Village's zero-hop
+  priority and unmeasured book-map restriction previously competed against Stone Cave. The new
+  rules remove those two obstacles but do not guarantee a visit; no bot has yet proven it safe or
+  profitable.
+
+## 2026-09-22 plan deployment and GUI filter fix
+
+- The built-in page (no `status.html` override) has Bots, Info and Settings tabs. Info contains
+  Hunting memory, Recent deaths, Drop lookup with Class, and a persisted level-up table. The
+  level-up character filter originally used a null character inside HTML option values; HTML
+  parsing changed it, so choosing a bot returned no rows. The filter now uses an HTML-safe key.
+  Verified in the live browser with Jill-only history, all eight bot cards, and the other Info
+  panels. If the old page remains open in a browser, reload it once to fetch the new script.
+- Level history persists in `memory/levels.json`; the one-time log backfill imported 165 inferred
+  events and is idempotent. Inferred timestamps/intervals are marked approximate. New level-ups
+  are observed and persisted. XP checkpoints are in `memory/xp.ndjson`; the card shows signed
+  XP/hour over up to two hours of connected play and ETA only when the sample supports it.
+- Hunting-map choice now draws with squared weights from the eligible shortlist, using a 25%
+  baseline death penalty. Each bot can raise its own next-travel penalty to 60% during sustained
+  adjusted gold loss. Confirmed equipment/book spending is tracked as cumulative capital spend
+  in new `gold.ndjson` records; old records remain readable but cannot be retroclassified.
+  Per-bot loss-watch latch files are `memory/profit-<bot>.json`. Manual gold grants are not
+  identifiable and may mask a loss during one watch window.
+- The spell book now aims verified area spells at clusters, including empty centres and all ray
+  directions. Fire Wall/Tempest reservations are predictive (the bot does not ingest spell-object
+  confirmations) and expire after the expected server lifetime. `AoeEnabled` and
+  `AoeMinimumTargets` control the feature; frugal recovery combat still suppresses optional
+  damage spells. Live Wizzler logs show Fire Wall and Scorched Earth casts with mana debits, but
+  they are **not** proof of damage from those spells; confirm health/effect evidence before
+  claiming effectiveness.
+- The final suite passed 43 tests. The deployed host uses staggered 15-second autostart for its
+  eight bots. Before swapping binaries, ask every bot to Stop, wait for Offline, stop the exact
+  `MirBot.exe` PID, then verify the process is gone before copying. Windows may retain the DLL
+  lock briefly after a Stop; never continue to Start after a failed copy, and compare source and
+  deployed hashes. Backups: `C:\HomeServer\mirbot-deploy-backups\2026-09-22-gui-stage`,
+  `2026-09-22-gui-hotfix`, `2026-09-22-level-filter`, `2026-09-22-combined-plan`, and
+  `2026-09-22-aoe-refinement`.
 
 ---
 
@@ -84,9 +316,46 @@ item identical to the one worn is never an upgrade.
 
 ### Hunting ground selection
 
-- **Level floor** (`HuntLevelsBelow`, default 8): skip grounds whose *median* monster level is that
-  far below the character. Previously every level test had an upper bound and no lower one, so a
-  level 22 Taoist farmed chickens in Bichon Town (median 10) on the strength of one lucky sample.
+- **Level floor** (`HuntLevelsBelow`) — **DISABLED (set to 0) 2026-09-22.** It skipped grounds whose
+  *median* monster level was that far below the character. It was wrong twice over:
+  - **It blocked every skill-book source.** The entire early book catalogue (Fire Ball, Heal,
+    Thunder Bolt, Teleportation, Poison Dust, Summon Skeleton, **Fire Wall**) drops only from L18
+    Skeletons and L20 Ghosts, which live exclusively on Banya/Bichon/Lost Paradise Caves Lv 1-3
+    (median 18) and Deserted Mine Lv 1-3 (median 20). At `HuntLevelsBelow=8` every one of those
+    twelve maps is excluded from level 27. Wizzler was structurally incapable of ever learning
+    Fire Wall. Worse, it is an **ordering** bug: `BotInstance` strips outgrown maps out of the loop
+    *before* building `candidates`, and the drop-only-book restriction filters `candidates` — so the
+    `shortlist = int.MaxValue` expansion added specifically to protect book maps is defeated one
+    filter later.
+  - **It was redundant.** Measured exp/hour already ranks these maps down on merit within a band
+    (Assassin band 5: Deserted Mine 578,794 vs Bichon Town 105,178). The codebase already argues
+    this against itself in `HuntingMemory.Best()`: *"'less relevant' is not 'unknown', and the
+    honest expression of it is a discount, not a filter."*
+
+  The symptom it was added for (a level 22 Taoist farming Bichon Town) traced to **poverty
+  recovery**, not to a missing level test — hence the fossil `if (!poor && ...)` guard on it.
+  Code left in place but inert; `OutgrownBy` returns false on `levelsBelow <= 0`.
+- **Confidence floor** (`MinimumSampleHours`, default 0.25): a map may be *ranked* on any rate but
+  cannot be *chosen* from memory until it has been measured for this long; below that it stays an
+  exploration target. A rate is a claim about an hour, and computed over three minutes it is an
+  extrapolation dressed as a measurement. Sindo committed to Despair Valley on **0.3 hours** reading
+  751,454 exp/hour, beating Deserted Mine's 578,794 over 1.9 hours, and died there seven times for
+  ~300,000 gold in potions. Confidence is **summed across every carrying band**, not read off the
+  freshest record, or crossing a band would reset a map to "unproven" — the same amnesia `Best()`
+  was already fixed for once. `MeasuredCount` applies the identical floor so the two agree about
+  what the bot knows. Empty result hands the thin maps back rather than stranding the bot.
+- **Deaths were charged, earnings were not** (fixed 2026-09-22). `RecordDeath` fired
+  unconditionally; `CloseExperienceSample` discarded any window under `MinimumSampleMinutes` (4),
+  and **death did not close the window at all** — it was closed only on *left the map*, *levelled
+  up*, *window complete*. So a map was credited with 100% of its deaths and only some of its
+  earnings, and the faster a map killed you the more completely it was slandered: rate stays 0,
+  which excludes it from `Best()`, and three such visits put it on `Lethal()`, which excludes it
+  from exploration too. Sixteen entries were in that state, including **Ant Cave North — written
+  off at zero by the Wizard while the Warrior measured 680,656 exp/hour there**. Death now closes
+  the window with `force: true`, bypassing the minimum, because a window that ended *because we
+  died* is the whole truth about that visit. Safe against noise since `Record()` is hours-weighted:
+  three minutes joins a 1.9h history at three minutes' worth. Not permanent as first thought —
+  `Lethal()`'s `forgetAfterBands = 2` expires the blacklist after ~10 levels.
 - **Outgrown-here trigger**: travel was only reconsidered when a town trip ended, so a bot parked
   on an outgrown map stayed there indefinitely. Now checked in place, rate-limited to 2 minutes,
   suspended while poor.
@@ -289,18 +558,63 @@ ground rather than taking Flea Cave without the configured return reserve.
 
 ## Open issues
 
-### 1. Book hunting can't stick
+### 1. Book hunting choice (updated 2026-09-22)
 
-`BookDrops` map scoring works (`BookHuntBonusPercent` 100, multiplicative per book), but the final
-pick is **random among the top 3**, so the bonus improves the odds and cannot hold a bot on a book
-map. The randomisation exists to stop one sample pinning a bot forever — the two goals conflict.
-Options: exempt book maps from the randomisation, or drop `HuntingChoices` to 2.
+The old hard book-map restriction is superseded by the 70%/20% goal draw and two-book-streak cap
+documented above. It deliberately allows normal hunting rather than holding a bot indefinitely
+on a book map. The top-three randomisation now runs within the selected goal pool.
 
-### 2. Skill books need pages
+### 2. Skill-book learning is probabilistic; duplicate retention fixed in source 2026-09-23
 
-`Failed to learn skill, not enough pages` — book items carry `durability = 100` as a page count and
-dropped books arrive partially used. Looting a book is **not** the same as getting the skill. No
-mechanism exists to combine partial books.
+`Failed to learn skill, not enough pages` is the server's failure message. The actual server check
+is a roll against the dropped book's `CurrentDurability`; failure consumes that copy. Looting one
+is **not** the same as learning the skill, and duplicates give additional independent attempts.
+The old one-of-each bank rule sold TooEarly duplicates, including Dreadlord's extra Ghost Walk and
+Waning Moon copies. `Backpack.DisposableSlots` now retains every class-appropriate unlearned copy
+(`TooEarly` or `Wanted`) until the skill is confirmed known, then ordinary sale rules apply. This
+source change passed the regression suite and was deployed 2026-09-23.
+
+### 2a. Map-selection history in source 2026-09-23
+
+The Info tab now has a persistent map-trip table, backed by
+`memory/map-trips.json` and `/api/map-trips`. It records the chosen destination and reason,
+arrival and departure, and why the visit ended. The “kills” column counts positive XP awards
+while on the selected map, an approximate credited-kill measure (item/quest XP can contribute).
+No historical backfill is attempted.
+The first four rows captured during deployment were preserved. Periodic memory flushing includes
+this bank; without that wiring it would only have saved on a graceful host shutdown.
+
+### 2b. Equipment count and class-wide bank eligibility, 2026-09-23
+
+The server consumes a broken Torch with a successful `S.ItemChanged` on the Equipment grid.
+MirBot previously applied that packet only to the Inventory grid, retaining a phantom 0/8 Candle
+and refusing to equip an equal-scoring spare until relog. The accepted equipment count is now
+applied (including zero removal); refused packets still leave the model unchanged. Equipped
+Poison/Amulet counts also benefit from this correction.
+
+The old warrior/MC bank fix exempted Taoists from the MC-requirement guard. Jill's Iron Rings
+require MC 9 yet scored above zero from their AC bonus, so they were banked even though her two
+SC rings were far better. Future offensive-stat requirements now follow class roles: Warrior and
+Assassin use DC, Wizard uses MC, Taoist uses SC. A future gear deposit additionally has to beat the
+weakest worn slot for that class. Legacy non-upgrades and wrong-class/unwanted books are withdrawn
+for sale on ordinary town trips; parts and useful unlearned books remain protected. A live Jill
+trip exposed the follow-on ordering gap: banking withdrew five Iron Rings only after the vendor
+circuit had finished. The town trip now makes a sell-only vendor pass after such withdrawals, with
+no second round of purchases, before returning to the hunting ground. These rules passed 74 tests
+and the final build was deployed. Both Jill's five and Toby's two legacy Iron Rings were then
+sold on forced ordinary town trips: live bag and storage counts are zero for each bot. All eight
+bots reconnected in Playing state with no faults. Candle replacement passed a focused model test;
+an actual live torch burn-down has not yet been observed after deployment.
+
+### 2c. Deserted Mine Lv 2 route finding
+
+The database has three exit cells on Lv 1 leading to Lv 2: `(311,33)`, `(312,33)`, `(312,34)`.
+The Lv 1 map's static walkability is connected, and an offline A* test from Dreadlord's failed
+position `(210,128)` reached all three, even with learned nav corrections. Multiple bots' live
+journeys aborted after one failed route to `(311,33)`. The evidence points to transient live
+obstacles/avoidance or a route-search limit under live conditions, not a missing cave link. A
+future fix should distinguish path failure causes and retry other exit cells before abandoning the
+journey; this route change is not implemented yet.
 
 ### 3. Wrong-class books are just sold
 

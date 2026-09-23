@@ -283,9 +283,13 @@ namespace MirBot
         private static bool Carries(int entryBand, int band) =>
             entryBand <= band && band - entryBand < CarryForwardBands;
 
-        private static double Ranked(HuntingEntry entry, int band, double deathPenalty) =>
+        private static double RankedBand(HuntingEntry entry, int band, double deathPenalty) =>
             entry.Score(deathPenalty) /
             (1 + StalePenaltyPerBand * Math.Max(0, band - entry.LevelBand));
+
+        /// <summary>The same band-discounted score used to sort Best().</summary>
+        public double Ranked(HuntingEntry entry, int level, double deathPenalty) =>
+            RankedBand(entry, BandOf(level), deathPenalty);
 
         /// <summary>
         /// Best known maps for this class and level, best first, ranked on mean rate discounted by
@@ -333,8 +337,29 @@ namespace MirBot
 
             List<HuntingEntry> found = new List<HuntingEntry>(byMap.Values);
 
-            found.Sort((a, b) => Ranked(b, band, deathPenalty)
-                                     .CompareTo(Ranked(a, band, deathPenalty)));
+            // A MAP WE HAVE BARELY SEEN IS SOMEWHERE TO GO, NOT SOMEWHERE TO COMMIT TO.
+            //
+            // Held back rather than dropped, and only while there is something better: the caller
+            // treats absence from this list as "unmeasured", which keeps a provisional map on the
+            // exploration path where it can earn its hours. Striking it out with nothing left to
+            // offer would strand the bot instead, so an empty result hands the thin ones back -
+            // the same rule the outgrown filter needed. See BotConfig.MinimumSampleHours.
+            if (MinimumSampleHours > 0 && found.Count > 0)
+            {
+                List<HuntingEntry> proven = new List<HuntingEntry>();
+
+                lock (Sync)
+                {
+                    foreach (HuntingEntry entry in found)
+                        if (ConfidenceIn(entry.MapIndex, mirClass, band) >= MinimumSampleHours)
+                            proven.Add(entry);
+                }
+
+                if (proven.Count > 0) found = proven;
+            }
+
+            found.Sort((a, b) => RankedBand(b, band, deathPenalty)
+                                     .CompareTo(RankedBand(a, band, deathPenalty)));
 
             if (found.Count > take) found.RemoveRange(take, found.Count - take);
 
@@ -413,10 +438,37 @@ namespace MirBot
 
         /// <summary>
         /// How hard a death counts against a map. Each death divides the rate by (1 + n * this),
-        /// so at 0.15 one death costs about 13% and ten cost 60%. Bounded and monotonic: a map
+        /// so at 0.25 one death costs 20% and ten cost about 71%. Bounded and monotonic: a map
         /// that keeps killing us falls steadily rather than being struck off on a single accident.
         /// </summary>
-        public const double DefaultDeathPenalty = 0.15;
+        public const double DefaultDeathPenalty = 0.25;
+
+        /// <summary>
+        /// Hours a map must have been measured for before Best() will offer it as a destination.
+        /// Set from BotConfig.MinimumSampleHours; 0 disables the test. See that field for why.
+        /// </summary>
+        public double MinimumSampleHours { get; set; }
+
+        /// <summary>
+        /// Total hours measured on this map across every band that still carries at this one.
+        ///
+        /// Call with the lock held.
+        /// </summary>
+        private double ConfidenceIn(int mapIndex, string mirClass, int band)
+        {
+            double hours = 0;
+
+            foreach (HuntingEntry entry in Entries)
+            {
+                if (entry.Class != mirClass) continue;
+                if (entry.MapIndex != mapIndex) continue;
+                if (!Carries(entry.LevelBand, band)) continue;
+
+                hours += Math.Max(0, entry.HoursSampled);
+            }
+
+            return hours;
+        }
 
         /// <summary>How many distinct maps we have a usable measurement for, at this class and band.</summary>
         public int MeasuredCount(string mirClass, int level)
@@ -435,6 +487,13 @@ namespace MirBot
                     if (entry.Class != mirClass) continue;
                     if (!Carries(entry.LevelBand, band)) continue;
                     if (entry.AverageExperiencePerHour <= 0) continue;
+
+                    // Same confidence floor Best() applies, for the reason the comment above
+                    // gives: a map this cannot offer as a destination must not also be counted
+                    // as a reason to stop exploring.
+                    if (MinimumSampleHours > 0 &&
+                        ConfidenceIn(entry.MapIndex, mirClass, band) < MinimumSampleHours)
+                        continue;
 
                     maps.Add(entry.MapIndex);
                 }

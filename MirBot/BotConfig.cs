@@ -265,6 +265,24 @@ namespace MirBot
         // any noise: a warrior spent 13m21s in Deserted Mine and had all of it thrown away for
         // being 99 seconds short.
         public int MinimumSampleMinutes = 4;
+
+        /// <summary>
+        /// How many hours a map must have been measured for before it can be CHOSEN from memory.
+        /// Below this it still ranks and still counts, but only as somewhere to go and find out.
+        /// 0 disables the test.
+        ///
+        /// A rate is a claim about an hour. Computed over three minutes it is an extrapolation
+        /// dressed as a measurement, and the ranking could not tell the two apart: Sindo committed
+        /// to Despair Valley on 0.3 hours that read as 751,454 exp/hour, beating Deserted Mine's
+        /// 578,794 measured over 1.9 hours, and died there seven times for 300,000 gold in potions.
+        /// No sustained hour on that map could ever have produced the number it was chasing.
+        ///
+        /// Confidence is summed across every band that still carries, not read off the single
+        /// freshest record - otherwise crossing a band would reset a map to "unproven" the moment
+        /// the first short window landed in the new band, which is the same amnesia Best() already
+        /// had to be fixed for once.
+        /// </summary>
+        public double MinimumSampleHours = 0.25;
         // Maps worth trying first, in order, before falling back to a random reachable one.
         // Comma separated map descriptions, e.g. "Deserted Mine Lv 1,Ant Cave North".
         public string PreferredMaps = "";
@@ -279,6 +297,23 @@ namespace MirBot
         // one. Straight from the Mir 2 agents, and it is what stops a single early sample
         // deciding where the bot lives for the rest of its career.
         public int HuntingChoices = 3;
+        public int HuntingDeathPenaltyPercent = 25;
+        public int HuntingPickWeightPower = 2;
+        // When both book and ordinary grounds qualify, choose the goal before ranking maps.
+        // A score bonus alone can still leave the book map as the only shortlisted candidate.
+        public int BookHuntChancePercent = 70;
+        public int LossBookHuntChancePercent = 20;
+        public int MaxConsecutiveBookHunts = 2;
+        // Only shopping towns are deferred when their typical monster is this far below us.
+        // 0 disables; caves remain eligible regardless of their median level.
+        public int TownHuntLevelGap = 10;
+        public bool AoeEnabled = true;
+        public int AoeMinimumTargets = 3;
+        public int LossWatchHours = 4;
+        public long LossWatchDropGold = 20000;
+        public long LossWatchRecoverGold = 20000;
+        public int LossDeathPenaltyPercent = 60;
+        public int LossWatchMaxHours = 12;
         // Keep exploring until this many maps have a usable measurement at the current class
         // and level band; only then start exploiting what is known.
         //
@@ -290,6 +325,11 @@ namespace MirBot
         // Once coverage is met, still explore this often, so a better map found later is not
         // locked out forever.
         public int ExploreChancePercent = 15;
+        // Only when a safe, reachable unmeasured map can drop a meaningful wearable upgrade.
+        public int UpgradeExploreChancePercent = 25;
+        // Capped multiplier within the current ordinary-hunt pool; books keep their own goal.
+        public int GearHuntBonusPercent = 50;
+        public int MaxConsecutiveGearHunts = 2;
         // Do not explore a map whose TYPICAL monster is more than this far above us. Checked
         // against System.db, because the learned danger model only knows maps that have
         // already hurt us and is therefore silent about anywhere new.
@@ -313,11 +353,9 @@ namespace MirBot
         /// How much to favour a hunting ground that drops a skill book we want but cannot buy,
         /// as a percentage bonus PER wanted book. 0 disables the whole idea.
         ///
-        /// A bonus rather than a rule, and that is the important part. Overriding the ranking
-        /// would park a character on a book map at terrible experience for as long as the book
-        /// refused to drop; a multiplier means a map that is both book-bearing and decent wins,
-        /// while a book-bearing deathtrap still loses to the danger and level filters that run
-        /// before this.
+        /// This multiplier ranks maps WITHIN the book-hunt pool. The separate book-goal chance
+        /// above decides whether to hunt a book at all when ordinary grounds also qualify;
+        /// a hard book-only filter formerly sent the warrior back to Desert after 13 deaths.
         ///
         /// It also needs no off switch. The bonus exists only while there is a book to want, so
         /// when the last one is learnt the ranking silently goes back to being about experience.
@@ -633,6 +671,84 @@ namespace MirBot
         /// missing.
         /// </summary>
         public int UnproductiveMinutes = 12;
+
+        /// <summary>
+        /// While travelling, stop and fight anything this close. 0 keeps running regardless.
+        ///
+        /// Travel deliberately outranks combat - a bot that stops to kill everything never gets
+        /// anywhere - and that is right for crossing an empty map. It is badly wrong for crossing
+        /// a full one. A level 25 Taoist routed through Lost Paradise Cave Lv 1 with THIRTY-SEVEN
+        /// live monsters on screen, and for fourteen seconds its only decisions were Heal,
+        /// Approach, Heal, Approach. It moved two tiles. Monsters occupy cells and the server
+        /// refuses a move into one, so the things hitting it were also the things blocking it -
+        /// and the bot was choosing, every tick, to walk rather than remove the obstacle.
+        ///
+        /// One tile by default: an adjacent monster is in contact, is blocking, and cannot be
+        /// outrun because monsters follow. Anything further away is a fight we would be choosing,
+        /// and the journey is more important than that choice.
+        /// </summary>
+        public int FightThroughRange = 1;
+
+        /// <summary>
+        /// Seconds of fighting a single leg may absorb before the journey's stall watchdog is
+        /// allowed to fire again. 0 means never pause it.
+        ///
+        /// Fighting does not close the distance to the exit, so without this the 30-second
+        /// no-progress watchdog would abort a journey precisely because the bot did the right
+        /// thing. But the pause cannot be unconditional either, or a bot swamped on a map it
+        /// cannot cross would fight there for ever instead of giving up and scrolling out.
+        /// </summary>
+        public int FightThroughSeconds = 90;
+
+        /// <summary>
+        /// Monster AI numbers that never start a fight, so crossing a map need not stop for them.
+        ///
+        /// The passive animals - 1 Chicken, 2 Cow/Deer/Pig/Sheep, 5 Carnivorous Plant, the same
+        /// set the butcher index uses. Walking past a deer costs nothing, and a Taoist that stops
+        /// to kill every chicken between Bichon Town and a cave arrives with its mana gone and
+        /// nothing to show for it. Fighting through is for things that are actually hitting us.
+        /// </summary>
+        public string HarmlessAIs = "1,2,5";
+
+        /// <summary>
+        /// While travelling, a monster whose WORST recorded hit is below this percentage of our
+        /// maximum health is not worth stopping for. 0 disables the damage test.
+        ///
+        /// HARMLESS IS A RELATIONSHIP, NOT A PROPERTY. The fixed HarmlessAIs list only covers the
+        /// animals that never fight at all; it says nothing about a Claw Cat, which is a real
+        /// threat to a level 13 wizard and completely beneath a level 32 warrior. Judging by AI
+        /// alone therefore had the warrior hold its journey to kill things that could not
+        /// meaningfully hurt it, burning mana and potions crossing a starter map.
+        ///
+        /// Measured rather than assumed: MonsterMemory already records the worst hit every
+        /// monster has landed on us, which is the honest answer to "can this thing hurt me" and
+        /// improves as the character grows.
+        /// </summary>
+        public int FightThroughHarmlessPercent = 3;
+
+        /// <summary>
+        /// Fallback when we have never been hit by it: treat it as harmless when its level is at
+        /// least this far below ours. 0 disables the fallback, so an unknown monster is respected.
+        ///
+        /// The damage record is the better signal but it only exists after the thing has hit us.
+        /// Level is what we can know in advance, from the monster database.
+        /// </summary>
+        public int FightThroughLevelsBelow = 12;
+
+        /// <summary>
+        /// Once fighting through has started, keep fighting until nothing hostile is within this
+        /// range. 0 falls back to FightThroughRange, i.e. the old behaviour.
+        ///
+        /// WITHOUT HYSTERESIS THE RULE FIGHTS ITS OWN PURPOSE. Settling the moment nothing is
+        /// ADJACENT meant travel resumed with two dozen monsters still on screen: the bot killed
+        /// the one in its face, took a step, pulled two more, killed one, took a step. A Taoist
+        /// crossing Lost Paradise Cave Lv 1 did that 56 times in a couple of minutes, walking
+        /// deeper into the cave between every fight and dragging a bigger train each time.
+        ///
+        /// Clearing the area before moving on is both safer and faster: the fight happens once,
+        /// standing still, instead of continuously while being chased.
+        /// </summary>
+        public int FightThroughClearRange = 8;
         // Walk through to the next floor on reaching it, rather than stopping at the stairs.
         //
         // The sweep only ever aims at a DEEPER floor of the same cave - matched on the map name,
@@ -862,12 +978,29 @@ namespace MirBot
                 case "memorypath": config.MemoryPath = value; break;
                 case "experiencesampleminutes": config.ExperienceSampleMinutes = int.Parse(value); break;
                 case "minimumsampleminutes": config.MinimumSampleMinutes = int.Parse(value); break;
+                case "minimumsamplehours": config.MinimumSampleHours = double.Parse(value); break;
                 case "preferredmaps": config.PreferredMaps = value; break;
                 case "levelbandsize": config.LevelBandSize = int.Parse(value); break;
                 case "autotravel": config.AutoTravel = bool.Parse(value); break;
                 case "huntingchoices": config.HuntingChoices = int.Parse(value); break;
+                case "huntingdeathpenaltypercent": config.HuntingDeathPenaltyPercent = int.Parse(value); break;
+                case "aoeenabled": config.AoeEnabled = bool.Parse(value); break;
+                case "aoeminimumtargets": config.AoeMinimumTargets = int.Parse(value); break;
+                case "huntingpickweightpower": config.HuntingPickWeightPower = int.Parse(value); break;
+                case "bookhuntchancepercent": config.BookHuntChancePercent = int.Parse(value); break;
+                case "lossbookhuntchancepercent": config.LossBookHuntChancePercent = int.Parse(value); break;
+                case "maxconsecutivebookhunts": config.MaxConsecutiveBookHunts = int.Parse(value); break;
+                case "townhuntlevelgap": config.TownHuntLevelGap = int.Parse(value); break;
+                case "losswatchhours": config.LossWatchHours = int.Parse(value); break;
+                case "losswatchdropgold": config.LossWatchDropGold = long.Parse(value); break;
+                case "losswatchrecovergold": config.LossWatchRecoverGold = long.Parse(value); break;
+                case "lossdeathpenaltypercent": config.LossDeathPenaltyPercent = int.Parse(value); break;
+                case "losswatchmaxhours": config.LossWatchMaxHours = int.Parse(value); break;
                 case "exploreuntilmapsknown": config.ExploreUntilMapsKnown = int.Parse(value); break;
                 case "explorechancepercent": config.ExploreChancePercent = int.Parse(value); break;
+                case "upgradeexplorechancepercent": config.UpgradeExploreChancePercent = int.Parse(value); break;
+                case "gearhuntbonuspercent": config.GearHuntBonusPercent = int.Parse(value); break;
+                case "maxconsecutivegearhunts": config.MaxConsecutiveGearHunts = int.Parse(value); break;
                 case "explorelevelsabove": config.ExploreLevelsAbove = int.Parse(value); break;
                 case "bookhuntbonuspercent": config.BookHuntBonusPercent = int.Parse(value); break;
                 case "huntinghalflifehours": config.HuntingHalfLifeHours = double.Parse(value); break;
@@ -875,6 +1008,12 @@ namespace MirBot
                 case "travelgoldperhop": config.TravelGoldPerHop = long.Parse(value); break;
                 case "poorgold": config.PoorGold = long.Parse(value); break;
                 case "unproductiveminutes": config.UnproductiveMinutes = int.Parse(value); break;
+                case "fightthroughrange": config.FightThroughRange = int.Parse(value); break;
+                case "fightthroughseconds": config.FightThroughSeconds = int.Parse(value); break;
+                case "harmlessais": config.HarmlessAIs = value; break;
+                case "fightthroughharmlesspercent": config.FightThroughHarmlessPercent = int.Parse(value); break;
+                case "fightthroughlevelsbelow": config.FightThroughLevelsBelow = int.Parse(value); break;
+                case "fightthroughclearrange": config.FightThroughClearRange = int.Parse(value); break;
                 case "sweepafteridleseconds": config.SweepAfterIdleSeconds = int.Parse(value); break;
                 case "recoverygold": config.RecoveryGold = long.Parse(value); break;
                 case "recoveryexitgold": config.RecoveryExitGold = long.Parse(value); break;

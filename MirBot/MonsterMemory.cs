@@ -122,6 +122,51 @@ namespace MirBot
         /// Having KILLED us counts for more than any damage figure: it is the one observation that
         /// already accounts for everything the damage model leaves out.
         /// </summary>
+        /// <summary>
+        /// Beneath our notice: it has hit us enough times to judge, and its worst hit is a
+        /// trivial fraction of our maximum health.
+        ///
+        /// Deliberately the WORST hit rather than the average - a monster that usually tickles
+        /// and occasionally takes a fifth of the bar is not harmless - and deliberately requires
+        /// a sample, so something we have never met is never assumed safe.
+        ///
+        /// Returns false when we have no record, which lets the caller fall back to level.
+        /// </summary>
+        /// <summary>
+        /// Do we have ENOUGH of a record to judge this monster by damage alone?
+        ///
+        /// "Have we seen it" was the wrong question and it left a hole: one or two hits meant
+        /// Harmless() refused to answer for want of a sample while the level fallback stood down
+        /// because a record existed. Nothing decided, so the bot held its journey for a monster
+        /// it massively outclassed - a level 27 wizard stopping in Bichon Town, which is the
+        /// behaviour this was all meant to remove.
+        /// </summary>
+        public bool Judged(string monsterName, int minimumHits)
+        {
+            if (string.IsNullOrEmpty(monsterName)) return false;
+
+            lock (Sync)
+            {
+                if (!_lookup.TryGetValue(monsterName, out MonsterDangerEntry entry)) return false;
+
+                return entry.Kills > 0 || entry.Hits >= Math.Max(1, minimumHits);
+            }
+        }
+
+        public bool Harmless(string monsterName, int maxHealth, int percent, int minimumHits)
+        {
+            if (percent <= 0 || maxHealth <= 0 || string.IsNullOrEmpty(monsterName)) return false;
+
+            lock (Sync)
+            {
+                if (!_lookup.TryGetValue(monsterName, out MonsterDangerEntry entry)) return false;
+                if (entry.Hits < Math.Max(1, minimumHits)) return false;
+                if (entry.Kills > 0) return false;   // it has killed us; never "harmless"
+
+                return entry.WorstHit * 100 <= maxHealth * percent;
+            }
+        }
+
         public bool TooDangerousToFight(string monsterName, int currentHealth, int hitsToDeath,
             int minimumHits)
         {

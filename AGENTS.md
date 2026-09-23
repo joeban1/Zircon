@@ -20,6 +20,7 @@ Normal route: `AGENTS.md` → [TASK_ROUTER](docs/TASK_ROUTER.md) or [GAMEPLAY_SY
 | Dialog layout | [CLIENT_UI](docs/CLIENT_UI.md) → owning Client/Scenes/Views file | ServerLibrary and networking unless gameplay changes |
 | Packet/client-server | [NETWORKING](docs/NETWORKING.md) → concrete sender/receiver | Unrelated UI and persistence |
 | Persisted property | [DATA_MODEL](docs/DATA_MODEL.md) → concrete SystemModel/DBModel | Editor/network/client unless the property crosses those boundaries |
+| Headless MirBot behavior | [BOT_STATE](zircon-bot-state.md) → `MirBot/` source and `MirBot.Tests/` | Server GUI and rendering unless packet semantics need checking |
 
 ## Repository map
 
@@ -37,6 +38,7 @@ Normal route: `AGENTS.md` → [TASK_ROUTER](docs/TASK_ROUTER.md) or [GAMEPLAY_SY
 | `PluginCore` / `PluginStandalone` | Server-editor plugin contracts/loader and separate form-plugin host. |
 | `Launcher` / `Patcher` / `PatchManager` | Patch download/client launch, launcher replacement helper, and patch publication tool. |
 | `Tools` | Audio conversion script and rendering-cache check executable. |
+| `MirBot` / `MirBot.Tests` | Headless bot runtime and its regression tests. Read [bot state](zircon-bot-state.md), [inventory packet model](zircon-bot-inventory-model.md), and [design](zircon-llm-bot-design.md) as relevant; verify server packet behavior in `ServerLibrary` before inferring it. |
 
 Exact project references and test projects: [PROJECT_MAP](docs/PROJECT_MAP.md).
 

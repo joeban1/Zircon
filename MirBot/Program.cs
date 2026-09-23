@@ -16,6 +16,7 @@ namespace MirBot
             string logPath = null;
             bool console = false;
             bool checkMaps = false;
+            bool backfillLevels = false;
             string checkTravel = null;
             string checkVendors = null;
             string checkTeleports = null;
@@ -31,6 +32,7 @@ namespace MirBot
                 if (args[i] == "--log" && i + 1 < args.Length) logPath = args[i + 1];
                 if (args[i] == "--console") console = true;
                 if (args[i] == "--check-maps") { checkMaps = true; console = true; }
+                if (args[i] == "--backfill-levels") { backfillLevels = true; console = true; }
                 if (args[i] == "--check-travel" && i + 1 < args.Length)
                 { checkTravel = args[i + 1]; console = true; }
                 if (args[i] == "--vendors")
@@ -63,6 +65,15 @@ namespace MirBot
 
                 host.Load(directory);
                 if (!host.Prepare()) return 2;
+
+                if (backfillLevels)
+                {
+                    var result = LevelBackfill.Run(directory, host.Levels);
+                    Console.WriteLine($"Level backfill: {result.imported} imported, " +
+                        $"{result.skipped} unanchored/contradictory observations skipped, " +
+                        $"{result.files} files scanned.");
+                    return 0;
+                }
 
                 // Diagnostic: is MapPath right, and do the grids parse? Worth its own mode because
                 // a wrong path is silent at runtime - the bot just steers blind again.

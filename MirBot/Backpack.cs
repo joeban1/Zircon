@@ -14,6 +14,9 @@ namespace MirBot
         public EquipmentSlot Slot;
         public string Reason;
 
+        /// <summary>Topping up the stack already worn rather than replacing it.</summary>
+        public bool Merge;
+
         public override string ToString() =>
             $"{ItemName} -> {Slot}" + (string.IsNullOrEmpty(Reason) ? "" : $" ({Reason})");
     }
@@ -482,8 +485,7 @@ namespace MirBot
                 case RequiredType.DC: return mirClass == MirClass.Warrior ||
                                              mirClass == MirClass.Assassin;
 
-                case RequiredType.MC: return mirClass == MirClass.Wizard ||
-                                             mirClass == MirClass.Taoist;
+                case RequiredType.MC: return mirClass == MirClass.Wizard;
 
                 case RequiredType.SC: return mirClass == MirClass.Taoist;
 
@@ -500,6 +502,10 @@ namespace MirBot
             int level, Stats stats, MagicBooks books, WorldModel world)
         {
             if (item?.Info == null) return false;
+
+            // Supplies are for the bag, not future equipment. This also guards against a
+            // consumable with an unusual level requirement entering the storage path.
+            if (item.Info.ItemType == ItemType.Consumable) return false;
 
             // Item parts belong in the bank.
             //
@@ -556,6 +562,19 @@ namespace MirBot
             return SlotFor(item.Info.ItemType) != null;
         }
 
+        /// <summary>
+        /// A future item must be useful for this class AND beat an actual worn slot. A little AC
+        /// on an MC ring can make its score positive for a Taoist without making it an upgrade.
+        /// Books and parts are intentionally exempt from the gear comparison.
+        /// </summary>
+        public bool ShouldBank(ClientUserItem item, MirClass mirClass, MirGender gender,
+            int level, Stats stats, MagicBooks books, WorldModel world)
+        {
+            if (!WorthStoring(item, mirClass, gender, level, stats, books, world)) return false;
+            if (item.Info.ItemType == ItemType.Book || IsItemPart(item)) return true;
+            return BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass);
+        }
+
         /// <summary>One banked item that is worth pulling back out, and why.</summary>
         public readonly struct Reclaim
         {
@@ -597,9 +616,22 @@ namespace MirBot
 
                 if (item.Info.ItemType == ItemType.Book)
                 {
-                    if (books?.Judge(item, mirClass, level, stats, world) == BookVerdict.Wanted)
+                    BookVerdict verdict = books?.Judge(item, mirClass, level, stats, world)
+                                          ?? BookVerdict.Junk;
+                    if (verdict == BookVerdict.Wanted)
                         found.Add(new Reclaim(pair.Key, item, "learnable now"));
+                    else if (!RetainUnlearnedBook(verdict))
+                        found.Add(new Reclaim(pair.Key, item, "unwanted book - selling"));
 
+                    continue;
+                }
+
+                // Recover legacy deposits. An already-usable potion has no equipment slot, so
+                // the generic gear reclaim path below would leave it in storage forever.
+                if (item.Info.ItemType == ItemType.Consumable &&
+                    (IsHealthPotion(item) || IsManaPotion(item)))
+                {
+                    found.Add(new Reclaim(pair.Key, item, "potion belongs in the bag"));
                     continue;
                 }
 
@@ -608,33 +640,28 @@ namespace MirBot
                 // not build never comes in - a warrior banked a Platinum Necklace on exactly that
                 // mistake and, once the rule was fixed, it would have sat there for ever, because
                 // the only way out of storage used to be becoming USABLE.
-                if (!WorthStoring(item, mirClass, gender, level, stats, books, world) &&
-                    !MeetsRequirement(item.Info, level, stats))
+                if (IsItemPart(item)) continue;
+
+                if (!CanEquip(item, mirClass, gender))
                 {
                     found.Add(new Reclaim(pair.Key, item, "should not have been banked - selling"));
                     continue;
                 }
 
-                if (!CanEquip(item, mirClass, gender)) continue;
-                if (!MeetsRequirement(item.Info, level, stats)) continue;
+                if (!MeetsRequirement(item.Info, level, stats))
+                {
+                    if (!ShouldBank(item, mirClass, gender, level, stats, books, world))
+                        found.Add(new Reclaim(pair.Key, item, "not a future upgrade - selling"));
+                    continue;
+                }
 
-                if (!BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass)) continue;
-
-                found.Add(new Reclaim(pair.Key, item, "beats what we are wearing"));
+                found.Add(new Reclaim(pair.Key, item,
+                    BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass)
+                        ? "beats what we are wearing"
+                        : "obsolete stored gear - selling"));
             }
 
             return found;
-        }
-
-        /// <summary>How many of this exact item are already banked - for "one of each" rules.</summary>
-        public int StoredCountOf(ItemInfo info)
-        {
-            long total = 0;
-
-            foreach (ClientUserItem item in _storage.Values)
-                if (item.Info == info) total += item.Count;
-
-            return (int)Math.Min(int.MaxValue, total);
         }
 
         /// <summary>
@@ -1167,11 +1194,22 @@ namespace MirBot
         /// Link.Count as what REMAINS - zero meaning the whole stack went - for both paths
         /// (PlayerObject.cs:6486-6496), so one setter serves both.
         /// </summary>
-        public void NoteSlotCount(int slot, long remaining)
-        {
-            if (!_inventory.TryGetValue(slot, out ClientUserItem item)) return;
+        public void NoteSlotCount(int slot, long remaining) =>
+            NoteSlotCount(GridType.Inventory, slot, remaining);
 
-            if (remaining <= 0) { _inventory.Remove(slot); return; }
+        /// <summary>Apply an accepted server count to either modeled grid.</summary>
+        public void NoteSlotCount(GridType grid, int slot, long remaining)
+        {
+            Dictionary<int, ClientUserItem> slots = grid == GridType.Inventory ? _inventory :
+                grid == GridType.Equipment ? _equipment : null;
+            if (slots == null || !slots.TryGetValue(slot, out ClientUserItem item)) return;
+
+            if (remaining <= 0)
+            {
+                slots.Remove(slot);
+                if (grid == GridType.Equipment) ClearEquipRefusals();
+                return;
+            }
 
             item.Count = remaining;
         }
@@ -2149,7 +2187,6 @@ namespace MirBot
             MagicBooks books, WorldModel world, out Dictionary<int, long> partialCounts)
         {
             List<int> slots = new List<int>();
-            HashSet<ItemInfo> keptBooks = new HashSet<ItemInfo>();
 
             partialCounts = new Dictionary<int, long>();
 
@@ -2177,16 +2214,12 @@ namespace MirBot
                     BookVerdict verdict = books?.Judge(item, mirClass, level, stats, world)
                                           ?? BookVerdict.Junk;
 
-                    if (verdict == BookVerdict.Wanted) continue;   // about to be learnt
+                    // Learning can fail and consumes the book. Every duplicate is another
+                    // chance, so bank ALL too-early copies and try ALL wanted copies until
+                    // the server confirms the skill was learned.
+                    if (RetainUnlearnedBook(verdict)) continue;
 
-                    if (verdict == BookVerdict.TooEarly)
-                    {
-                        // One of each only: a copy already banked, or an earlier slot already
-                        // claimed the keep, makes this one a duplicate to sell.
-                        if (StoredCountOf(item.Info) == 0 && keptBooks.Add(item.Info)) continue;
-                    }
-
-                    slots.Add(pair.Key);   // Junk / WrongClass / AlreadyKnown / duplicate
+                    slots.Add(pair.Key);   // Junk / WrongClass / AlreadyKnown
                     continue;
                 }
 
@@ -2202,7 +2235,7 @@ namespace MirBot
                 if (IsItemPart(item)) continue;
 
                 // Keep anything the bank should hold for later.
-                if (WorthStoring(item, mirClass, gender, level, stats, books, world)) continue;
+                if (ShouldBank(item, mirClass, gender, level, stats, books, world)) continue;
 
                 EquipmentSlot? slot = SlotFor(item.Info.ItemType);
 
@@ -2217,6 +2250,9 @@ namespace MirBot
 
             return slots;
         }
+
+        public static bool RetainUnlearnedBook(BookVerdict verdict) =>
+            verdict == BookVerdict.TooEarly || verdict == BookVerdict.Wanted;
 
         #region Equipping
 
@@ -2408,6 +2444,7 @@ namespace MirBot
                 // displace whichever side is currently weaker.
                 EquipmentSlot? chosen = null;
                 string reason = null;
+                bool merge = false;
                 int weakest = int.MaxValue;
 
                 foreach (EquipmentSlot option in SlotsFor(item.Info.ItemType))
@@ -2419,6 +2456,24 @@ namespace MirBot
                     {
                         chosen = option;
                         reason = "empty slot";
+                        break;
+                    }
+
+                    // SAME ITEM, AND THE WORN STACK HAS ROOM: top it up.
+                    //
+                    // Poison and Amulet hold stackable reagents that are consumed by casting, so
+                    // "already wearing one" is not a reason to leave 58 more in the bag. The score
+                    // comparison below can never allow this - an identical item ties, and the test
+                    // is strictly greater - so without this the bot buys reagents it can never
+                    // equip and quietly runs out mid-fight.
+                    if (worn.Info == item.Info && worn.Count < worn.Info.StackSize &&
+                        (worn.Flags & UserItemFlags.Expirable) != UserItemFlags.Expirable &&
+                        (item.Flags & UserItemFlags.Expirable) != UserItemFlags.Expirable)
+                    {
+                        merge = true;
+                        chosen = option;
+                        reason = $"topping up {worn.Info.ItemName} " +
+                                 $"({worn.Count} + {item.Count} of {worn.Info.StackSize})";
                         break;
                     }
 
@@ -2444,7 +2499,8 @@ namespace MirBot
                     ToSlot = (int)chosen.Value,
                     ItemName = item.Info.ItemName,
                     Slot = chosen.Value,
-                    Reason = reason
+                    Reason = reason,
+                    Merge = merge
                 });
             }
 
@@ -2494,6 +2550,23 @@ namespace MirBot
             ClearEquipRefusals();
 
             if (!_inventory.TryGetValue(request.FromSlot, out ClientUserItem item)) return;
+
+            // A MERGE MOVES COUNTS, NOT ITEMS. The server adds what it can to the worn stack and
+            // leaves any remainder behind (PlayerObject.cs ItemMove, the MergeItem branch), so
+            // modelling it as a swap would put the worn stack in the bag and lose the total.
+            if (request.Merge &&
+                _equipment.TryGetValue(request.ToSlot, out ClientUserItem into) &&
+                into?.Info != null && into.Info == item.Info)
+            {
+                long room = into.Info.StackSize - into.Count;
+                long moved = Math.Min(room, item.Count);
+
+                into.Count += moved;
+                item.Count -= moved;
+
+                if (item.Count <= 0) _inventory.Remove(request.FromSlot);
+                return;
+            }
 
             _inventory.Remove(request.FromSlot);
 

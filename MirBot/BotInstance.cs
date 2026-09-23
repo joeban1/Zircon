@@ -65,6 +65,10 @@ namespace MirBot
         private TownTrip _town;
         private readonly RecoveryPolicy _recovery = new RecoveryPolicy();
         private bool _lastFrugalRecoveryCombat;
+        private string _farmingDestinationName = "";
+        private string _farmingDestinationReason = "";
+        private MapTripEntry _mapTrip;
+        private long _mapTripXpAwardBaseline;
         /// <summary>
         /// Explicit desired state. Inferring "should I be running" from AutoStart and the
         /// attempt count does not work: a Start command resets those very fields, so an
@@ -387,6 +391,46 @@ namespace MirBot
             // Always a FRESH connection. Disconnect() tears down BaseConnection state and
             // ExitReason is set-once, so a reused instance carries the previous run's failure.
             _connection = new BotConnection(client, Config, _host.ClientHash, _log);
+            _profitPolicy = new ProfitPolicy(Path.Combine(_host.MemoryFolder,
+                "profit-" + Id + ".json"));
+            if (_profitPolicy.LoadDiagnostic.Length > 0)
+                _log.Write("Money: " + _profitPolicy.LoadDiagnostic);
+            _goldHistory.Clear();
+            foreach (GoldPoint point in _host.Gold.Read(Id))
+            {
+                if (!point.HasCapitalSpent ||
+                    !long.TryParse(point.Gold, out long priorGold) || priorGold <= 0 ||
+                    !DateTime.TryParse(point.Utc, null,
+                        System.Globalization.DateTimeStyles.RoundtripKind, out DateTime priorUtc))
+                    continue;
+                _goldHistory.Add(new GoldSample(priorUtc.ToUniversalTime(), priorGold,
+                    point.CapitalSpent));
+            }
+            if (_goldHistory.Count > 0) _capitalSpent = _goldHistory[^1].CapitalSpent;
+            else _capitalSpent = 0;
+            _nextGoldSample = DateTime.MinValue;
+            _lastGoldSampled = long.MinValue;
+            _lastTravelPenaltyPercent = Config.HuntingDeathPenaltyPercent;
+            _connection.OnCapitalBought = cost =>
+            {
+                if (cost <= 0 || cost > long.MaxValue - _capitalSpent) return;
+                _capitalSpent += cost;
+                _log.Write($"Capital purchase confirmed: {cost:N0} gold (cumulative {_capitalSpent:N0}).");
+                SampleGold(force: true);
+            };
+            _xpSession = Guid.NewGuid().ToString("N");
+            _nextXpSample = DateTime.MinValue;
+            _lastXpTotal = decimal.MinValue;
+            _xpPace = new XpPace(null, 0);
+            _connection.OnLevelUp = (from, to) =>
+            {
+                WorldModel world = _connection.World;
+                _host.Levels.Record(new LevelEntry
+                {
+                    Bot = Id, Character = world.Name, Class = world.Class.ToString(),
+                    FromLevel = from, ToLevel = to, Utc = DateTime.UtcNow
+                });
+            };
             _recovery.Reset();
             _lastFrugalRecoveryCombat = false;
             _tripWasActive = false;
@@ -471,7 +515,10 @@ namespace MirBot
             _connection.OnMagicToggle = (magic, canUse) => _brain?.Skills.Toggled(magic, canUse);
 
             _connection.OnMagicCooldown = (infoIndex, delay) =>
+            {
                 _brain?.Spells.Cooldown(infoIndex, delay);
+                _brain?.Skills.Cooldown(infoIndex, delay);
+            };
 
             _connection.OnObjectGone = id =>
             {
@@ -563,6 +610,7 @@ namespace MirBot
             // log had nothing whatsoever to say about the delay - which is how this went unnoticed
             // long enough to be observed by eye rather than read.
             LogTripStatus();
+            ObserveMapTrip();
 
             if (decision == null || decision.Action == BotAction.Idle)
             {
@@ -735,7 +783,8 @@ namespace MirBot
                     return;
                 }
 
-                Begin(asked.Index, asked.Description, "requested");
+                Begin(asked.Index, asked.Description, "requested",
+                      displayReason: "manual destination");
                 return;
             }
 
@@ -798,7 +847,8 @@ namespace MirBot
                     string why = _brain.Town.ShortOfSupplies
                         ? "out of supplies - going to town, not hunting"
                         : "banked item ready - going to a safe town";
-                    Begin(best, _host.Profiles.For(best)?.MapName ?? $"map {best}", why);
+                    Begin(best, _host.Profiles.For(best)?.MapName ?? $"map {best}", why,
+                          farmingChoice: false);
                     return;
                 }
 
@@ -913,7 +963,13 @@ namespace MirBot
 
                 if (recovery.Count > 0)
                 {
-                    if (recovery.Contains(world.MapIndex)) return;
+                    if (recovery.Contains(world.MapIndex))
+                    {
+                        NoteFarmingChoice(world.MapIndex, world.MapName,
+                            caveReady ? "poverty recovery - supplied cave farming"
+                                      : "poverty recovery - rebuilding on beginner ground");
+                        return;
+                    }
 
                     int best = -1, bestHops = int.MaxValue;
 
@@ -940,7 +996,10 @@ namespace MirBot
                               caveReady
                                   ? $"supplied but broke - money recovery until " +
                                     $"{Config.RecoveryExitGold:N0} survives a restock"
-                                  : "broke and undersupplied - rebuilding on free beginner ground");
+                                  : "broke and undersupplied - rebuilding on free beginner ground",
+                              displayReason: caveReady
+                                  ? "poverty recovery - supplied cave farming"
+                                  : "poverty recovery - rebuilding on beginner ground");
                         return;
                     }
 
@@ -959,8 +1018,15 @@ namespace MirBot
             // Coverage-driven instead: keep exploring until enough maps have been measured to be
             // worth choosing between, then mostly exploit with a residual chance of looking further.
             int known = _host.Hunting.MeasuredCount(mirClass, world.Level);
+            bool gearFocus = Config.GearHuntBonusPercent > 0 &&
+                             !_recovery.Active && _profitPolicy?.Active != true &&
+                             _consecutiveGearHunts < Math.Max(1, Config.MaxConsecutiveGearHunts);
+            int exploreChance = HasSafeUnmeasuredGearMap(world, mirClass, hops,
+                Affordable, Permitted, gearFocus)
+                ? Math.Max(Config.ExploreChancePercent, Config.UpgradeExploreChancePercent)
+                : Config.ExploreChancePercent;
             bool wantExplore = known < Config.ExploreUntilMapsKnown ||
-                               _random.Next(100) < Config.ExploreChancePercent;
+                               _random.Next(100) < exploreChance;
 
             if (wantExplore && TryExplore(world, mirClass, hops, Affordable, Permitted, known)) return;
 
@@ -973,9 +1039,7 @@ namespace MirBot
             // Skills that can only be got by killing something, that this character could learn
             // today, and has not. Empty for a character with nothing left to want - at which point
             // everything below is a no-op and the ranking is about experience again.
-            HashSet<int> wantedBooks = Config.BookHuntBonusPercent > 0
-                ? _host.BookDrops.Wanted(world.Class, world.Level, world.PlayerStats, world)
-                : new HashSet<int>();
+            HashSet<int> wantedBooks = WantedDropOnlyBooks(world);
 
             List<HuntingEntry> candidates = new List<HuntingEntry>();
             List<HuntingEntry> outgrown = new List<HuntingEntry>();
@@ -987,11 +1051,13 @@ namespace MirBot
             // measured. While a drop-only skill is wanted, inspect every measured map so its source
             // cannot disappear from consideration simply because the character is already strong
             // enough to earn better experience elsewhere.
-            int shortlist = wantedBooks.Count > 0
-                ? int.MaxValue
-                : Math.Max(1, Config.HuntingChoices);
+            _lastTravelPenaltyPercent = Math.Max(Config.HuntingDeathPenaltyPercent,
+                _profitPolicy?.Active == true ? Config.LossDeathPenaltyPercent : 0);
+            double deathPenalty = _lastTravelPenaltyPercent / 100.0;
+            int shortlist = int.MaxValue;
 
-            foreach (HuntingEntry entry in _host.Hunting.Best(mirClass, world.Level, shortlist))
+            foreach (HuntingEntry entry in _host.Hunting.Best(mirClass, world.Level, shortlist,
+                         deathPenalty))
             {
                 if (entry.MapIndex == world.MapIndex) continue;
                 if (!Permitted(entry.MapIndex)) continue;
@@ -1017,54 +1083,82 @@ namespace MirBot
                     continue;
                 }
 
+                if (OutgrownShoppingTown(world, entry.MapIndex, wantedBooks, out string townWhy))
+                {
+                    _log.Write($"Travel: deferring {entry.MapName} - {townWhy}.");
+                    outgrown.Add(entry);
+                    continue;
+                }
+
                 candidates.Add(entry);
             }
 
-            // A DROP-ONLY SKILL IS A REQUIREMENT, NOT A SOFT XP PREFERENCE.
-            //
-            // The old bonus only moved book maps upward before RANDOMLY choosing from the top
-            // three. Jill could therefore know that Bichon Cave supplied Summon Skeleton and still
-            // choose Flea Cave two times out of three. Worse, once a low real sample pushed the cave
-            // outside the enlarged XP shortlist, the bonus could no longer see it at all.
-            //
-            // If at least one measured, safe, affordable and reachable map supplies a wanted book,
-            // constrain the choice to those maps until the skill is learned. Randomness remains
-            // among valid book grounds, so the bot can vary its hunt without walking away from the
-            // progression goal. If none qualifies, the exploration path above remains responsible
-            // for finding and measuring one, and ordinary hunting remains the final fallback.
-            if (wantedBooks.Count > 0 && candidates.Count > 0)
-            {
-                List<HuntingEntry> bookCandidates = candidates
-                    .Where(x => _host.BookDrops.Supplies(x.MapIndex, wantedBooks) > 0)
-                    .ToList();
+            // Keep the book and ordinary pools separate BEFORE the shortlist. A book bonus alone
+            // can push every ordinary map out of the top three, leaving a nominally weighted draw
+            // that still chooses the same book map 100% of the time. Prefer the book goal 70% of
+            // the time (20% under loss watch), but force an ordinary goal after two book-priority
+            // decisions. Within the chosen pool the existing XP/death weighting still decides.
+            List<HuntingEntry> bookCandidates = candidates
+                .Where(x => _host.BookDrops.Supplies(x.MapIndex, wantedBooks) > 0).ToList();
+            List<HuntingEntry> ordinaryCandidates = candidates
+                .Where(x => _host.BookDrops.Supplies(x.MapIndex, wantedBooks) == 0).ToList();
+            bool bookGoal = HuntingGoalChoice.PursueBook(bookCandidates.Count > 0,
+                ordinaryCandidates.Count > 0, _profitPolicy?.Active == true,
+                _consecutiveBookHunts, Config.BookHuntChancePercent,
+                Config.LossBookHuntChancePercent, Config.MaxConsecutiveBookHunts,
+                _random, out int bookChance);
 
-                if (bookCandidates.Count > 0)
-                {
-                    candidates = bookCandidates;
-                    _log.Write($"Travel: {candidates.Count} measured map(s) supply a wanted " +
-                               "drop-only skill - restricting this hunt to those maps.");
-                }
+            if (bookCandidates.Count > 0)
+                _log.Write($"Travel: {bookCandidates.Count} book map(s), " +
+                           $"{ordinaryCandidates.Count} ordinary map(s); " +
+                           $"{bookChance}% book chance, {_consecutiveBookHunts} prior " +
+                           $"book-priority choice(s) - choosing {(bookGoal ? "book" : "ordinary")} hunt.");
 
-                candidates.Sort((a, b) => BookRanked(b, wantedBooks)
-                                              .CompareTo(BookRanked(a, wantedBooks)));
-
-                int keep = Math.Max(1, Config.HuntingChoices);
-                if (candidates.Count > keep) candidates.RemoveRange(keep, candidates.Count - keep);
-            }
+            candidates = bookGoal ? bookCandidates : ordinaryCandidates;
+            Dictionary<int, GearTarget> gearTargets = new Dictionary<int, GearTarget>();
+            if (!bookGoal && gearFocus)
+                foreach (HuntingEntry entry in candidates)
+                    gearTargets[entry.MapIndex] = GearTargetFor(entry.MapIndex, world);
+            double Rank(HuntingEntry entry) => bookGoal
+                ? BookRanked(entry, wantedBooks, world.Level, deathPenalty)
+                : _host.Hunting.Ranked(entry, world.Level, deathPenalty) *
+                  (1 + (gearTargets.TryGetValue(entry.MapIndex, out GearTarget gear) &&
+                        gear != null ? Config.GearHuntBonusPercent / 100.0 * gear.Priority : 0));
+            candidates.Sort((a, b) => Rank(b).CompareTo(Rank(a)));
+            int keep = Math.Max(1, Config.HuntingChoices);
+            if (candidates.Count > keep) candidates.RemoveRange(keep, candidates.Count - keep);
 
             if (candidates.Count > 0)
             {
-                HuntingEntry pick = candidates[_random.Next(candidates.Count)];
+                double[] weights = candidates.Select(Rank).ToArray();
+                int index = WeightedChoice.Pick(weights, Config.HuntingPickWeightPower,
+                    _random, out double chance);
+                HuntingEntry pick = candidates[index];
 
                 int supplies = _host.BookDrops.Supplies(pick.MapIndex, wantedBooks);
+                GearTarget pickedGear = !bookGoal && gearTargets.TryGetValue(pick.MapIndex,
+                    out GearTarget target) ? target : null;
 
                 Begin(pick.MapIndex, pick.MapName,
                       $"{pick.AverageExperiencePerHour:N0} exp/hour average over " +
                       $"{pick.HoursSampled:N1}h, {pick.Deaths} death(s) - " +
-                      $"chosen from {candidates.Count} candidate(s)" +
+                      $"chosen from {candidates.Count} candidate(s), " +
+                      $"score {weights[index]:N0}, draw {chance:P1}, death penalty " +
+                      $"{deathPenalty:P0}" +
+                      (bookCandidates.Count > 0 ? $"; {bookChance}% book-goal chance" : "") +
                       (supplies > 0
                           ? $"; drops {_host.BookDrops.Names(pick.MapIndex, wantedBooks)}"
-                          : ""));
+                          : "") +
+                      (pickedGear != null ? $"; {GearChoiceReason(pickedGear)}" : ""),
+                      displayReason: pickedGear != null
+                          ? GearChoiceReason(pickedGear)
+                          : supplies > 0
+                          ? $"looking for {supplies} skill book(s): " +
+                            _host.BookDrops.Names(pick.MapIndex, wantedBooks)
+                          : $"hunting score {weights[index]:N0}; " +
+                            $"{pick.AverageExperiencePerHour:N0} XP/hour average");
+                _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
+                _consecutiveGearHunts = pickedGear != null ? _consecutiveGearHunts + 1 : 0;
                 return;
             }
 
@@ -1079,14 +1173,26 @@ namespace MirBot
             // somewhere new the way it did when it was folded into the exploit block above.
             if (outgrown.Count > 0)
             {
-                HuntingEntry fallback = outgrown[_random.Next(outgrown.Count)];
+                // A healthy bot already in a starter town should not bounce to another starter
+                // town merely because every useful destination failed the safety/route filters.
+                if (OutgrownShoppingTown(world, world.MapIndex, wantedBooks, out _))
+                {
+                    _log.Write("Travel: no suitable alternative to this outgrown town - staying put.");
+                    return;
+                }
+
+                double[] weights = outgrown.Select(x => _host.Hunting.Ranked(x, world.Level,
+                    deathPenalty)).ToArray();
+                HuntingEntry fallback = outgrown[WeightedChoice.Pick(weights,
+                    Config.HuntingPickWeightPower, _random, out _)];
 
                 _log.Write($"Travel: nothing else reachable, so taking {fallback.MapName} " +
                            $"despite having outgrown it - {outgrown.Count} such map(s) known.");
 
                 Begin(fallback.MapIndex, fallback.MapName,
                       $"{fallback.AverageExperiencePerHour:N0} exp/hour average, outgrown but " +
-                      "the only thing left");
+                      "the only thing left",
+                      displayReason: "only safe, reachable measured ground left");
                 return;
             }
 
@@ -1096,27 +1202,89 @@ namespace MirBot
         }
 
         /// <summary>
-        /// Go somewhere we have never measured, to find out what it is worth.
-        ///
-        /// The database filter is what makes this safe to do often. MonsterMemory only knows maps
-        /// that have already hurt us, so it is silent about anywhere new - which is exactly when the
-        /// question is asked. MapProfile reads what actually spawns on a map before we go.
+        /// A map's best worthwhile wearable drop, if its currently reachable monsters can supply it.
         /// </summary>
-        /// <summary>
-        /// A hunting entry's ranking score, lifted for each drop-only book the map supplies.
-        ///
-        /// Multiplicative so it scales with what the map is actually worth: doubling a good map
-        /// beats doubling a bad one, which is the behaviour wanted. An ADDITIVE bonus would have
-        /// let a worthless map outrank a good one simply by stocking a book.
-        /// </summary>
-        private double BookRanked(HuntingEntry entry, HashSet<int> wanted)
+        private GearTarget GearTargetFor(int mapIndex, WorldModel world) =>
+            Config.GearHuntBonusPercent <= 0 ? null :
+            _host.GearDrops.Best(mapIndex, _connection?.Items, world,
+                Config.ExploreLevelsAbove);
+
+        private static string GearChoiceReason(GearTarget gear) =>
+            $"looking for gear upgrade: {gear.ItemName} (score +{gear.ScoreGain})";
+
+        private bool DeeperUnmeasuredFloor(int mapIndex, HashSet<int> measured,
+            Dictionary<int, int> hops)
         {
-            double score = entry.Score(HuntingMemory.DefaultDeathPenalty);
+            (string cave, int depth) = MapProfile.SplitDepth(_host.Profiles.For(mapIndex)?.MapName);
+            if (depth <= 1) return false;
+
+            foreach (int other in hops.Keys)
+            {
+                if (other == mapIndex || measured.Contains(other)) continue;
+                (string otherCave, int otherDepth) =
+                    MapProfile.SplitDepth(_host.Profiles.For(other)?.MapName);
+                if (otherDepth > 0 && otherDepth < depth &&
+                    string.Equals(otherCave, cave, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        private bool HasSafeUnmeasuredGearMap(WorldModel world, string mirClass,
+            Dictionary<int, int> hops, AffordableCheck affordable,
+            Func<int, bool> permitted, bool gearFocus)
+        {
+            if (!gearFocus) return false;
+
+            HashSet<int> measured = new HashSet<int>(_host.Hunting.Best(mirClass,
+                world.Level, 500, Config.HuntingDeathPenaltyPercent / 100.0)
+                .Select(entry => entry.MapIndex));
+            HashSet<int> lethal = _host.Hunting.Lethal(mirClass, world.Level);
+            HashSet<int> wantedBooks = WantedDropOnlyBooks(world);
+
+            foreach (int map in hops.Keys)
+            {
+                if (map == world.MapIndex || measured.Contains(map) || lethal.Contains(map) ||
+                    !permitted(map) || _host.Danger.TooDangerous(map, world.MaxHealth) ||
+                    !_host.Profiles.WorthExploring(map, world.Level,
+                        Config.ExploreLevelsAbove, out _) ||
+                    _host.Profiles.OutgrownBy(map, world.Level, Config.HuntLevelsBelow, out _) ||
+                    !affordable(map, out _) ||
+                    OutgrownShoppingTown(world, map, wantedBooks, out _) ||
+                    DeeperUnmeasuredFloor(map, measured, hops)) continue;
+
+                if (GearTargetFor(map, world) != null) return true;
+            }
+
+            return false;
+        }
+
+        private double BookRanked(HuntingEntry entry, HashSet<int> wanted,
+            int level, double deathPenalty)
+        {
+            double score = _host.Hunting.Ranked(entry, level, deathPenalty);
             int supplies = _host.BookDrops.Supplies(entry.MapIndex, wanted);
 
             if (supplies <= 0) return score;
 
             return score * (1 + Config.BookHuntBonusPercent / 100.0 * supplies);
+        }
+
+        private HashSet<int> WantedDropOnlyBooks(WorldModel world) =>
+            Config.BookHuntBonusPercent > 0
+                ? _host.BookDrops.Wanted(world.Class, world.Level, world.PlayerStats, world)
+                : new HashSet<int>();
+
+        private bool OutgrownShoppingTown(WorldModel world, int mapIndex,
+            HashSet<int> wantedBooks, out string why)
+        {
+            MapProfileEntry profile = _host.Profiles.For(mapIndex);
+            int median = profile?.MedianLevel ?? 0;
+            bool defer = HuntingTownPolicy.Defer(_host.Vendors.TownMaps.Contains(mapIndex),
+                median, world.Level, Config.TownHuntLevelGap, world.Gold < Config.PoorGold,
+                _recovery.Active, _host.BookDrops.Supplies(mapIndex, wantedBooks) > 0);
+            why = defer ? $"typical monster level {median} is far below level {world.Level}" : "";
+            return defer;
         }
 
         private string _learningBook;
@@ -1165,14 +1333,17 @@ namespace MirBot
             AffordableCheck affordable, Func<int, bool> permitted, int known)
         {
             HashSet<int> measured = new HashSet<int>(
-                _host.Hunting.Best(mirClass, world.Level, 500).Select(x => x.MapIndex));
+                _host.Hunting.Best(mirClass, world.Level, 500,
+                    Config.HuntingDeathPenaltyPercent / 100.0).Select(x => x.MapIndex));
 
             // "Measured" and "been there" are not the same thing, and the difference is where a
             // map that kills us on arrival hides. Best() has nothing to say about a map we never
             // survived long enough to measure, so without this it reads as unexplored for ever.
             HashSet<int> lethal = _host.Hunting.Lethal(mirClass, world.Level);
+            HashSet<int> wantedHere = WantedDropOnlyBooks(world);
 
             List<int> options = new List<int>();
+            List<int> deferredTowns = new List<int>();
             int tooStrong = 0, tooFar = 0, killers = 0, tooWeak = 0;
 
             foreach (int mapIndex in hops.Keys)
@@ -1201,7 +1372,25 @@ namespace MirBot
 
                 if (!affordable(mapIndex, out _)) { tooFar++; continue; }
 
+                // Towns are still valid vendor stops and emergency recovery grounds. They are
+                // merely postponed as EXPERIMENTS once their normal monsters are far below us.
+                // A wanted drop-only book exempts a town; vendor-sold books do not enter Wanted.
+                if (OutgrownShoppingTown(world, mapIndex, wantedHere, out _))
+                {
+                    deferredTowns.Add(mapIndex);
+                    continue;
+                }
+
                 options.Add(mapIndex);
+            }
+
+            bool usingDeferredTowns = options.Count == 0 && deferredTowns.Count > 0 &&
+                !OutgrownShoppingTown(world, world.MapIndex, wantedHere, out _);
+            if (usingDeferredTowns)
+            {
+                _log.Write($"Travel: only {deferredTowns.Count} outgrown shopping town(s) " +
+                           "remain safe and reachable - allowing one as a fallback.");
+                options.AddRange(deferredTowns);
             }
 
             if (options.Count == 0)
@@ -1212,6 +1401,10 @@ namespace MirBot
                            $"{tooFar} too far to afford.");
                 return false;
             }
+
+            if (deferredTowns.Count > 0 && !usingDeferredTowns)
+                _log.Write($"Travel: deferred {deferredTowns.Count} outgrown shopping " +
+                           "town(s) while exploring stronger grounds.");
 
             // Shallowest floor of a cave first.
             //
@@ -1225,25 +1418,7 @@ namespace MirBot
             // already been measured. Explore Lv 1, learn what it is worth, and Lv 2 becomes
             // available on the next decision.
             int deeper = options.RemoveAll(mapIndex =>
-            {
-                (string cave, int depth) = MapProfile.SplitDepth(_host.Profiles.For(mapIndex)?.MapName);
-
-                if (depth <= 1) return false;
-
-                foreach (int other in hops.Keys)
-                {
-                    if (other == mapIndex || measured.Contains(other)) continue;
-
-                    (string otherCave, int otherDepth) =
-                        MapProfile.SplitDepth(_host.Profiles.For(other)?.MapName);
-
-                    if (otherDepth > 0 && otherDepth < depth &&
-                        string.Equals(otherCave, cave, StringComparison.OrdinalIgnoreCase))
-                        return true;   // a shallower floor is still unmeasured - start there
-                }
-
-                return false;
-            });
+                DeeperUnmeasuredFloor(mapIndex, measured, hops));
 
             // Nearer before further - measured from TOWN, not from where the bot is standing.
             //
@@ -1260,34 +1435,41 @@ namespace MirBot
             int Distance(int mapIndex) =>
                 fromTown.TryGetValue(mapIndex, out int d) ? d : hops[mapIndex];
 
-            // A MAP THAT DROPS A SKILL WE CANNOT BUY JUMPS THE QUEUE.
-            //
-            // Applied before the distance ring, not after, because the whole point is to accept a
-            // longer walk for something the shops cannot supply. It only ever narrows the list to
-            // maps that already passed every safety, level and affordability test above, so this
-            // cannot send a character somewhere it was not already willing to go.
-            //
-            // Nothing to want means nothing changes - the list is untouched and exploration works
-            // exactly as it did.
-            HashSet<int> wantedHere = Config.BookHuntBonusPercent > 0
-                ? _host.BookDrops.Wanted(world.Class, world.Level, world.PlayerStats, world)
-                : new HashSet<int>();
-
-            if (wantedHere.Count > 0)
-            {
-                List<int> bookMaps = options
-                    .Where(x => _host.BookDrops.Supplies(x, wantedHere) > 0).ToList();
-
-                if (bookMaps.Count > 0)
-                {
-                    _log.Write($"Travel: {bookMaps.Count} unmeasured map(s) drop a skill book we " +
-                               "cannot buy - looking there first.");
-                    options = bookMaps;
-                }
-            }
+            // Choose the GOAL before the distance ring, just as exploitation chooses it before
+            // the XP shortlist. Otherwise a book map at one hop is always discarded behind a
+            // zero-hop town, or conversely the old hard book filter chooses books 100% of the
+            // time and defeats the configured 70%/20% preference.
+            List<int> bookMaps = options
+                .Where(x => _host.BookDrops.Supplies(x, wantedHere) > 0).ToList();
+            List<int> ordinaryMaps = options
+                .Where(x => _host.BookDrops.Supplies(x, wantedHere) == 0).ToList();
+            bool bookGoal = HuntingGoalChoice.PursueBook(bookMaps.Count > 0,
+                ordinaryMaps.Count > 0, _profitPolicy?.Active == true,
+                _consecutiveBookHunts, Config.BookHuntChancePercent,
+                Config.LossBookHuntChancePercent, Config.MaxConsecutiveBookHunts,
+                _random, out int bookChance);
+            if (bookMaps.Count > 0)
+                _log.Write($"Travel: exploring {bookMaps.Count} book map(s), " +
+                           $"{ordinaryMaps.Count} ordinary map(s); {bookChance}% book chance, " +
+                           $"{_consecutiveBookHunts} prior book-priority choice(s) - choosing " +
+                           $"{(bookGoal ? "book" : "ordinary")} exploration.");
+            options = bookGoal ? bookMaps : ordinaryMaps;
 
             int nearest = options.Min(Distance);
-            options.RemoveAll(x => Distance(x) > nearest);
+            bool gearFocus = !bookGoal && Config.GearHuntBonusPercent > 0 &&
+                             !_recovery.Active && _profitPolicy?.Active != true &&
+                             _consecutiveGearHunts < Math.Max(1, Config.MaxConsecutiveGearHunts);
+            Dictionary<int, GearTarget> gearTargets = new Dictionary<int, GearTarget>();
+            if (gearFocus)
+                foreach (int map in options)
+                    gearTargets[map] = GearTargetFor(map, world);
+            bool nearGear = gearTargets.Any(pair => pair.Value != null &&
+                Distance(pair.Key) <= nearest + 1);
+
+            // Keep the normal nearest-town ring, plus a gear source at most one hop beyond it.
+            // A distant drop does not justify crossing several unmeasured floors blind.
+            options.RemoveAll(map => Distance(map) > nearest &&
+                (!nearGear || Distance(map) > nearest + 1 || gearTargets[map] == null));
 
             string why = known < Config.ExploreUntilMapsKnown
                 ? $"exploring - only {known} of {Config.ExploreUntilMapsKnown} maps measured"
@@ -1298,23 +1480,52 @@ namespace MirBot
             // Named maps first. This biases which map gets measured FIRST; it does not fake a
             // measurement. Seeding invented rates would poison every real observation ranked
             // against them, and the whole point of the memory is that it is observed.
-            foreach (string name in PreferredMapNames())
+            if (!nearGear)
             {
-                MapInfo info = Globals.MapInfoList?.Binding?.FirstOrDefault(x =>
-                    string.Equals(x.Description, name, StringComparison.OrdinalIgnoreCase));
+                foreach (string name in PreferredMapNames())
+                {
+                    MapInfo info = Globals.MapInfoList?.Binding?.FirstOrDefault(x =>
+                        string.Equals(x.Description, name, StringComparison.OrdinalIgnoreCase));
 
-                if (info == null || !options.Contains(info.Index)) continue;
+                    if (info == null || !options.Contains(info.Index)) continue;
 
-                Begin(info.Index, info.Description, $"preferred, {why}");
-                return true;
+                    Begin(info.Index, info.Description, $"preferred, {why}",
+                          displayReason: bookGoal
+                              ? BookChoiceReason(info.Index, wantedHere, exploring: true)
+                              : "exploring unmeasured preferred map");
+                    _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
+                    _consecutiveGearHunts = 0;
+                    return true;
+                }
             }
 
-            int chosen = options[_random.Next(options.Count)];
+            int chosen;
+            if (nearGear)
+            {
+                HashSet<string> preferred = new HashSet<string>(PreferredMapNames(),
+                    StringComparer.OrdinalIgnoreCase);
+                double[] weights = options.Select(map =>
+                    (Distance(map) == nearest ? 1.0 : 0.6) *
+                    (preferred.Contains(_host.Profiles.For(map)?.MapName ?? "") ? 2.0 : 1.0) *
+                    (1 + (gearTargets[map]?.Priority ?? 0) * 2)).ToArray();
+                chosen = options[WeightedChoice.Pick(weights, 1, _random, out _)];
+            }
+            else chosen = options[_random.Next(options.Count)];
             MapProfileEntry profile = _host.Profiles.For(chosen);
+            GearTarget chosenGear = nearGear ? gearTargets[chosen] : null;
 
             Begin(chosen, profile?.MapName ?? $"map {chosen}",
                   $"{why} (median monster level {profile?.MedianLevel ?? 0}, " +
-                  $"{hops[chosen]} hop(s) away, {Distance(chosen)} from town)");
+                  $"{hops[chosen]} hop(s) away, {Distance(chosen)} from town)" +
+                  (chosenGear == null ? "" : $"; {GearChoiceReason(chosenGear)}"),
+                  displayReason: chosenGear != null
+                      ? GearChoiceReason(chosenGear)
+                      : bookGoal
+                      ? BookChoiceReason(chosen, wantedHere, exploring: true)
+                      : "exploring unmeasured hunting ground");
+
+            _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
+            _consecutiveGearHunts = chosenGear != null ? _consecutiveGearHunts + 1 : 0;
 
             return true;
         }
@@ -1433,6 +1644,8 @@ namespace MirBot
             bool tripJustFinished = _tripWasActive && !active;
             _tripWasActive = active;
 
+            if (tripJustFinished) SampleGold(force: true, tripCompleted: true);
+
             UpdateRecoveryState(tripJustFinished);
 
             bool recoveryRoute = !active && RecoveryRouteNeeded();
@@ -1493,9 +1706,13 @@ namespace MirBot
                                 _connection.World.Gold >= Config.PoorGold &&
                                 (_brain?.Travel == null || !_brain.Travel.Active) &&
                                 DateTime.UtcNow >= _nextOutgrownCheck &&
-                                _host.Profiles.OutgrownBy(_connection.World.MapIndex,
-                                    _connection.World.Level, Config.HuntLevelsBelow,
-                                    out outgrownHereWhy);
+                                (_host.Profiles.OutgrownBy(_connection.World.MapIndex,
+                                     _connection.World.Level, Config.HuntLevelsBelow,
+                                     out outgrownHereWhy) ||
+                                 OutgrownShoppingTown(_connection.World,
+                                     _connection.World.MapIndex,
+                                     WantedDropOnlyBooks(_connection.World),
+                                     out outgrownHereWhy));
 
             // EARNING NOTHING HERE. See BotConfig.UnproductiveMinutes.
             //
@@ -1695,7 +1912,67 @@ namespace MirBot
             }
         }
 
-        private void Begin(int mapIndex, string mapName, string why)
+        private string BookChoiceReason(int mapIndex, HashSet<int> wanted, bool exploring)
+        {
+            int count = _host.BookDrops.Supplies(mapIndex, wanted);
+            return $"{(exploring ? "exploring for" : "looking for")} {count} skill " +
+                   $"{(count == 1 ? "book" : "books")}: " +
+                   _host.BookDrops.Names(mapIndex, wanted);
+        }
+
+        private int MapTripKillProxy() => _mapTrip == null || !_mapTrip.ArrivedUtc.HasValue ||
+            _connection == null ? 0 :
+            (int)Math.Clamp(_connection.World.PositiveExperienceAwards - _mapTripXpAwardBaseline,
+                0L, int.MaxValue);
+
+        private void CloseMapTrip(string reason)
+        {
+            if (_mapTrip == null) return;
+            int credited = _connection != null &&
+                _connection.World.MapIndex == _mapTrip.MapIndex
+                ? MapTripKillProxy() : _mapTrip.CreditedKills;
+            _host.MapTrips.Close(_mapTrip, reason, credited);
+            _mapTrip = null;
+        }
+
+        private void ObserveMapTrip()
+        {
+            if (_mapTrip == null || _connection == null) return;
+            WorldModel world = _connection.World;
+            if (world.MapIndex == _mapTrip.MapIndex)
+            {
+                if (!_mapTrip.ArrivedUtc.HasValue)
+                    _mapTripXpAwardBaseline = world.PositiveExperienceAwards;
+                _host.MapTrips.Observe(_mapTrip, world.MapIndex, MapTripKillProxy());
+            }
+            else if (_mapTrip.ArrivedUtc.HasValue)
+            {
+                string reason = world.Dead ? "died" :
+                    _town != null && _town.Active ? "town trip: " + _town.Status :
+                    _brain?.Travel != null && _brain.Travel.Active ? "travelling to another map" :
+                    "left the selected map";
+                CloseMapTrip(reason);
+            }
+        }
+
+        private void NoteFarmingChoice(int mapIndex, string mapName, string reason)
+        {
+            // A trip to restock is not a new farming decision. Keep the selected destination
+            // visible while the character is in town or crossing intermediate cave floors.
+            _farmingDestinationName = mapName ?? "";
+            _farmingDestinationReason = reason ?? "";
+            if (_mapTrip != null && _mapTrip.MapIndex == mapIndex &&
+                _mapTrip.SelectionReason == _farmingDestinationReason) return;
+            CloseMapTrip("new selection: " + _farmingDestinationName);
+            WorldModel world = _connection?.World;
+            _mapTrip = _host.MapTrips.Start(Id, world?.Name ?? Config.CharacterName,
+                world?.Class.ToString() ?? "", mapIndex, _farmingDestinationName,
+                _farmingDestinationReason);
+            if (world != null && world.MapIndex == mapIndex) ObserveMapTrip();
+        }
+
+        private void Begin(int mapIndex, string mapName, string why,
+            bool farmingChoice = true, string displayReason = null)
         {
             // Refreshed per journey rather than held, because the set is a function of our level
             // and of what has happened since - both of which move.
@@ -1705,6 +1982,8 @@ namespace MirBot
 
             if (_brain.Travel.Begin(_connection.World, mapIndex, mapName))
             {
+                if (farmingChoice)
+                    NoteFarmingChoice(mapIndex, mapName, displayReason ?? why);
                 if (!string.IsNullOrEmpty(_brain.Travel.Detour))
                     _log.Write($"Travel: {_brain.Travel.Detour}");
 
@@ -1796,6 +2075,30 @@ namespace MirBot
             if (!string.IsNullOrEmpty(_lastAttacker))
                 _host.Danger.RecordKill(_lastAttacker, world.MapName, world.Location, world.Level);
 
+            // BANK THE EARNINGS BEFORE THE DEATH, OR THE MAP IS CHARGED AND NEVER CREDITED.
+            //
+            // RecordDeath fires every time, unconditionally. CloseExperienceSample refuses any
+            // window shorter than MinimumSampleMinutes, and nothing closed the window on death at
+            // all - so a map that killed us three minutes after we arrived kept the death and
+            // threw the experience away. Deaths were therefore recorded in full and earnings only
+            // sometimes, and the faster a map killed us the more completely it was slandered: the
+            // rate stayed at zero, which excludes the map from Best(), and three such visits put
+            // it on the Lethal() list, which excludes it from exploration too.
+            //
+            // Sixteen entries across the fleet were in exactly that state, including Ant Cave
+            // North - written off at zero by the wizard while the warrior measured 680,656
+            // exp/hour there.
+            //
+            // Forced past the minimum because the window did not end early by accident: it ended
+            // because we died, which is the one case where the short window is the whole truth
+            // about the visit. The rate it produces is honest and Record() weights it by its own
+            // duration, so three minutes joins a 1.9 hour history at three minutes' worth.
+            //
+            // Once the map has a rate it belongs to Score() and its death discount, which is what
+            // HuntingMemory.Lethal already says should happen to anywhere that has ever paid us.
+            CloseExperienceSample("died", force: true);
+            ResetExperienceSample();
+
             _host.Hunting.RecordDeath(world.MapIndex, world.MapName,
                 world.Class.ToString(), world.Level);
 
@@ -1883,14 +2186,17 @@ namespace MirBot
         /// Recorded against the map and level the window STARTED on, which is why both are held:
         /// by the time this runs, the world model has usually already moved on.
         /// </summary>
-        private void CloseExperienceSample(string why)
+        private void CloseExperienceSample(string why, bool force = false)
         {
             if (_sampleStarted == DateTime.MinValue || _sampleMapIndex <= 0) return;
             if (_connection == null) return;
 
             TimeSpan elapsed = DateTime.UtcNow - _sampleStarted;
 
-            if (elapsed < TimeSpan.FromMinutes(Math.Max(1, Config.MinimumSampleMinutes))) return;
+            // The minimum exists to keep noise out of the average. It must not also keep the
+            // truth out: see the death handler for what discarding these windows cost us.
+            if (!force &&
+                elapsed < TimeSpan.FromMinutes(Math.Max(1, Config.MinimumSampleMinutes))) return;
 
             decimal gained = _connection.World.TotalExperienceGained - _sampleStartExperience;
             double hours = elapsed.TotalHours;
@@ -2027,6 +2333,10 @@ namespace MirBot
         {
             if (_connection == null) return;
 
+            CloseMapTrip(why);
+
+            SampleXp(force: true);
+
             WriteSummary(why);
 
             try
@@ -2049,6 +2359,33 @@ namespace MirBot
 
         private DateTime _nextGoldSample = DateTime.MinValue;
         private long _lastGoldSampled = long.MinValue;
+        private readonly List<GoldSample> _goldHistory = new List<GoldSample>();
+        private ProfitPolicy _profitPolicy;
+        private long _capitalSpent;
+        private string _moneyDiagnostic = "";
+        private int _lastTravelPenaltyPercent;
+        private int _consecutiveBookHunts;
+        private int _consecutiveGearHunts;
+        private string _xpSession = "";
+        private DateTime _nextXpSample = DateTime.MinValue;
+        private decimal _lastXpTotal = decimal.MinValue;
+        private XpPace _xpPace;
+
+        private void SampleXp(bool force = false)
+        {
+            if (_connection == null || _connection.World.SelfID == 0) return;
+            WorldModel world = _connection.World;
+            DateTime now = DateTime.UtcNow;
+            if (!force && now < _nextXpSample) return;
+            _host.Xp.Append(new XpPoint
+            {
+                Bot = Id, Character = world.Name, Session = _xpSession,
+                Utc = now, Total = world.TotalExperienceNet
+            });
+            _lastXpTotal = world.TotalExperienceNet;
+            _nextXpSample = now + XpLog.SampleInterval;
+            _xpPace = _host.Xp.Measure(Id, world.Name, now);
+        }
 
         /// <summary>
         /// One point on the gold curve, on the ordinary cadence or whenever the balance jumps.
@@ -2057,7 +2394,7 @@ namespace MirBot
         /// that has wedged still has gold worth plotting, and hanging this off snapshot rebuilds
         /// would stop sampling at the moment the chart became interesting.
         /// </summary>
-        private void SampleGold()
+        private void SampleGold(bool force = false, bool tripCompleted = false)
         {
             if (_connection == null || _connection.World.SelfID == 0) return;
 
@@ -2068,11 +2405,35 @@ namespace MirBot
             bool jumped = _lastGoldSampled != long.MinValue &&
                           Math.Abs(gold - _lastGoldSampled) >= GoldLog.NotableChange;
 
-            if (!due && !jumped) return;
+            if (!force && !due && !jumped) return;
 
             _nextGoldSample = now + GoldLog.SampleInterval;
             _lastGoldSampled = gold;
-            _host.Gold.Append(Id, gold, now);
+            _host.Gold.Append(Id, gold, now, _capitalSpent);
+            _goldHistory.Add(new GoldSample(now, gold, _capitalSpent));
+            DateTime keepAfter = now.AddHours(-Math.Max(48, Config.LossWatchHours));
+            int remove = 0;
+            while (remove + 1 < _goldHistory.Count && _goldHistory[remove + 1].Utc < keepAfter)
+                remove++;
+            if (remove > 0) _goldHistory.RemoveRange(0, remove);
+            EvaluateProfit(now, tripCompleted);
+        }
+
+        private void EvaluateProfit(DateTime now, bool tripCompleted)
+        {
+            if (_profitPolicy == null) return;
+            GoldTrendResult trend = GoldTrend.Measure(_goldHistory, now, Config.LossWatchHours);
+            string transition = _profitPolicy.Update(trend, now, tripCompleted,
+                Config.LossWatchHours, Config.LossWatchDropGold,
+                Config.LossWatchRecoverGold, Config.LossWatchMaxHours);
+            if (transition.Length > 0) _log.Write("Money: " + transition);
+            string slope = trend.Valid ? $"adjusted {trend.Change:+#,0;-#,0;0} over " +
+                $"{trend.CoverageHours:N1}h" : $"warming up ({trend.CoverageHours:N1}h coverage)";
+            string mode = _profitPolicy.Active ? "loss watch active" :
+                now < _profitPolicy.CooldownUntilUtc ? "capped/cooling down" : "baseline";
+            _moneyDiagnostic = $"{slope}; capital adjustment +{trend.CapitalAdjustment:N0}; " +
+                $"{mode}; latest travel death penalty {_lastTravelPenaltyPercent}% " +
+                "(manual gold grants unclassified)";
         }
 
         /// <summary>How long a snapshot may sit unrebuilt while the world is not moving.</summary>
@@ -2083,6 +2444,7 @@ namespace MirBot
         private void PublishIfDue()
         {
             SampleGold();
+            SampleXp();
 
             DateTime now = DateTime.UtcNow;
             if (now < _nextSnapshot) return;
@@ -2303,7 +2665,9 @@ namespace MirBot
                     // values - so two bots could disagree about a setting and nothing would say
                     // so, because one of them happened to be reconnecting at the time.
                     Config = ConfigView(),
-                    ConfigResult = _configResult
+                    ConfigResult = _configResult,
+                    FarmingDestinationName = _farmingDestinationName,
+                    FarmingDestinationReason = _farmingDestinationReason
                 };
 
             WorldModel world = _connection.World;
@@ -2362,6 +2726,80 @@ namespace MirBot
 
             storage.Sort((a, b) => a.Slot.CompareTo(b.Slot));
 
+            // WorldModel already tracks ownership and pet health for combat decisions. Copy the
+            // same live objects into the immutable web snapshot instead of leaving Pets empty.
+            List<PetStatus> pets = new List<PetStatus>();
+            foreach (WorldObject pet in world.OwnPets)
+                pets.Add(new PetStatus
+                {
+                    Name = pet.Name ?? "",
+                    Level = pet.Level,
+                    Health = pet.Health,
+                    MaxHealth = pet.MaxHealth,
+                    HealthPercent = pet.MaxHealth > 0
+                        ? (int)Math.Clamp((long)pet.Health * 100 / pet.MaxHealth, 0, 100)
+                        : 0,
+                    Distance = WorldModel.Distance(world.Location, pet.Location)
+                });
+
+            // SKILLS. Ordered by the character level each becomes available at, which is the order
+            // a player thinks of them in and puts the newest acquisition at the bottom.
+            List<SkillStatus> skills = new List<SkillStatus>();
+
+            foreach (ClientUserMagic magic in world.Magics)
+            {
+                if (magic?.Info == null) continue;
+
+                MagicInfo info = magic.Info;
+
+                // The threshold for the NEXT skill level, not the current one. Level 3 is the cap,
+                // so there is no next and both figures are reported as zero rather than as a bar
+                // that can never fill.
+                long next = magic.Level switch
+                {
+                    0 => info.Experience1,
+                    1 => info.Experience2,
+                    2 => info.Experience3,
+                    _ => 0
+                };
+
+                int needLevel = magic.Level switch
+                {
+                    0 => info.NeedLevel1,
+                    1 => info.NeedLevel2,
+                    2 => info.NeedLevel3,
+                    _ => 0
+                };
+
+                bool supported = SpellBook.IsSupported(info.Magic, out string why);
+
+                if (supported && magic.ItemRequired)
+                {
+                    supported = false;
+                    why = "needs an item the bot does not carry";
+                }
+
+                skills.Add(new SkillStatus
+                {
+                    Name = info.Name ?? "",
+                    School = info.School.ToString(),
+                    Level = magic.Level,
+                    Experience = magic.Experience,
+                    NextExperience = next,
+                    Percent = next > 0
+                        ? (int)Math.Clamp(magic.Experience * 100 / next, 0, 100)
+                        : 100,
+                    NeedLevel = needLevel,
+                    Usable = world.Level >= info.NeedLevel1,
+                    Castable = supported,
+                    Use = supported ? "active"
+                        : SpellBook.IsPassive(info.Magic) ? "passive" : "unused",
+                    Why = why
+                });
+            }
+
+            skills.Sort((a, b) => a.Name.CompareTo(b.Name));
+
             ExplorationSnapshot exploration = _brain?.ExplorationStatus()
                 ?? new ExplorationSnapshot(0, 0);
 
@@ -2391,6 +2829,13 @@ namespace MirBot
                 MaxExperience = world.MaxExperience.ToString("0"),
                 ExperiencePercent = percent,
                 AtMaxLevel = world.AtMaxLevel,
+                XpRatePerHour = _xpPace.PerHour?.ToString("0", System.Globalization.CultureInfo.InvariantCulture),
+                XpCoverageSeconds = _xpPace.CoverageSeconds,
+                EstimatedNextLevelSeconds = !world.MaxExperienceKnown || world.AtMaxLevel ||
+                    _xpPace.PerHour == null || _xpPace.PerHour <= 0 ? null :
+                    (long?)Math.Min(long.MaxValue,
+                        Math.Ceiling(Math.Max(0m, world.MaxExperience - world.Experience) * 3600m /
+                                     _xpPace.PerHour.Value)),
                 Gold = world.Gold.ToString(),
 
                 MapIndex = world.MapIndex,
@@ -2398,6 +2843,8 @@ namespace MirBot
                 X = world.Location.X,
                 Y = world.Location.Y,
                 InSafeZone = world.InSafeZone,
+                FarmingDestinationName = _farmingDestinationName,
+                FarmingDestinationReason = _farmingDestinationReason,
                 DestX = destination == System.Drawing.Point.Empty ? (int?)null : destination.X,
                 DestY = destination == System.Drawing.Point.Empty ? (int?)null : destination.Y,
                 ExplorationMode = _brain?.ExplorationMode ?? "none",
@@ -2445,7 +2892,11 @@ namespace MirBot
                 GearDiagnostic = _town?.GearDiagnostic ?? "",
                 SupplyDiagnostic = _town?.SupplyDiagnostic ?? "",
                 RepairDiagnostic = _town?.RepairDiagnostic ?? "",
+                MoneyDiagnostic = _moneyDiagnostic,
 
+                Skills = skills,
+                PetMode = world.PetMode.ToString(),
+                Pets = pets,
                 Equipment = equipment,
                 Inventory = inventory,
                 Storage = storage,

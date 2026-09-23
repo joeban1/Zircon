@@ -296,13 +296,25 @@ namespace MirBot
 
         public void Process(S.LevelChanged p)
         {
+            int previousLevel = World.Level;
+            if (World.SelfID != 0 && p.Level > previousLevel && previousLevel > 0)
+                OnLevelUp?.Invoke(previousLevel, p.Level);
             World.ApplyLevelChanged(p.Level, p.Experience, p.MaxExperience);
 
             // A level up raises WearWeight, so gear refused as too heavy may now fit.
             Items.ClearEquipRefusals();
         }
 
-        public void Process(S.CurrencyChanged p) => World.ApplyCurrency(p.CurrencyIndex, p.Amount);
+        public Action<int, int> OnLevelUp;
+
+        public void Process(S.CurrencyChanged p)
+        {
+            long before = World.Gold;
+            World.ApplyCurrency(p.CurrencyIndex, p.Amount);
+            if (_pendingCapital && DateTime.UtcNow - _pendingCapitalAt <= BuyAnswerWindow &&
+                before == _pendingCapitalGold && World.Gold < before)
+                _pendingCapitalDebit = before - World.Gold;
+        }
 
         public void Process(S.NewMagic p) => World.ApplyMagic(p.Magic);
 
@@ -371,8 +383,28 @@ namespace MirBot
         public void Process(S.DataObjectHealthMana p) =>
             World.ApplyHealthMana(p.ObjectID, p.Health, p.Mana, p.Dead);
 
-        public void Process(S.DataObjectMaxHealthMana p) =>
-            World.ApplyMaxHealthMana(p.ObjectID, p.MaxHealth, p.MaxMana);
+        /// <summary>
+        /// A MONSTER reports its maximum through Stats, not through MaxHealth.
+        ///
+        /// The packet carries three fields and the server fills different ones depending on what
+        /// is being described: PlayerObject sets MaxHealth/MaxMana (PlayerObject.cs:2299), while
+        /// MonsterObject sets Stats and leaves them at zero (MonsterObject.cs:847). Reading only
+        /// MaxHealth therefore recorded every monster - and every PET - as having a maximum of
+        /// zero.
+        ///
+        /// That is why the status page showed a healthy skeleton as "hp=300/0", and much worse,
+        /// why a Taoist never once healed its pet: ChoosePetHeal opens with
+        /// `if (pet.MaxHealth &lt;= 0) continue`, a guard against dividing by zero that silently
+        /// disabled the whole feature because the value it guards was never populated. The spell
+        /// was known, the code was called, and the first line threw every candidate away.
+        /// </summary>
+        public void Process(S.DataObjectMaxHealthMana p)
+        {
+            int maxHealth = p.MaxHealth > 0 ? p.MaxHealth : p.Stats?[Stat.Health] ?? 0;
+            int maxMana = p.MaxMana > 0 ? p.MaxMana : p.Stats?[Stat.Mana] ?? 0;
+
+            World.ApplyMaxHealthMana(p.ObjectID, maxHealth, maxMana);
+        }
 
         #endregion
 
@@ -472,7 +504,10 @@ namespace MirBot
             // (PlayerObject.cs:6486-6496). Applied to the slot the SERVER named.
             long remaining = p.Link?.Count ?? 0;
 
-            if (inventory && slot >= 0) Items.NoteSlotCount(slot, remaining);
+            if (p.Link != null && slot >= 0 &&
+                (p.Link.GridType == GridType.Inventory ||
+                 p.Link.GridType == GridType.Equipment))
+                Items.NoteSlotCount(p.Link.GridType, slot, remaining);
 
             if (answersDrop)
                 Log(remaining <= 0
@@ -761,6 +796,13 @@ namespace MirBot
 
         private string _pendingBuy;
         private DateTime _pendingBuyAt;
+        private bool _pendingCapital;
+        private DateTime _pendingCapitalAt;
+        private int _pendingCapitalItemIndex;
+        private long _pendingCapitalAmount;
+        private long _pendingCapitalGold;
+        private long _pendingCapitalDebit;
+        public Action<long> OnCapitalBought;
 
         /// <summary>
         /// How long to wait for a purchase to arrive before calling it refused. The server answers
@@ -793,6 +835,8 @@ namespace MirBot
 
             string what = _pendingBuy;
             _pendingBuy = null;
+            if (_pendingCapital) Log($"Capital purchase unconfirmed: {what}; no adjustment.");
+            _pendingCapital = false;
 
             Log($"Buy REFUSED by the server: {what} never arrived - no S.ItemsGained followed the " +
                 "order. Gold was not spent; nothing was received.");
@@ -803,6 +847,25 @@ namespace MirBot
         public void Process(S.ItemsGained p)
         {
             if (p.Items == null) return;
+
+            if (_pendingCapital)
+            {
+                int received = 0;
+                bool matched = false;
+                foreach (ClientUserItem item in p.Items)
+                {
+                    received++;
+                    matched = item?.Info?.Index == _pendingCapitalItemIndex &&
+                              item.Count == _pendingCapitalAmount;
+                }
+                if (received == 1 && matched && _pendingCapitalDebit > 0 &&
+                    DateTime.UtcNow - _pendingCapitalAt <= BuyAnswerWindow)
+                    OnCapitalBought?.Invoke(_pendingCapitalDebit);
+                else
+                    Log("Capital purchase answer did not match item, amount and gold debit; " +
+                        "leaving spend in the operating trend.");
+                _pendingCapital = false;
+            }
 
             // Whatever arrived, the order was answered.
             _pendingBuy = null;
@@ -856,7 +919,14 @@ namespace MirBot
                         ToGrid = GridType.Equipment,
                         FromSlot = decision.Equip.FromSlot,
                         ToSlot = decision.Equip.ToSlot,
-                        MergeItem = false
+
+                        // TOPPING UP A STACK IS A MERGE, and the server will refuse it otherwise:
+                        // ItemMove returns immediately when the destination is occupied and
+                        // MergeItem is false (PlayerObject.cs ItemMove, "if (!p.MergeItem &&
+                        // toItem != null) return"). Hardcoding false meant a Taoist carrying 33
+                        // Green Poison and 58 Talisman beside 267 and 242 already equipped could
+                        // never add them - it bought reagents it was structurally unable to use.
+                        MergeItem = decision.Equip.Merge
                     });
                     // Remembered, not applied - see Process(S.ItemMove).
                     _pendingEquip = decision.Equip;
@@ -1115,6 +1185,12 @@ namespace MirBot
                     // Remembered so the OUTCOME can be checked - see Process(S.ItemsGained).
                     _pendingBuy = decision.Reason;
                     _pendingBuyAt = DateTime.UtcNow;
+                    _pendingCapital = decision.CapitalPurchase;
+                    _pendingCapitalAt = _pendingBuyAt;
+                    _pendingCapitalItemIndex = decision.BuyItemIndex;
+                    _pendingCapitalAmount = decision.BuyAmount;
+                    _pendingCapitalGold = World.Gold;
+                    _pendingCapitalDebit = 0;
 
                     Enqueue(new C.NPCBuy
                     {

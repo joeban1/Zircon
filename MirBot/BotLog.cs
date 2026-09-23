@@ -24,6 +24,13 @@ namespace MirBot
 
         private readonly object _lock = new object();
         private readonly string _path;
+
+        /// <summary>
+        /// Where this log is written, so a reader can find it and its rotations (.2, .3).
+        /// Exposed for the loot search, which answers "where did this item ever drop" from the
+        /// only record that holds it - nothing else persists a loot event.
+        /// </summary>
+        public string FilePath => _path;
         private readonly bool _console;
 
         private StreamWriter _writer;
@@ -88,7 +95,7 @@ namespace MirBot
 
         public void Write(string message)
         {
-            string line = $"[{DateTime.Now:HH:mm:ss.fff}] [{Prefix}] {message}";
+            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{Prefix}] {message}";
 
             if (_console) Console.WriteLine(line);
 

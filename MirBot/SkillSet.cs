@@ -40,7 +40,17 @@ namespace MirBot
             // read. Both of these are AttackSkill on the server and both add their own Type in
             // AttackCast, so the server will accept them as an AttackMagic - the test that rules
             // Swordsmanship out above.
-            MagicType.VineTreeDance, MagicType.Discipline
+            MagicType.VineTreeDance, MagicType.Discipline,
+            MagicType.CalamityOfFullMoon, MagicType.FullBloom, MagicType.WhiteLotus,
+            MagicType.RedLotus, MagicType.SweetBrier
+        };
+
+        // The client chooses these as AttackMagic on its next ordinary swing. They do not
+        // send a MagicToggle(true), so waiting for one would leave them unused forever.
+        private static readonly MagicType[] ChosenAssassinAttacks =
+        {
+            MagicType.FullBloom, MagicType.WhiteLotus, MagicType.RedLotus,
+            MagicType.SweetBrier
         };
 
         /// <summary>
@@ -54,8 +64,30 @@ namespace MirBot
             MagicType.VineTreeDance, MagicType.Discipline
         };
 
+        /// <summary>
+        /// Does the bot actively drive this melee skill?
+        ///
+        /// Nameable and Sustained between them are every magic this class acts on: one names the
+        /// skill on a swing, the other arms it and leaves it armed. Asked by the status page, which
+        /// otherwise reported a warrior's entire kit as unused - Mirbot has four skills, all four
+        /// are melee, and it had cast Half Moon 3,727 times while the page called it unusable.
+        /// </summary>
+        public static bool Drives(MagicType magic) =>
+            Nameable.Contains(magic) || Array.IndexOf(Sustained, magic) >= 0;
+
+        public bool HasAssassinMelee(WorldModel world)
+        {
+            if (world.Class != MirClass.Assassin) return false;
+            foreach (MagicType magic in ChosenAssassinAttacks)
+                if (world.CanUseMagic(magic)) return true;
+            return world.CanUseMagic(MagicType.Discipline) ||
+                   world.CanUseMagic(MagicType.VineTreeDance) ||
+                   world.CanUseMagic(MagicType.CalamityOfFullMoon);
+        }
+
         private readonly HashSet<MagicType> _armed = new HashSet<MagicType>();
         private readonly HashSet<MagicType> _enabled = new HashSet<MagicType>();
+        private readonly Dictionary<int, DateTime> _cooldowns = new Dictionary<int, DateTime>();
 
         public int ArmedCount => _armed.Count;
 
@@ -68,11 +100,15 @@ namespace MirBot
 
         public bool IsArmed(MagicType magic) => _armed.Contains(magic);
 
+        public void Cooldown(int infoIndex, int delayMilliseconds) =>
+            _cooldowns[infoIndex] = DateTime.UtcNow.AddMilliseconds(Math.Max(0, delayMilliseconds));
+
         /// <summary>Everything resets on a reconnect - the server's arming state does not survive.</summary>
         public void Reset()
         {
             _armed.Clear();
             _enabled.Clear();
+            _cooldowns.Clear();
         }
 
         /// <summary>
@@ -105,6 +141,16 @@ namespace MirBot
         public MagicType ChooseAttackMagic(WorldModel world, WorldObject target, int distance)
         {
             if (target == null) return MagicType.None;
+
+            // Prefer the server's Lotus chain while its predecessor buff is still present.
+            // Every one is a C.Attack AttackMagic, not a C.Magic cast or a toggle.
+            MagicType preferred = world.HasBuff(BuffType.RedLotus) ? MagicType.SweetBrier :
+                world.HasBuff(BuffType.WhiteLotus) ? MagicType.RedLotus :
+                world.HasBuff(BuffType.FullBloom) ? MagicType.WhiteLotus :
+                MagicType.FullBloom;
+            if (ManualReady(world, preferred)) return preferred;
+            foreach (MagicType magic in ChosenAssassinAttacks)
+                if (magic != preferred && ManualReady(world, magic)) return magic;
 
             if (IsArmed(MagicType.Thrusting) && Usable(world, MagicType.Thrusting))
             {
@@ -158,6 +204,14 @@ namespace MirBot
             if (!world.CanUseMagic(magic)) return false;
 
             return world.Mana >= CostOf(world, magic);
+        }
+
+        private bool ManualReady(WorldModel world, MagicType magic)
+        {
+            if (!world.TryGetMagic(magic, out ClientUserMagic known) ||
+                known?.Info == null || known.ItemRequired || !Usable(world, magic)) return false;
+            return !_cooldowns.TryGetValue(known.InfoIndex, out DateTime until) ||
+                   DateTime.UtcNow >= until;
         }
 
         /// <summary>

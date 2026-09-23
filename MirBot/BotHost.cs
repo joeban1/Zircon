@@ -34,6 +34,7 @@ namespace MirBot
         public MonsterIndex Monsters { get; } = new MonsterIndex();
         public ButcherIndex Butcher { get; } = new ButcherIndex();
         public BookDropIndex BookDrops { get; } = new BookDropIndex();
+        public GearDropIndex GearDrops { get; } = new GearDropIndex();
         public MapLibrary Maps { get; private set; }
 
         /// <summary>A map's display name, or a readable fallback when the database has none.</summary>
@@ -44,7 +45,10 @@ namespace MirBot
         public MonsterMemory Danger { get; private set; }
         public NavCorrections Nav { get; private set; }
         public DeathMemory Deaths { get; private set; }
+        public LevelMemory Levels { get; private set; }
+        public MapTripMemory MapTrips { get; private set; }
         public GoldLog Gold { get; private set; }
+        public XpLog Xp { get; private set; }
 
         /// <summary>Where the memory banks and the extracted item icons live.</summary>
         public string MemoryFolder { get; private set; } = "";
@@ -514,6 +518,8 @@ namespace MirBot
             BookDrops.Build(Books);
             Log.Write($"Drop-only skill books: {BookDrops.BookCount} across " +
                       $"{BookDrops.MapCount} map(s)");
+            GearDrops.Build();
+            Log.Write($"Equipment drops indexed across {GearDrops.MapCount} map(s)");
             BotConnection.Monsters = Monsters;
 
             // Shared: maps never change, and one copy of the grids serves every bot.
@@ -530,12 +536,16 @@ namespace MirBot
 
             Hunting = new HuntingMemory(Path.Combine(memory, "hunting.json"), first.LevelBandSize)
             {
-                HalfLifeHours = first.HuntingHalfLifeHours
+                HalfLifeHours = first.HuntingHalfLifeHours,
+                MinimumSampleHours = first.MinimumSampleHours
             };
             Danger = new MonsterMemory(Path.Combine(memory, "monsters.json"));
             Nav = new NavCorrections(Path.Combine(memory, "navdata.json"));
             Deaths = new DeathMemory(Path.Combine(memory, "deaths.json"));
+            Levels = new LevelMemory(Path.Combine(memory, "levels.json"));
+            MapTrips = new MapTripMemory(Path.Combine(memory, "map-trips.json"));
             Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));
+            Xp = new XpLog(Path.Combine(memory, "xp.ndjson"));
 
             // Needs the grids: a map region is a bitmap whose width is the map's own.
             World.Build(Maps);
@@ -744,6 +754,190 @@ namespace MirBot
 
         public string[] BotLogTail(string id, int lines) => Find(id)?.LogTail(lines);
 
+        /// <summary>
+        /// Every time an item was looted, newest first, from the log and its rotations.
+        ///
+        /// THE LOG IS THE ONLY RECORD. A loot event is written once and stored nowhere else - not
+        /// in hunting.json, deaths.json or the gold log - so "has Fire Wall ever dropped, and
+        /// where" could only be answered by grepping tens of megabytes by hand. That is a question
+        /// worth asking often enough to deserve a button.
+        ///
+        /// Read with FileShare.ReadWrite because the live log is open for writing by this very
+        /// process; anything stricter throws IOException on the file that matters most. Streamed a
+        /// line at a time rather than ReadAllLines: these files reach 32MB each and the answer is
+        /// usually a handful of rows.
+        ///
+        /// Newest first means reading the CURRENT file first and stopping as soon as take rows are
+        /// collected, so the common case never touches the rotations at all.
+        /// </summary>
+        public List<LootRow> LootSearch(string item, int take)
+        {
+            List<LootRow> found = new List<LootRow>();
+
+            if (string.IsNullOrWhiteSpace(item)) return found;
+
+            take = Math.Clamp(take, 1, 2000);
+
+            string path = Log?.FilePath;
+
+            if (string.IsNullOrEmpty(path)) return found;
+
+            // Map names by index, resolved once. MapInfo.Description is what every other view
+            // calls a map, so the loot table agrees with the travel dropdown and the death list.
+            Dictionary<int, string> names = new Dictionary<int, string>();
+
+            if (Globals.MapInfoList?.Binding != null)
+                foreach (MapInfo info in Globals.MapInfoList.Binding)
+                    if (!string.IsNullOrWhiteSpace(info.Description))
+                        names[info.Index] = info.Description;
+
+            foreach (string file in new[] { path, path + ".2", path + ".3" })
+            {
+                if (found.Count >= take) break;
+                if (!File.Exists(file)) continue;
+
+                List<LootRow> here = new List<LootRow>();
+
+                try
+                {
+                    using FileStream stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite);
+                    using StreamReader reader = new StreamReader(stream);
+
+                    string line;
+
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        LootRow row = ParseLoot(line, item, names);
+
+                        if (row != null) here.Add(row);
+                    }
+                }
+                catch
+                {
+                    // A rotation being moved out from under us mid-read is expected, not an error.
+                    continue;
+                }
+
+                // Within one file the lines are oldest first, so reverse before appending: the
+                // caller asked for newest first and the files are already walked newest first.
+                here.Reverse();
+
+                foreach (LootRow row in here)
+                {
+                    if (found.Count >= take) break;
+                    found.Add(row);
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// One log line, if it is a loot of the item asked for.
+        ///
+        /// The shape is fixed by BotLog and the brain's status suffix:
+        ///   [2026-09-22 07:12:04.881] [Mirbot2] Loot (Skeleton Bone) | Wizzler L26 Wizard @ 173,83 map 59 | ...
+        ///
+        /// Matching is a case-insensitive SUBSTRING of the item name, so "fire" finds Fire Wall and
+        /// Fire Ball and the whole name still works. Deliberately not a regex over the line: an item
+        /// name can contain parentheses - "Healing Potion (II)" - and the first ") | " is a far more
+        /// reliable terminator than trying to balance them.
+        /// </summary>
+        private static LootRow ParseLoot(string line, string item, Dictionary<int, string> names)
+        {
+            if (line == null) return null;
+
+            const string Marker = " Loot (";
+
+            int loot = line.IndexOf(Marker, StringComparison.Ordinal);
+
+            if (loot < 0) return null;
+
+            int nameStart = loot + Marker.Length;
+            int nameEnd = line.IndexOf(") | ", nameStart, StringComparison.Ordinal);
+
+            if (nameEnd < 0) return null;
+
+            string looted = line.Substring(nameStart, nameEnd - nameStart);
+
+            if (looted.IndexOf(item, StringComparison.OrdinalIgnoreCase) < 0) return null;
+
+            // [yyyy-MM-dd HH:MM:SS.mmm] [BotId] (older logs have time only).
+            string time = "", bot = "";
+
+            int close = line.IndexOf(']');
+
+            if (line.Length > 0 && line[0] == '[' && close > 1)
+            {
+                time = line.Substring(1, close - 1);
+
+                int open2 = line.IndexOf('[', close);
+                int close2 = open2 < 0 ? -1 : line.IndexOf(']', open2);
+
+                if (open2 > 0 && close2 > open2) bot = line.Substring(open2 + 1, close2 - open2 - 1);
+            }
+
+            // "Wizzler L26 Wizard @ 173,83 map 59" - read from the status suffix rather than
+            // guessed, because the character name is the one thing the operator actually reads.
+            string character = "", mirClass = "";
+            int level = 0, x = 0, y = 0, mapIndex = 0;
+
+            int endOfSuffix = line.IndexOf(" | ", nameEnd + 4, StringComparison.Ordinal);
+
+            string suffix = endOfSuffix > 0
+                ? line.Substring(nameEnd + 4, endOfSuffix - nameEnd - 4)
+                : line.Substring(nameEnd + 4);
+
+            string[] parts = suffix.Split(' ');
+
+            if (parts.Length > 0) character = parts[0];
+
+            for (int i = 1; i < parts.Length; i++)
+            {
+                if (parts[i].Length > 1 && parts[i][0] == 'L' &&
+                    int.TryParse(parts[i].Substring(1), out int parsedLevel))
+                    level = parsedLevel;
+
+                if (i > 1 && parts[i - 1].Length > 1 && parts[i - 1][0] == 'L' &&
+                    int.TryParse(parts[i - 1].Substring(1), out _) &&
+                    Enum.TryParse(parts[i], true, out MirClass parsedClass) &&
+                    Enum.IsDefined(parsedClass))
+                    mirClass = parsedClass.ToString();
+
+                if (parts[i] == "@" && i + 1 < parts.Length)
+                {
+                    string[] xy = parts[i + 1].Split(',');
+
+                    if (xy.Length == 2)
+                    {
+                        int.TryParse(xy[0], out x);
+                        int.TryParse(xy[1], out y);
+                    }
+                }
+
+                if (parts[i] == "map" && i + 1 < parts.Length)
+                    int.TryParse(parts[i + 1], out mapIndex);
+            }
+
+            return new LootRow
+            {
+                Time = time,
+                Bot = bot,
+                Character = character,
+                Class = mirClass,
+                Item = looted,
+                Level = level,
+                MapIndex = mapIndex,
+                MapName = names.TryGetValue(mapIndex, out string mapName)
+                    ? mapName
+                    : (mapIndex > 0 ? "map " + mapIndex : ""),
+                X = x,
+                Y = y
+            };
+        }
+
+
         public void Run(int seconds = 0)
         {
             DateTime deadline = seconds > 0 ? DateTime.UtcNow.AddSeconds(seconds) : DateTime.MaxValue;
@@ -772,8 +966,8 @@ namespace MirBot
             }
 
             _status = new StatusServer(StatusPort, Log, Snapshot, Command, TravelChoices, BotLogTail,
-                HuntingRows, Deaths.Snapshot, Gold.Read, MapMaskFor,
-                HostConfig, CommandAll,
+                HuntingRows, Deaths.Snapshot, Levels.Snapshot, MapTrips.Snapshot, Gold.Read, MapMaskFor,
+                HostConfig, CommandAll, LootSearch,
                 _instances.FirstOrDefault()?.Config?.StatusExtraHosts ?? "");
 
             // Icons are optional: the folder is normally absent, and the page falls back to
@@ -791,6 +985,8 @@ namespace MirBot
                 Danger.FlushIfDue();
                 Nav.FlushIfDue();
                 Deaths.FlushIfDue();
+                Levels.FlushIfDue();
+                MapTrips.FlushIfDue();
                 Thread.Sleep(500);
             }
 
@@ -850,6 +1046,8 @@ namespace MirBot
             Danger.Flush();
             Nav.Flush();
             Deaths.Flush();
+            Levels.Flush();
+            MapTrips.Flush();
         }
 
         public void RequestShutdown() => _shutdown.Cancel();

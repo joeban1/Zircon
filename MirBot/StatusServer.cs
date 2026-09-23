@@ -50,15 +50,19 @@ namespace MirBot
         // same reason as everything else here: this thread must not be able to reach live state.
         private readonly Func<List<HuntingRow>> _hunting;
         private readonly Func<int, List<DeathRow>> _deaths;
+        private readonly Func<int, List<LevelRow>> _levels;
+        private readonly Func<int, List<MapTripEntry>> _mapTrips;
         private readonly Func<string, List<GoldPoint>> _gold;
         private readonly Func<int, MapMask> _map;
         private readonly Func<List<HostConfigField>> _config;
         private readonly Func<BotCommandKind, string, int> _commandAll;
+        private readonly Func<string, int, List<LootRow>> _loot;
         private readonly BotLog _hostLog;
         private readonly int _port;
 
         private Thread _thread;
         private volatile bool _stopping;
+        private bool _warnedAboutOverride;
 
         public StatusServer(int port, BotLog hostLog,
             Func<HostStatus> read,
@@ -67,10 +71,13 @@ namespace MirBot
             Func<string, int, string[]> log,
             Func<List<HuntingRow>> hunting,
             Func<int, List<DeathRow>> deaths,
+            Func<int, List<LevelRow>> levels,
+            Func<int, List<MapTripEntry>> mapTrips,
             Func<string, List<GoldPoint>> gold,
             Func<int, MapMask> map,
             Func<List<HostConfigField>> config,
             Func<BotCommandKind, string, int> commandAll,
+            Func<string, int, List<LootRow>> loot,
             string extraHosts = "")
         {
             _port = port;
@@ -78,9 +85,12 @@ namespace MirBot
             _read = read;
             _command = command;
             _maps = maps;
+            _loot = loot;
             _log = log;
             _hunting = hunting;
             _deaths = deaths;
+            _levels = levels;
+            _mapTrips = mapTrips;
             _gold = gold;
             _map = map;
             _config = config;
@@ -267,6 +277,52 @@ namespace MirBot
                 return;
             }
 
+            if (path == "/api/levels" && !post)
+            {
+                int take = 500;
+                string rawTake = context.Request.QueryString["take"];
+                if (rawTake != null && int.TryParse(rawTake, out int parsedTake))
+                    take = Math.Clamp(parsedTake, 1, 2000);
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(_levels(take), Json));
+                return;
+            }
+
+            if (path == "/api/map-trips" && !post)
+            {
+                int take = 200;
+                string rawTake = context.Request.QueryString["take"];
+                if (rawTake != null && int.TryParse(rawTake, out int parsedTake))
+                    take = Math.Clamp(parsedTake, 1, 2000);
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(_mapTrips(take), Json));
+                return;
+            }
+
+            // WHERE DID THIS EVER DROP? Answered from the log, which is the only place a loot
+            // event is recorded. Bounded by take and by the search string being non-empty, so an
+            // accidental request cannot ask the host to serialise every loot it has ever seen.
+            if (path == "/api/loot" && !post)
+            {
+                string item = context.Request.QueryString["item"] ?? "";
+
+                if (item.Trim().Length < 2)
+                {
+                    TryFail(context, 400, "item needs at least two characters");
+                    return;
+                }
+
+                int take = 200;
+                string rawTake = context.Request.QueryString["take"];
+
+                if (rawTake != null && int.TryParse(rawTake, out int parsedTake))
+                    take = Math.Clamp(parsedTake, 1, 2000);
+
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(_loot(item.Trim(), take), Json));
+                return;
+            }
+
             if (path == "/api/gold" && !post)
             {
                 Send(context, 200, "application/json; charset=utf-8",
@@ -433,6 +489,21 @@ namespace MirBot
             {
                 if (File.Exists(path))
                 {
+                    // SAY SO, ONCE. A stale override is invisible and silently shadows every page
+                    // change made in code: this file was written on 21 September and went on being
+                    // served for a day afterwards, so the pet tracking added to StatusPage.cs after
+                    // that date was never on screen and was believed delivered. An override is a
+                    // reasonable thing to want and a terrible thing to forget about.
+                    if (!_warnedAboutOverride)
+                    {
+                        _warnedAboutOverride = true;
+
+                        _hostLog.Write($"Status page: serving {path} " +
+                                       $"(written {File.GetLastWriteTime(path):yyyy-MM-dd HH:mm}) " +
+                                       "INSTEAD of the built-in page. Delete it to use the page " +
+                                       "compiled into this build.");
+                    }
+
                     using FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
                         FileShare.ReadWrite);
                     using StreamReader reader = new StreamReader(stream);

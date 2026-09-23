@@ -226,6 +226,18 @@ namespace MirBot
         /// The next step of the journey, or null when there is nothing to do this tick. The caller
         /// steers: this only ever says where to head.
         /// </summary>
+        /// <summary>
+        /// The brain is fighting its way past something instead of walking this tick.
+        ///
+        /// Pushes the stall clock forward so the no-progress watchdog does not abort a journey
+        /// that is being actively defended. Bounded by the caller, so a bot that cannot win the
+        /// fight still eventually gives up and re-plans rather than dying in place.
+        /// </summary>
+        public void NoteFightingThrough()
+        {
+            _lastProgress = DateTime.UtcNow;
+        }
+
         public Decision Next(WorldModel world)
         {
             if (_route == null || Phase == JourneyPhase.Arrived || Phase == JourneyPhase.Failed)

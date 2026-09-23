@@ -95,11 +95,35 @@ no chat and no consumption. The use was **refused**; the bot deleted its copy an
 
 | Packet | Meaning | Notes |
 | --- | --- | --- |
-| `S.ItemChanged` | verdict on **use** or **drop** | `Link.Count` = what **REMAINS**; `0` = whole stack gone (`PlayerObject.cs:6486-6496`). Echoes `GridType`+`Slot` — key off that, not off a pending field. |
+| `S.ItemChanged` | verdict on **use**, **drop**, or automatic equipment consumption | `Link.Count` = what **REMAINS**; `0` = whole stack/item gone (`PlayerObject.cs:6486-6496`). Echoes `GridType`+`Slot` — key off that, not off a pending field. Apply successful Inventory **and Equipment** updates; leave refused ones untouched. |
 | `S.ItemsChanged` | verdict on a **sell** | Enqueued before validation, `Success` set after. One bad link voids all. |
 | `S.ItemMove` | verdict on **equip / deposit / withdraw** | Same enqueue-then-validate shape. |
 | `S.ItemLock` | verdict on **lock/unlock** | Returns silently when the slot is empty. |
 | `S.ItemsGained` | items **announced**, not necessarily placed | See filtering below. |
+
+### Equipment-grid counts are authoritative too (2026-09-23)
+
+`PlayerObject.ProcessTorch` consumes a burnt-out Candle and sends a successful
+`S.ItemChanged { Link = Equipment/Torch, Count = 0 }`. The bot used to apply only Inventory-grid
+counts, leaving a phantom broken Candle worn locally; equal-scoring spares then could not equip
+until a relog rebuilt the model. `BotConnection.World.Process(S.ItemChanged)` now applies an
+accepted count to either grid through `Backpack.NoteSlotCount(GridType, slot, remaining)`.
+Equipped Poison/Amulet stack counts follow the same rule. This is a server-confirmed update, not
+an optimistic guess. A focused model test passed; a live post-fix torch burn-down has not yet been
+observed.
+
+### Banking eligibility and cleanup (2026-09-23)
+
+The earlier warrior/MC guard was incomplete: it allowed MC requirements for Taoists. Jill's
+Iron Rings required MC 9 and had a small AC bonus, so their class-aware score was positive even
+though MC was the wrong attack stat and her worn SC rings were stronger. Future-stat gates now
+match the class's attack stat (Warrior/Assassin DC, Wizard MC, Taoist SC), and `ShouldBank` also
+requires future gear to beat the weakest worn slot. Books and item parts are exempt from the gear
+comparison. `StorageReclaims` withdraws obsolete/non-upgrade legacy gear and unwanted books for
+sale, preserving useful unlearned books and parts. TownTrip needs a *sell-only* vendor pass after
+banking, since ordinary vendor visits occur first. Jill's five and Toby's two legacy rings were
+sold and verified absent from both bag and storage; the new post-bank pass itself has not yet
+been exercised by a fresh legacy withdrawal.
 
 ### `S.ItemsGained` does not mean "this is in your bag"
 

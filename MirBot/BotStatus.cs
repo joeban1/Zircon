@@ -47,6 +47,68 @@ namespace MirBot
     /// that reports a pet's target, so what it is fighting cannot be shown; distance and health
     /// are what the world model genuinely knows.
     /// </summary>
+    /// <summary>
+    /// One learnt skill: what it is, how far it has been trained, and whether the bot can use it.
+    ///
+    /// Skill LEVEL is not character level. A magic trains 1 -> 2 -> 3 on its own experience track
+    /// (MagicInfo.Experience1/2/3), gated by character level (NeedLevel1/2/3), and the two were
+    /// impossible to tell apart from the outside because neither was displayed at all.
+    /// </summary>
+    public sealed record SkillStatus
+    {
+        public string Name { get; init; } = "";
+        public string School { get; init; } = "";
+
+        /// <summary>1-3. The skill's own level, not the character's.</summary>
+        public int Level { get; init; }
+
+        public long Experience { get; init; }
+
+        /// <summary>Experience needed for the next skill level; 0 when there is none.</summary>
+        public long NextExperience { get; init; }
+
+        /// <summary>Progress toward the next skill level, 0-100. 100 when maxed.</summary>
+        public int Percent { get; init; }
+
+        /// <summary>Character level needed before the next skill level can be trained; 0 if none.</summary>
+        public int NeedLevel { get; init; }
+
+        /// <summary>The character is high enough level to use this at all.</summary>
+        public bool Usable { get; init; }
+
+        /// <summary>The bot actively drives this skill - casts it, arms it, or names it on a swing.</summary>
+        public bool Castable { get; init; }
+
+        /// <summary>
+        /// "active", "passive" or "unused".
+        ///
+        /// Three states rather than two because a passive is neither. A bool reported a warrior's
+        /// Swordsmanship as unused alongside a wizard's Fire Wall, and only one of those is a
+        /// missing feature.
+        /// </summary>
+        public string Use { get; init; } = "";
+
+        /// <summary>Short reason when the bot does not drive it, for the tooltip.</summary>
+        public string Why { get; init; } = "";
+    }
+
+    /// <summary>
+    /// One looted item, recovered from the log. See BotHost.LootSearch.
+    /// </summary>
+    public sealed record LootRow
+    {
+        public string Time { get; init; } = "";
+        public string Bot { get; init; } = "";
+        public string Character { get; init; } = "";
+        public string Class { get; init; } = "";
+        public string Item { get; init; } = "";
+        public int Level { get; init; }
+        public string MapName { get; init; } = "";
+        public int MapIndex { get; init; }
+        public int X { get; init; }
+        public int Y { get; init; }
+    }
+
     public sealed record PetStatus
     {
         public string Name { get; init; } = "";
@@ -148,6 +210,9 @@ namespace MirBot
         /// <summary>null = unknown or max level; render as a dash, not 0%.</summary>
         public double? ExperiencePercent { get; init; }
         public bool AtMaxLevel { get; init; }
+        public string XpRatePerHour { get; init; }
+        public int XpCoverageSeconds { get; init; }
+        public long? EstimatedNextLevelSeconds { get; init; }
         public string Gold { get; init; } = "0";
 
         public int MapIndex { get; init; }
@@ -155,6 +220,13 @@ namespace MirBot
         public int X { get; init; }
         public int Y { get; init; }
         public bool InSafeZone { get; init; }
+
+        /// <summary>
+        /// The last committed hunting-ground choice, not the map currently crossed on a journey
+        /// or a temporary town stop. Empty until this bot has made a choice in this host run.
+        /// </summary>
+        public string FarmingDestinationName { get; init; } = "";
+        public string FarmingDestinationReason { get; init; } = "";
 
         /// <summary>
         /// Where the bot is walking to on this map, or null when it is not walking anywhere.
@@ -252,6 +324,7 @@ namespace MirBot
         public string GearDiagnostic { get; init; } = "";
         public string SupplyDiagnostic { get; init; } = "";
         public string RepairDiagnostic { get; init; } = "";
+        public string MoneyDiagnostic { get; init; } = "";
 
         public IReadOnlyList<EquipmentStatus> Equipment { get; init; } =
             Array.Empty<EquipmentStatus>();
@@ -260,6 +333,8 @@ namespace MirBot
         public string PetMode { get; init; } = "";
 
         public IReadOnlyList<PetStatus> Pets { get; init; } = Array.Empty<PetStatus>();
+
+        public IReadOnlyList<SkillStatus> Skills { get; init; } = Array.Empty<SkillStatus>();
         public IReadOnlyList<ItemStatus> Inventory { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<ItemStatus> Storage { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<HistoryStatus> History { get; init; } = Array.Empty<HistoryStatus>();
@@ -323,6 +398,8 @@ namespace MirBot
         public string Bot { get; init; } = "";
         public string Utc { get; init; } = "";
         public string Gold { get; init; } = "0";
+        public long CapitalSpent { get; init; }
+        public bool HasCapitalSpent { get; init; }
     }
 
     /// <summary>

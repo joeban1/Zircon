@@ -614,9 +614,13 @@ packets. Three facts make it work:
   `S.StatsUpdate`.
 
 That gives a three-way split for anything picked up: **wearable now and better** → equip;
-**wrong class or gender** → sell, since that will never change; **right class and gender but a
-requirement not met yet** → bank it, because levelling will unlock it. Skill books for the class
-fall in the third bucket.
+**wrong class or gender** → sell, since that will never change; **right class/gender, a future
+requirement this class can realistically meet, and better than the weakest worn slot** → bank it.
+Do not infer future value from an unmet requirement alone: a Warrior/Assassin grows DC, a Wizard
+MC, and a Taoist SC. A small AC bonus can make an off-class ring's score positive without making
+it a real upgrade. Class-appropriate unlearned skill books and item parts use separate banking
+rules; failed book learning consumes the copy, so retain *all* unlearned duplicates. Obsolete
+withdrawals happen after the normal vendor circuit, so a sell-only pass must follow banking.
 
 ### Survival must outrank everything — and must not become a trap
 

@@ -185,6 +185,26 @@ TorchGoldFloor=500
 # outranked everything for five hours and pulled a warrior out of the only other map
 # it ever tried.
 HuntingChoices=3
+HuntingDeathPenaltyPercent=25
+HuntingPickWeightPower=2
+# With both wanted-book and ordinary grounds available, pursue the book on 70% of
+# hunting decisions, or 20% while sustained gold loss is active. After two
+# consecutive book-priority choices, take an ordinary ground once. The book
+# score bonus below still ranks maps WITHIN the book group.
+BookHuntChancePercent=70
+LossBookHuntChancePercent=20
+MaxConsecutiveBookHunts=2
+# Defer a shopping town as a hunting ground when its median monster is 10+ levels
+# below us. This does not block shopping, travel through town, manual destinations,
+# poverty recovery, or caves that remain valuable even at higher levels.
+TownHuntLevelGap=10
+AoeEnabled=true
+AoeMinimumTargets=3
+LossWatchHours=4
+LossWatchDropGold=20000
+LossWatchRecoverGold=20000
+LossDeathPenaltyPercent=60
+LossWatchMaxHours=12
 
 # How quickly old hunting evidence yields to a fresh sample. The accumulated experience and
 # accumulated hours are both halved over this many idle hours, so an old average does not drift
@@ -202,6 +222,14 @@ ExploreUntilMapsKnown=4
 # Once coverage is met, still explore this often, so a better map found later is not
 # locked out forever.
 ExploreChancePercent=15
+
+# Raise the explore draw only while a safe, reachable unmeasured map drops a
+# meaningful wearable upgrade. The ordinary 15% applies otherwise.
+UpgradeExploreChancePercent=25
+# Bounded score bonus for an upgrade source within an ordinary hunting choice.
+GearHuntBonusPercent=50
+# Avoid repeatedly farming one rare item instead of returning to XP/profit maps.
+MaxConsecutiveGearHunts=2
 
 # Do not explore a map whose TYPICAL (median) monster is more than this far above us.
 # Checked against System.db, because the learned danger model only knows maps that have
