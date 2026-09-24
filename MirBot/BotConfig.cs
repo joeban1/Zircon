@@ -267,9 +267,11 @@ namespace MirBot
 
         /// <summary>
         /// A quest whose target is a boss (Level 40 - Well done: the Crazed Warrior) is only taken
-        /// from this level - the operator's call, above the server's own level 40.
+        /// from this level - the operator's call, above the server's own level 40. Raised from 45
+        /// to 50 on 2026-09-24: Mirbot at 45 fled from Lost Paradise Forest's monsters at 8% HP,
+        /// poisoned and out of potions, without reaching the boss.
         /// </summary>
-        public int QuestBossMinLevel = 45;
+        public int QuestBossMinLevel = 50;
 
         // The game store, paid for with Hunt Gold. The shopping list and its order are fixed in
         // GameStore.Plan: every permanent first, then temporaries kept topped up.

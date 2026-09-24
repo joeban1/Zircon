@@ -770,7 +770,8 @@ ground rather than taking Flea Cave without the configured return reserve.
 done only when passing through (or on the bot card's **Do quests** button). Accepts and hand-ins
 count only on the matching `S.QuestChanged` transition.
 - Rewards are drunk automatically. Scrolls of Boss Tracking are read on a map with a wanted boss.
-- The Level 40 boss quest is for level 45+ only.
+- The Level 40 boss quest is for level 50+ only (raised from 45 after Mirbot, at 45, had to flee
+  Lost Paradise Forest at 8% HP without reaching the Crazed Warrior).
 - Verified live:
   - three dailies and two "Getting Started" completed and handed in;
   - buffs used;
