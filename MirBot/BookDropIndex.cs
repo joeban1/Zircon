@@ -44,6 +44,12 @@ namespace MirBot
         /// <summary>Boss monster index -> the magics its books teach (boss lairs).</summary>
         private readonly Dictionary<int, HashSet<int>> _bossBooks = new Dictionary<int, HashSet<int>>();
 
+        /// <summary>
+        /// Magics whose book drops from at least one ORDINARY monster. The rest come only from
+        /// bosses and mini-bosses (Flaming Sword, Blade Storm, Dragon Rise, the Taoist summons).
+        /// </summary>
+        private readonly HashSet<int> _fromOrdinary = new HashSet<int>();
+
         public int BookCount => _dropOnly.Count;
         public int BossCount => _bossBooks.Count;
         public int MapCount => _byMap.Count;
@@ -54,6 +60,7 @@ namespace MirBot
             _byMap.Clear();
             _anyBook.Clear();
             _bossBooks.Clear();
+            _fromOrdinary.Clear();
 
             if (books == null) return;
 
@@ -121,6 +128,8 @@ namespace MirBot
                             _bossBooks[monster.Index] = taught = new HashSet<int>();
                         taught.UnionWith(magics);
                     }
+                    else
+                        _fromOrdinary.UnionWith(magics);
 
                     foreach (RespawnInfo respawn in monster.Respawns)
                     {
@@ -142,8 +151,12 @@ namespace MirBot
                 _byMap.Clear();
                 _anyBook.Clear();
                 _bossBooks.Clear();
+                _fromOrdinary.Clear();
             }
         }
+
+        /// <summary>A book for this magic drops only from bosses and mini-bosses.</summary>
+        public bool BossOnly(int magic) => _anyBook.ContainsKey(magic) && !_fromOrdinary.Contains(magic);
 
         /// <summary>
         /// Drop-only skills this character could learn TODAY and does not have.
@@ -165,10 +178,15 @@ namespace MirBot
                 wanted.Add(pair.Key);
             }
 
-            // Level 4 training: a known level 3 skill wants any dropped copy of its book.
+            // Level 4 training: a known level 3 skill wants any dropped copy of its book - unless
+            // only bosses and mini-bosses drop it. Level 4 takes many copies (500 pages, each read
+            // a roll), and a mini-boss respawns on the order of half an hour, so hunting one for
+            // training copies of Flaming Sword is days of lair walks for one level. Operator's
+            // call: not sought. A copy that drops anyway is still looted and read (MagicBooks.Judge
+            // is separate); learning such a skill the FIRST time is still sought above.
             if (world != null)
                 foreach (KeyValuePair<int, ItemInfo> pair in _anyBook)
-                    if (world.Trainable(pair.Key) &&
+                    if (world.Trainable(pair.Key) && !BossOnly(pair.Key) &&
                         Backpack.MeetsRequirement(pair.Value, level, stats))
                         wanted.Add(pair.Key);
 

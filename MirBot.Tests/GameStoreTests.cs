@@ -247,6 +247,32 @@ namespace MirBot.Tests
             Assert.Equal(int.MaxValue, TownTrip.PotionCeiling(0, 60, healing: true));
         }
 
+        // ---- level 4 training books --------------------------------------------------------
+
+        [Fact]
+        public void ALevelThreeSkillOnlyTrainsFromBooksOrdinaryMonstersDrop()
+        {
+            BookDropIndex index = new BookDropIndex();
+            var anyBook = (Dictionary<int, ItemInfo>)typeof(BookDropIndex)
+                .GetField("_anyBook", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(index);
+            var ordinary = (HashSet<int>)typeof(BookDropIndex)
+                .GetField("_fromOrdinary", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(index);
+
+            anyBook[1] = Item(961, "Flaming Sword", ItemType.Book, 0);     // mini-boss only
+            anyBook[2] = Item(962, "Thrusting", ItemType.Book, 0);         // ordinary monsters too
+            ordinary.Add(2);
+
+            WorldModel world = World();
+            world.ApplyMagic(new ClientUserMagic { InfoIndex = 1, Level = 3 });
+            world.ApplyMagic(new ClientUserMagic { InfoIndex = 2, Level = 3 });
+
+            HashSet<int> wanted = index.Wanted(MirClass.Warrior, 45, new Stats(), world);
+
+            Assert.True(index.BossOnly(1));
+            Assert.DoesNotContain(1, wanted);
+            Assert.Contains(2, wanted);
+        }
+
         // ---- helpers -------------------------------------------------------------------------
 
         private static readonly TimeSpan Hour = TimeSpan.FromHours(1);
