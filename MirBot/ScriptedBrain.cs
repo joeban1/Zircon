@@ -826,7 +826,11 @@ namespace MirBot
                             int remaining = WorldModel.Distance(world.Location, errand.Destination);
                             errand.Action = BotAction.Approach;
 
-                            if (!TrySteer(errand, world, errand.Destination, 0, remaining, routeKind: "town"))
+                            // To TALKING range, not onto the NPC's own cell - the errand talks from
+                            // VendorTalkRange, and the exact cell is where the NPC stands.
+                            NoteNpcWalk(world, errand.Subject);
+                            if (!TrySteer(errand, world, errand.Destination,
+                                    Math.Max(1, _config.VendorTalkRange - 1), remaining, routeKind: "town"))
                                 return new Decision
                                 {
                                     Action = BotAction.Idle,
@@ -836,6 +840,39 @@ namespace MirBot
                         }
 
                         return errand;
+                    }
+                }
+            }
+
+            // 2a-iii. Fame errand (FameErrand): only on the fame NPC's map, only between town
+            //         trips, and only while Fame Points cover the next rank.
+            if (Fame != null)
+            {
+                if (Town != null && Town.Active)
+                    Fame.Suspend("a town trip started");
+                else if (!itemUsePending && (Quest == null || !Quest.Active))
+                {
+                    Decision fame = Fame.Next(world, items);
+
+                    if (fame != null)
+                    {
+                        if (fame.Action == BotAction.WalkTo)
+                        {
+                            int remaining = WorldModel.Distance(world.Location, fame.Destination);
+                            fame.Action = BotAction.Approach;
+
+                            NoteNpcWalk(world, fame.Subject);
+                            if (!TrySteer(fame, world, fame.Destination,
+                                    Math.Max(1, _config.VendorTalkRange - 1), remaining, routeKind: "town"))
+                                return new Decision
+                                {
+                                    Action = BotAction.Idle,
+                                    Reason = $"no route to {fame.Destination.X},{fame.Destination.Y}",
+                                    Subject = fame.Subject
+                                };
+                        }
+
+                        return fame;
                     }
                 }
             }
@@ -854,7 +891,8 @@ namespace MirBot
             // journey's stuck clock expired mid-shop.
             // The quest errand owns movement the same way: a journey passing through Bichon is
             // held for the errand and carries on afterwards, never replaced.
-            bool tripOwnsUs = Town != null && Town.Active || Quest != null && Quest.OwnsMovement;
+            bool tripOwnsUs = Town != null && Town.Active || Quest != null && Quest.OwnsMovement ||
+                              Fame != null && Fame.OwnsMovement;
             if (tripOwnsUs) Travel?.Hold();
 
             if (!tripOwnsUs && Travel != null && Travel.Active && FightingThrough(world))
@@ -1095,6 +1133,36 @@ namespace MirBot
             if (target != null)
             {
                 int distance = world.DistanceTo(target.Location);
+
+                // A QUEST TREE (Chestnut Tree, AI 4) is only ever a target while a gather quest
+                // wants it, and it is hit by hand: spells do nothing to it (a wizard once spent
+                // 200 mana on one) and the server takes exactly 1 health per blow, 7 blows a tree.
+                if (target.IsSceneryNode)
+                {
+                    if (distance == 1)
+                        return new Decision
+                        {
+                            Action = BotAction.Attack,
+                            Reason = $"{target.Name} (quest)",
+                            Subject = target.Name,
+                            TargetID = target.ObjectID,
+                            Direction = WorldModel.DirectionTo(world.Location, target.Location)
+                        };
+
+                    Decision toTree = new Decision
+                    {
+                        Action = BotAction.Approach,
+                        Reason = $"{target.Name} at {distance} (quest)",
+                        Subject = target.Name,
+                        TargetID = target.ObjectID
+                    };
+                    if (distance > 1 && TrySteer(toTree, world, target.Location, 1, distance, routeKind: "target"))
+                        return toTree;
+
+                    _unreachable[target.ObjectID] = DateTime.Now;
+                    _committedTarget = 0;
+                    return new Decision { Action = BotAction.Idle, Reason = $"{target.Name} out of reach" };
+                }
 
                 // 3a. Cast, if we know something worth casting and can pay for it.
                 //
@@ -2493,6 +2561,9 @@ namespace MirBot
         public GameStore Store;
         public StoreShopper Shopper;
 
+        /// <summary>Set by BotInstance: buying fame ranks at the fame NPC.</summary>
+        public FameErrand Fame;
+
         /// <summary>Set by BotInstance: walkable spawn cells of a monster on a map.</summary>
         public Func<int, int, IReadOnlyList<Point>> SpawnCells;
 
@@ -3435,9 +3506,30 @@ namespace MirBot
         /// Nearest item we actually want. Once the bag is heavy the bot stops hoovering up junk and
         /// takes only consumables and genuine upgrades, which is what keeps it from going overweight.
         /// </summary>
+        /// <summary>
+        /// The nearest floor item an accepted gather task wants (Skeletal Spine, Venom, a key, a
+        /// chestnut). No value, weight or journey rule applies: it takes no slot.
+        /// </summary>
+        private WorldObject QuestItemOnFloor(WorldModel world, HashSet<uint> skip)
+        {
+            if (QuestBook == null || !_config.EnableQuests) return null;
+
+            int range = Math.Max(_config.LootRange, 10);
+            return world.Objects
+                .Where(x => x.Kind == ObjectKind.Item && !skip.Contains(x.ObjectID) &&
+                            world.DistanceTo(x.Location) <= range &&
+                            QuestBook.QuestItemWanted(x.ItemInfo, world))
+                .OrderBy(x => world.DistanceTo(x.Location)).FirstOrDefault();
+        }
+
         private WorldObject FindWorthwhileLoot(WorldModel world, bool heavy, bool full)
         {
             HashSet<uint> skip = new HashSet<uint>(_unreachable.Keys);
+
+            // A quest item first of all: picked up, it credits the quest and is deleted, so it
+            // never costs bag space, and it is only on the floor because this bot killed for it.
+            WorldObject questItem = QuestItemOnFloor(world, skip);
+            if (questItem != null) return questItem;
 
             // A book we want goes first, however much else is on the floor: nearest-first would
             // pick up a pile of potions and rings while the one Blade Storm in the drop sat there,
@@ -3579,7 +3671,7 @@ namespace MirBot
                     return SelectTarget(world);      // pick again, now that it is parked
                 }
 
-                bool stillGood = current != null && current.IsValidTarget &&
+                bool stillGood = current != null && (current.IsValidTarget || IsQuestTree(current)) &&
                                  !_unreachable.ContainsKey(current.ObjectID) &&
                                  world.DistanceTo(current.Location) <= _config.AggroRange + 2;
 
@@ -3860,6 +3952,40 @@ namespace MirBot
         /// <summary>The quest errand is hunting its targets on this map.</summary>
         private bool QuestHunting => Quest != null && Quest.Phase == QuestErrand.ErrandPhase.Hunting;
 
+        private Point _npcWalkFrom = Point.Empty;
+        private DateTime _npcWalkSince = DateTime.MinValue;
+        private string _npcWalkTo = "";
+
+        /// <summary>
+        /// Diagnostic: an errand walk to an NPC that has not moved us for five seconds is logged
+        /// once, with where we are and how long the route is - Jane was seen "approaching" Sara for
+        /// forty seconds without visibly moving, and the log had nothing to say about it.
+        /// </summary>
+        private void NoteNpcWalk(WorldModel world, string npc)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (npc != _npcWalkTo || world.Location != _npcWalkFrom || now - _npcWalkSince > TimeSpan.FromSeconds(30))
+            {
+                _npcWalkTo = npc;
+                _npcWalkFrom = world.Location;
+                _npcWalkSince = now;
+                return;
+            }
+
+            if (now - _npcWalkSince >= TimeSpan.FromSeconds(5))
+            {
+                BrainLog?.Invoke($"Errand walk to {npc} has not moved us for 5s at " +
+                                 $"{world.Location.X},{world.Location.Y} (route {_route.Length} cells, " +
+                                 $"{world.Objects.Count(o => o.IsLiveMonster)} live monsters in view).");
+                _npcWalkSince = now + TimeSpan.FromSeconds(25);     // once per stall, not every tick
+            }
+        }
+
+        /// <summary>A scenery node (AI 4) that the quest hunt wants - the Chestnut Tree.</summary>
+        private bool IsQuestTree(WorldObject ob) =>
+            ob != null && ob.IsSceneryNode && ob.IsLiveMonster && QuestHunting &&
+            Quest.HuntTargets.Contains(ob.MonsterIndex);
+
         /// <summary>Walking to a boss that was actually seen (in view or on the tracker).</summary>
         private bool BossChasing =>
             _roamKind == RoamTargetKind.BossLair && _roamTarget != Point.Empty && _lair?.Sighted == true;
@@ -3868,12 +3994,15 @@ namespace MirBot
         {
             if (!_config.ButcherEnabled || _butcher == null) return null;
 
-            // Not while hunting quest targets: a carcass is a detour, and the target moves on.
-            if (QuestHunting) return null;
+            // While hunting quest targets, only the quest's OWN corpses: a harvest monster (Spitting
+            // Spider, Spider Bat) keeps its quest item - Venom, Spider Curare - in the corpse until
+            // it is butchered. Any other carcass is a detour, and the target moves on.
+            bool questOnly = QuestHunting;
 
-            // No room for what it yields, so there is no point making it.
-            if (world.MaxBagWeight > 0 && world.WeightPercent >= _config.HeavyWeightPercent)
-                return null;
+            // No room for what it yields, so there is no point making it - unless it is the quest
+            // corpse, whose item takes no slot.
+            bool heavy = world.MaxBagWeight > 0 && world.WeightPercent >= _config.HeavyWeightPercent;
+            if (heavy && !questOnly) return null;
 
             // Anything alive nearby wins. Standing still over a corpse is how a bot gets killed,
             // and the Mir 2 agents break off harvesting for exactly this at the same range.
@@ -3887,6 +4016,7 @@ namespace MirBot
                 if (ob.Kind != ObjectKind.Monster || !ob.Dead) continue;
                 if (_butchered.Contains(ob.ObjectID)) continue;
                 if (!_butcher.IsButcherable(ob.MonsterIndex)) continue;
+                if (questOnly && !Quest.HuntTargets.Contains(ob.MonsterIndex)) continue;
 
                 _butcherAttempts.TryGetValue(ob.ObjectID, out int tries);
                 if (tries >= _config.ButcherAttempts) continue;
@@ -3940,12 +4070,13 @@ namespace MirBot
 
         private Decision TryLoot(WorldModel world)
         {
-            if (!_config.LootEnabled) return null;
-
             bool heavy = world.MaxBagWeight > 0 && world.WeightPercent >= _config.HeavyWeightPercent;
             bool full = world.MaxBagWeight > 0 && world.WeightPercent >= 100;
 
-            WorldObject item = FindWorthwhileLoot(world, heavy, full);
+            // Quest items are picked up even with looting off: they are quest progress, not loot.
+            WorldObject item = _config.LootEnabled
+                ? FindWorthwhileLoot(world, heavy, full)
+                : QuestItemOnFloor(world, new HashSet<uint>(_unreachable.Keys));
             if (item == null) return null;
 
             int distance = world.DistanceTo(item.Location);

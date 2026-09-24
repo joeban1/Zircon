@@ -484,11 +484,14 @@ namespace MirBot
                 if (here.Count == 0) return here;
                 HashSet<int> wanted = _host.BookDrops.Wanted(world.Class, world.Level,
                     world.PlayerStats, world);
-                // Plus the boss an accepted quest needs (Level 40 - Well done: Crazed Warrior),
-                // chosen deliberately so not filtered to mini-bosses.
-                HashSet<int> questBosses = Config.EnableQuests &&
-                                           world.Level >= Config.QuestBossMinLevel
-                    ? _host.Quests.KillTargets(world).Where(t => t.IsBoss)
+                // Plus the bosses accepted quests need, each only from its own level (mini-bosses
+                // QuestMiniBossMinLevel, Crazed Warrior QuestBossMinLevel) - checked here as well as
+                // at acceptance, because a quest taken under an older rule is still in the log.
+                QuestRules rules = QuestRulesNow();
+                HashSet<int> questBosses = Config.EnableQuests
+                    ? _host.Quests.KillTargets(world)
+                        .Where(t => t.IsBoss && world.Level >= QuestBook.BossLevelFor(
+                            _host.Monsters.Find(t.MonsterIndex), rules))
                         .Select(t => t.MonsterIndex).ToHashSet()
                     : new HashSet<int>();
                 return here.Where(l => questBosses.Contains(l.MonsterIndex) ||
@@ -533,6 +536,7 @@ namespace MirBot
             // Quests (QuestBook/QuestErrand). Everything here runs on this bot's thread - packets
             // are drained by _connection.Process() in Advance - so no locking is needed.
             _questErrand = new QuestErrand(Config, _host.Quests, message => _log.Write(message));
+            _questErrand.Rules = QuestRulesNow;
             _brain.Quest = _questErrand;
             _brain.QuestBook = _host.Quests;
             _brain.SpawnCells = (monster, map) => _host.BossLairs.SpawnCells(monster, map);
@@ -551,7 +555,19 @@ namespace MirBot
             };
             _brain.Store = _host.Store;
             _brain.Shopper = _shopper;
-            _connection.OnSystemChat = text => _shopper.NoteServerLine(text);
+
+            // Fame ranks (FameBook/FameErrand). The system chat line explains refusals to BOTH the
+            // store and the fame errand, so it goes to each.
+            _fameErrand = new FameErrand(Config, _host.Fame, message => _log.Write(message))
+            {
+                OnPromoted = NotePromoted
+            };
+            _brain.Fame = _fameErrand;
+            _connection.OnSystemChat = text =>
+            {
+                _shopper.NoteServerLine(text);
+                _fameErrand.NoteServerLine(text);
+            };
 
             _connection.OnNPCPage = page =>
             {
@@ -567,6 +583,7 @@ namespace MirBot
                 // so this runs on the same thread as Decide and touches no shared state.
                 _town.PageChanged(page);
                 _questErrand?.PageChanged(page);
+                _fameErrand?.PageChanged(page);
 
                 string kind = page == null ? "(none)" : page.DialogType.ToString();
                 _log.Write($"NPC page: {kind} | trip {_town.Phase} {_town.Status}" +
@@ -682,10 +699,12 @@ namespace MirBot
             // Telling the brain about the cooldown as well means the trip does not choose to
             // scroll until the scroll can actually be sent. TownTrip.Next already turns this into
             // "no scroll slot this tick" and simply tries again.
+            System.Diagnostics.Stopwatch decideTimer = System.Diagnostics.Stopwatch.StartNew();
             Decision decision = _brain.Decide(
                 _connection.World,
                 _connection.Items,
                 _connection.ItemUsePending || _connection.ItemUseOnCooldown);
+            NoteSlowTick("Decide", decideTimer.ElapsedMilliseconds, decision);
 
             // Deliberately ABOVE the early return, because the interesting case is the tick that
             // decides to do nothing.
@@ -765,7 +784,9 @@ namespace MirBot
             WatchBossDrops(decision);
 
             SampleExperience();
+            System.Diagnostics.Stopwatch travelTimer = System.Diagnostics.Stopwatch.StartNew();
             ConsiderTravel();
+            NoteSlowTick("ConsiderTravel", travelTimer.ElapsedMilliseconds, decision);
             CheckIdleNotify();
 
             _lastDecision = decision;
@@ -875,18 +896,19 @@ namespace MirBot
             }
 
             WorldModel world = _connection.World;
-            MapInfo map = _questErrand.QuestNpcMap;
 
-            if (!Config.EnableQuests || map == null)
+            if (!Config.EnableQuests)
             {
-                _log.Write("Do quests: quests are off or no quest NPC is configured.");
+                _log.Write("Do quests: quests are off.");
                 return;
             }
 
-            if (!_questErrand.HasWorkOn(world, map.Index))
+            MapInfo map = NearestQuestMap(world);
+
+            if (map == null)
             {
-                _log.Write($"Do quests: nothing to do on {map.Description} " +
-                           "(dailies done, nothing acceptable, nothing to hunt there).");
+                _log.Write("Do quests: nothing to do in any quest town (nothing to hand in, nothing " +
+                           "acceptable, nothing to hunt there).");
                 return;
             }
 
@@ -918,6 +940,46 @@ namespace MirBot
                 _log.Write($"Do quests: heading for {map.Description}.");
                 StartTravel(map.Index.ToString());
             }
+        }
+
+        /// <summary>
+        /// The quest town (Bichon Town, Banya Village, Lost Paradise) with work for us that is
+        /// fewest map hops away - the current map if it has work - or null.
+        /// </summary>
+        private MapInfo NearestQuestMap(WorldModel world)
+        {
+            List<int> maps = _questErrand?.MapsWithWork(world) ?? new List<int>();
+            if (maps.Count == 0) return null;
+
+            int best = maps.Contains(world.MapIndex) ? world.MapIndex : -1;
+
+            if (best < 0)
+            {
+                Dictionary<int, int> hops = _host.World.HopCounts(world.MapIndex, world.Class,
+                    world.Level, world.Gold, Config.TeleportGoldFloor, world.PKPoints,
+                    Config.TeleportMaxGoldPercent);
+                best = maps.Where(hops.ContainsKey).OrderBy(m => hops[m]).ThenBy(m => m)
+                    .DefaultIfEmpty(-1).First();
+            }
+
+            return best < 0 ? null : Globals.MapInfoList?.Binding?.FirstOrDefault(m => m.Index == best);
+        }
+
+        private DateTime _lastQuestTownTrip = DateTime.MinValue;
+
+        private DateTime _lastSlowTickLog = DateTime.MinValue;
+
+        /// <summary>
+        /// A decision tick is normally a few milliseconds. One that takes half a second stalls
+        /// everything on this bot's thread - packets are read late, steps are sent late - which is
+        /// what a bot "approaching without moving" looks like from outside. Logged, rate-limited.
+        /// </summary>
+        private void NoteSlowTick(string stage, long ms, Decision decision)
+        {
+            if (ms < 500 || DateTime.UtcNow - _lastSlowTickLog < TimeSpan.FromSeconds(10)) return;
+            _lastSlowTickLog = DateTime.UtcNow;
+            _log.Write($"Slow tick: {stage} took {ms} ms (decision {decision?.Action} - " +
+                       $"{decision?.Reason}; quest {_questErrand?.Status}; route {_brain?.CurrentRoute.Cells.Length ?? 0} cells).");
         }
 
         /// <summary>Do quests was pressed away from the quest NPC: travel there after the town trip.</summary>
@@ -1225,6 +1287,10 @@ namespace MirBot
                 exploreChance = Math.Max(exploreChance, _profitPolicy?.Active == true
                     ? Config.LossBookHuntChancePercent
                     : Config.BookHuntChancePercent);
+            // Likewise a quest whose targets live only on unmeasured maps can only be pursued by
+            // exploring, so it lifts the explore chance to the quest chance.
+            if (HasUnmeasuredQuestMap(world, mirClass))
+                exploreChance = Math.Max(exploreChance, Config.QuestHuntChancePercent);
             bool wantExplore = known < Config.ExploreUntilMapsKnown ||
                                _random.Next(100) < exploreChance;
 
@@ -1293,6 +1359,40 @@ namespace MirBot
                 candidates.Add(entry);
             }
 
+            // QUEST GOAL first: maps where accepted quests' targets live (only maps this bot may
+            // hunt), ranked by the usual score times the quest bonus.
+            Dictionary<int, List<string>> questMaps = QuestMaps(world);
+            List<HuntingEntry> questCandidates = candidates
+                .Where(x => QuestSupply(questMaps, x.MapIndex) > 0).ToList();
+            if (PursueQuest(questCandidates.Count > 0, out int questChance))
+            {
+                double QuestRank(HuntingEntry entry) =>
+                    _host.Hunting.Ranked(entry, world.Level, deathPenalty) *
+                    QuestBonus(QuestSupply(questMaps, entry.MapIndex));
+                questCandidates.Sort((a, b) => QuestRank(b).CompareTo(QuestRank(a)));
+                int keepQuest = Math.Max(1, Config.HuntingChoices);
+                if (questCandidates.Count > keepQuest)
+                    questCandidates.RemoveRange(keepQuest, questCandidates.Count - keepQuest);
+
+                double[] questWeights = questCandidates.Select(QuestRank).ToArray();
+                int qi = WeightedChoice.Pick(questWeights, Config.HuntingPickWeightPower, _random,
+                    out double qdraw);
+                HuntingEntry questPick = questCandidates[qi];
+                string names = QuestNames(questMaps, questPick.MapIndex);
+
+                _log.Write($"Travel: {questCandidates.Count} quest map(s) shortlisted; " +
+                           $"{questChance}% quest chance - choosing quest hunt.");
+                Begin(questPick.MapIndex, questPick.MapName,
+                      $"{questPick.AverageExperiencePerHour:N0} exp/hour average, " +
+                      $"{questPick.Deaths} death(s) - quests: {names} " +
+                      $"(score {questWeights[qi]:N0}, draw {qdraw:P1})",
+                      displayReason: $"quests: {names}");
+                _consecutiveQuestHunts++;
+                _consecutiveBookHunts = 0;
+                _consecutiveGearHunts = 0;
+                return;
+            }
+
             // Keep the book and ordinary pools separate BEFORE the shortlist. A book bonus alone
             // can push every ordinary map out of the top three, leaving a nominally weighted draw
             // that still chooses the same book map 100% of the time. Prefer the book goal 70% of
@@ -1359,6 +1459,7 @@ namespace MirBot
                             $"{pick.AverageExperiencePerHour:N0} XP/hour average");
                 _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
                 _consecutiveGearHunts = pickedGear != null ? _consecutiveGearHunts + 1 : 0;
+                _consecutiveQuestHunts = 0;
                 return;
             }
 
@@ -1524,6 +1625,16 @@ namespace MirBot
             return false;
         }
 
+        /// <summary>An accepted quest's target lives on a huntable map we have not measured.</summary>
+        private bool HasUnmeasuredQuestMap(WorldModel world, string mirClass)
+        {
+            Dictionary<int, List<string>> questMaps = QuestMaps(world);
+            if (questMaps.Count == 0) return false;
+            HashSet<int> measured = new HashSet<int>(_host.Hunting.Best(mirClass, world.Level, 500,
+                Config.HuntingDeathPenaltyPercent / 100.0).Select(entry => entry.MapIndex));
+            return questMaps.Keys.Any(map => map != world.MapIndex && !measured.Contains(map));
+        }
+
         private double BookRanked(HuntingEntry entry, HashSet<int> wanted,
             int level, double deathPenalty)
         {
@@ -1573,6 +1684,7 @@ namespace MirBot
 
         private QuestErrand _questErrand;
         private StoreShopper _shopper;
+        private FameErrand _fameErrand;
 
         /// <summary>What the store step is doing, for the log and the bot panel.</summary>
         private string StoreStatusText()
@@ -1594,6 +1706,54 @@ namespace MirBot
         /// S.QuestChanged, already classified. Only real transitions are logged: a quest that
         /// appears is an accept, Completed going true is a hand-in; kill updates write nothing.
         /// </summary>
+        /// <summary>A fame rank was reached: log it, record it, tell the phone.</summary>
+        private void NotePromoted(FameInfo rank, long fameLeft)
+        {
+            WorldModel world = _connection.World;
+            string buffs = FameBook.Buffs(rank);
+
+            _history.Note("Fame", rank?.Name ?? "rank");
+            _host.QuestLog.Record(new QuestLogEntry
+            {
+                Bot = Id, Character = world.Name, Class = world.Class.ToString(), Level = world.Level,
+                QuestIndex = 0, Quest = $"Fame: {rank?.Name}", Event = "fame",
+                MapIndex = world.MapIndex, Map = world.MapName, Utc = DateTime.UtcNow,
+                Rewards = buffs
+            });
+
+            if (Config.NotifyFame && rank != null)
+                Notify($"fame:{rank.Index}", $"{world.Name} reached fame rank {rank.Name}",
+                    string.IsNullOrEmpty(buffs) ? "fame rank reached" : buffs, TimeSpan.FromMinutes(5));
+        }
+
+        /// <summary>"Village Explorer (rank 2) - 740 / 2,000 FP for Regional Apprentice".</summary>
+        private string FameStatusText()
+        {
+            WorldModel world = _connection?.World;
+            if (world == null || !_host.Fame.Ready) return "";
+
+            FameInfo current = _host.Fame.Current(world.FameIndex);
+            FameInfo next = _host.Fame.Next(world.FameIndex);
+            string held = current == null ? "no rank" : $"{current.Name} (rank {current.Order + 1})";
+
+            if (next == null) return $"{held} - highest rank reached";
+            if (!Config.EnableFame) return $"{held} - {world.FamePoints:N0} FP (fame buying off)";
+            string progress = $"{world.FamePoints:N0} / {next.Cost:N0} FP for {next.Name}";
+            if (world.FamePoints >= next.Cost && world.Level < FameMinLevel)
+                return $"{held} - {progress}; {_host.Fame.Map?.Description ?? "the fame NPC"} needs level {FameMinLevel}";
+            return $"{held} - {progress}";
+        }
+
+        /// <summary>
+        /// The fame NPC stands in Frost Village, which the teleport stones only take a character
+        /// of level 45 to (and two fares: Bichon to Lost Paradise 10,000, on to Frost 20,000).
+        /// </summary>
+        private const int FameMinLevel = 45;
+        private const long FameRouteGold = 30000;
+
+        private DateTime _lastFameTrip = DateTime.MinValue;
+        private DateTime _fameNoRouteUntil = DateTime.MinValue;
+
         private void NoteQuestChanged(QuestTransition transition)
         {
             _questErrand?.QuestChanged(transition);
@@ -1630,37 +1790,95 @@ namespace MirBot
         private bool TryQuestBossJourney(WorldModel world, Dictionary<int, int> hops,
             AffordableCheck affordable, Func<int, bool> permitted, HashSet<int> deadly)
         {
-            if (!Config.EnableQuests || world.Level < Config.QuestBossMinLevel) return false;
+            if (!Config.EnableQuests) return false;
 
-            QuestKillTarget target = _host.Quests.KillTargets(world).FirstOrDefault(t => t.IsBoss);
-            if (target == null) return false;
+            QuestRules rules = QuestRulesNow();
 
-            if (_host.QuestLog.JourneysSince(Id, target.Quest.Index,
-                    DateTime.UtcNow - TimeSpan.FromHours(6)) >= 2) return false;
+            // Every accepted boss target this bot is now old enough for (mini-bosses 40, Crazed
+            // Warrior 50), once per quest and monster. The first one that is capped or has nowhere
+            // reachable no longer blocks the rest.
+            var targets = _host.Quests.KillTargets(world)
+                .Where(t => t.IsBoss && world.Level >= QuestBook.BossLevelFor(
+                    _host.Monsters.Find(t.MonsterIndex), rules))
+                .GroupBy(t => (t.Quest.Index, t.MonsterIndex)).Select(g => g.First())
+                .ToList();
 
-            HashSet<int> maps = new HashSet<int>(_host.BossLairs.MapsForMonster(target.MonsterIndex));
-            maps.UnionWith(target.Maps);
-            if (maps.Contains(world.MapIndex)) return false;   // here already: the lairs do the rest
-
-            int best = maps.Where(m => hops.ContainsKey(m) && permitted(m) &&
-                                       (deadly == null || !deadly.Contains(m)) && affordable(m, out _))
-                .OrderBy(m => hops[m]).ThenBy(m => m).DefaultIfEmpty(-1).First();
-            if (best < 0) return false;
-
-            string mapName = _host.Profiles.For(best)?.MapName ?? $"map {best}";
-            Begin(best, mapName, $"quest '{target.Quest.QuestName}': kill {target.MonsterName}",
-                  displayReason: $"quest: kill {target.MonsterName}");
-
-            if (_brain.Travel == null || !_brain.Travel.Active) return false;
-
-            _host.QuestLog.Record(new QuestLogEntry
+            foreach (QuestKillTarget target in targets)
             {
-                Bot = Id, Character = world.Name, Class = world.Class.ToString(), Level = world.Level,
-                QuestIndex = target.Quest.Index, Quest = target.Quest.QuestName, Event = "journey",
-                MapIndex = best, Map = mapName, Utc = DateTime.UtcNow,
-                Rewards = $"setting off to kill {target.MonsterName}"
-            });
-            return true;
+                // Per quest: two journeys in six hours, however many bosses it has.
+                if (_host.QuestLog.JourneysSince(Id, target.Quest.Index,
+                        DateTime.UtcNow - TimeSpan.FromHours(6)) >= 2) continue;
+
+                HashSet<int> maps = new HashSet<int>(_host.BossLairs.MapsForMonster(target.MonsterIndex));
+                maps.IntersectWith(target.Maps.Count > 0 ? target.Maps : maps);
+                if (maps.Contains(world.MapIndex)) return false;   // here already: the lairs do the rest
+
+                int best = maps.Where(m => hops.ContainsKey(m) && permitted(m) &&
+                                           (deadly == null || !deadly.Contains(m)) && affordable(m, out _))
+                    .OrderBy(m => hops[m]).ThenBy(m => m).DefaultIfEmpty(-1).First();
+                if (best < 0) continue;
+
+                string mapName = _host.Profiles.For(best)?.MapName ?? $"map {best}";
+                Begin(best, mapName, $"quest '{target.Quest.QuestName}': kill {target.MonsterName}",
+                      displayReason: $"quest: kill {target.MonsterName}");
+
+                if (_brain.Travel == null || !_brain.Travel.Active) continue;
+
+                _host.QuestLog.Record(new QuestLogEntry
+                {
+                    Bot = Id, Character = world.Name, Class = world.Class.ToString(), Level = world.Level,
+                    QuestIndex = target.Quest.Index, Quest = target.Quest.QuestName, Event = "journey",
+                    MapIndex = best, Map = mapName, Utc = DateTime.UtcNow,
+                    Rewards = $"setting off to kill {target.MonsterName}"
+                });
+                return true;
+            }
+
+            return false;
+        }
+
+        private QuestRules _questRules;
+        private DateTime _questRulesAt = DateTime.MinValue;
+
+        /// <summary>
+        /// This bot's quest rules now: the boss levels, the QuestNPCs filter, and the LEVEL-AWARE
+        /// map test - a quest only counts if its monsters live somewhere this bot may hunt: a
+        /// quest town, or a reachable map it may explore at its level that has not proved lethal
+        /// or too dangerous. Rebuilt at most every 30 seconds (it walks the travel graph).
+        /// </summary>
+        private QuestRules QuestRulesNow()
+        {
+            if (_questRules != null && DateTime.UtcNow - _questRulesAt < TimeSpan.FromSeconds(30))
+                return _questRules;
+
+            QuestRules rules = new QuestRules
+            {
+                MiniBossMinLevel = Config.QuestMiniBossMinLevel,
+                BossMinLevel = Config.QuestBossMinLevel,
+                NpcFilter = Config.QuestNpcFilter()
+            };
+
+            WorldModel world = _connection?.World;
+            if (world != null && world.MapIndex > 0)
+            {
+                string mirClass = world.Class.ToString();
+                HashSet<int> lethal = _host.Hunting.Lethal(mirClass, world.Level);
+                Dictionary<int, int> hops = _host.World.HopCounts(world.MapIndex, world.Class,
+                    world.Level, world.Gold, Config.TeleportGoldFloor, world.PKPoints,
+                    Config.TeleportMaxGoldPercent, avoid: lethal);
+                IReadOnlyCollection<int> towns = _host.Vendors.TownMaps;
+                int level = world.Level, maxHealth = world.MaxHealth;
+
+                rules.Huntable = map =>
+                    towns.Contains(map) ||
+                    (hops.ContainsKey(map) && !lethal.Contains(map) &&
+                     !_host.Danger.TooDangerous(map, maxHealth) &&
+                     _host.Profiles.WorthExploring(map, level, Config.ExploreLevelsAbove, out _));
+            }
+
+            _questRules = rules;
+            _questRulesAt = DateTime.UtcNow;
+            return rules;
         }
 
         /// <summary>
@@ -2077,6 +2295,32 @@ namespace MirBot
             int Distance(int mapIndex) =>
                 fromTown.TryGetValue(mapIndex, out int d) ? d : hops[mapIndex];
 
+            // QUEST GOAL: unmeasured maps where accepted quests' targets live, weighted by the
+            // quests they advance and by distance from town - not the uniform draw below.
+            Dictionary<int, List<string>> questHere = QuestMaps(world);
+            List<int> questOptions = options.Where(x => QuestSupply(questHere, x) > 0).ToList();
+            if (PursueQuest(questOptions.Count > 0, out int questExploreChance))
+            {
+                int nearestQuest = questOptions.Min(Distance);
+                double[] qweights = questOptions.Select(map =>
+                    QuestBonus(QuestSupply(questHere, map)) *
+                    (Distance(map) == nearestQuest ? 1.0 : 0.6)).ToArray();
+                int questMap = questOptions[WeightedChoice.Pick(qweights, 1, _random, out _)];
+                MapProfileEntry questProfile = _host.Profiles.For(questMap);
+                string names = QuestNames(questHere, questMap);
+
+                _log.Write($"Travel: exploring {questOptions.Count} quest map(s); " +
+                           $"{questExploreChance}% quest chance - choosing quest exploration.");
+                Begin(questMap, questProfile?.MapName ?? $"map {questMap}",
+                      $"exploring for quests: {names} (median monster level " +
+                      $"{questProfile?.MedianLevel ?? 0}, {hops[questMap]} hop(s) away)",
+                      displayReason: $"quests: {names}");
+                _consecutiveQuestHunts++;
+                _consecutiveBookHunts = 0;
+                _consecutiveGearHunts = 0;
+                return true;
+            }
+
             // Choose the GOAL before the distance ring, just as exploitation chooses it before
             // the XP shortlist. Otherwise a book map at one hop is always discarded behind a
             // zero-hop town, or conversely the old hard book filter chooses books 100% of the
@@ -2137,6 +2381,7 @@ namespace MirBot
                               : "exploring unmeasured preferred map");
                     _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
                     _consecutiveGearHunts = 0;
+                    _consecutiveQuestHunts = 0;
                     return true;
                 }
             }
@@ -2168,6 +2413,7 @@ namespace MirBot
 
             _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
             _consecutiveGearHunts = chosenGear != null ? _consecutiveGearHunts + 1 : 0;
+            _consecutiveQuestHunts = 0;
 
             return true;
         }
@@ -2494,10 +2740,16 @@ namespace MirBot
             // to move on - it is not a town trip, so nothing else would reconsider travel.
             bool questFinished = _questErrand != null && _questErrand.JustFinished;
             if (questFinished) _questErrand.JustFinished = false;
+            if (_fameErrand != null && _fameErrand.JustFinished)
+            {
+                _fameErrand.JustFinished = false;
+                questFinished = true;           // same meaning: an errand ended, move on
+            }
 
             // While the errand owns the bot here, "this town is outgrown / pays nothing" must not
             // walk it off mid-errand; it ends within minutes and triggers travel itself.
-            if (_questErrand != null && _questErrand.OwnsMovement)
+            if (_questErrand != null && _questErrand.OwnsMovement ||
+                _fameErrand != null && _fameErrand.OwnsMovement)
             {
                 barren = false;
                 outgrownHere = false;
@@ -2509,7 +2761,7 @@ namespace MirBot
             if (_questRequestPending && !active && _connection != null &&
                 _connection.Stage == BotStage.InGame && !_connection.World.Dead)
             {
-                MapInfo questMap = _questErrand?.QuestNpcMap;
+                MapInfo questMap = NearestQuestMap(_connection.World);
 
                 if (questMap == null || _connection.World.MapIndex == questMap.Index)
                     _questRequestPending = false;          // there already: the errand takes over
@@ -2521,6 +2773,73 @@ namespace MirBot
                     if (_town != null) _town.WalkToTownRequested = false;
                     _log.Write($"Do quests: heading for {questMap.Description}.");
                     StartTravel(questMap.Index.ToString());
+                    return;
+                }
+            }
+
+            // FAME: after a successful town trip, when Fame Points cover the next rank, go to the
+            // fame NPC - level 45+ (the Frost Village gate), enough gold for both fares on top of
+            // the teleport floor, a real route, nothing else owed. Never mid-hunt.
+            if (tripJustFinished && _town != null && _town.LastTripTraded && !recoveryRoute &&
+                !townNeed && _connection != null && !_connection.World.Dead && Config.EnableFame &&
+                _fameErrand != null && _host.Fame.Ready && _host.Fame.Map != null &&
+                (_brain?.Travel == null || !_brain.Travel.Active) &&
+                (_questErrand == null || !_questErrand.Active))
+            {
+                WorldModel fw = _connection.World;
+                FameInfo next = _fameErrand.Affordable(fw);
+                int fameMap = _host.Fame.Map.Index;
+
+                if (next != null && fw.MapIndex != fameMap && fw.Level >= FameMinLevel &&
+                    fw.Gold >= FameRouteGold + Config.TeleportGoldFloor &&
+                    DateTime.UtcNow - _lastFameTrip >= TimeSpan.FromMinutes(30) &&
+                    DateTime.UtcNow >= _fameNoRouteUntil)
+                {
+                    Dictionary<int, int> fameHops = _host.World.HopCounts(fw.MapIndex, fw.Class,
+                        fw.Level, fw.Gold, Config.TeleportGoldFloor, fw.PKPoints,
+                        Config.TeleportMaxGoldPercent);
+
+                    _lastFameTrip = DateTime.UtcNow;
+
+                    if (!fameHops.ContainsKey(fameMap))
+                    {
+                        _fameNoRouteUntil = DateTime.UtcNow.AddHours(2);
+                        _log.Write($"Fame: {fw.FamePoints:N0} FP covers {next.Name}, but there is no " +
+                                   $"route to {_host.Fame.Map.Description} - trying again in 2 hours.");
+                    }
+                    else
+                    {
+                        _log.Write($"Fame: {fw.FamePoints:N0} FP covers {next.Name} ({next.Cost:N0}) - " +
+                                   $"heading for {_host.Fame.Map.Description}.");
+                        _town.ClearReturn();
+                        StartTravel(fameMap.ToString());
+                        return;
+                    }
+                }
+            }
+
+            // QUEST TOWNS: after a successful town trip, go where quest work is waiting - a hand-in
+            // (every 20 minutes at most) or quests to take (hourly) at another town's NPCs. Only
+            // then: never mid-hunt, never instead of supplies or recovery.
+            if (tripJustFinished && _town != null && _town.LastTripTraded && !recoveryRoute &&
+                !townNeed && _connection != null && !_connection.World.Dead &&
+                Config.EnableQuests && _questErrand != null && !_questErrand.HasWork(_connection.World) &&
+                (_brain?.Travel == null || !_brain.Travel.Active))
+            {
+                WorldModel qw = _connection.World;
+                MapInfo questTown = NearestQuestMap(qw);
+                bool handIn = questTown != null && _host.Quests.ReadyToHandIn(qw)
+                    .Any(q => q.Quest.FinishNPC?.Region?.Map?.Index == questTown.Index);
+                TimeSpan every = handIn ? TimeSpan.FromMinutes(20) : TimeSpan.FromMinutes(60);
+
+                if (questTown != null && questTown.Index != qw.MapIndex &&
+                    DateTime.UtcNow - _lastQuestTownTrip >= every)
+                {
+                    _lastQuestTownTrip = DateTime.UtcNow;
+                    _log.Write($"Quest: {(handIn ? "a quest to hand in" : "quests to take")} at " +
+                               $"{questTown.Description} - heading there.");
+                    _town.ClearReturn();
+                    StartTravel(questTown.Index.ToString());
                     return;
                 }
             }
@@ -3204,6 +3523,54 @@ namespace MirBot
         private int _lastTravelPenaltyPercent;
         private int _consecutiveBookHunts;
         private int _consecutiveGearHunts;
+        private int _consecutiveQuestHunts;
+
+        /// <summary>
+        /// Map -> the accepted, unfinished quests with a (non-boss) target living there, counting
+        /// only maps this bot may hunt (QuestRules.Huntable). Bosses are TryQuestBossJourney's.
+        /// </summary>
+        private Dictionary<int, List<string>> QuestMaps(WorldModel world)
+        {
+            Dictionary<int, List<string>> maps = new Dictionary<int, List<string>>();
+            if (!Config.EnableQuests || Config.QuestHuntChancePercent <= 0) return maps;
+
+            QuestRules rules = QuestRulesNow();
+            foreach (QuestKillTarget target in _host.Quests.KillTargets(world, rules.Huntable))
+            {
+                if (target.IsBoss) continue;
+                foreach (int map in target.Maps)
+                {
+                    if (!maps.TryGetValue(map, out List<string> quests)) maps[map] = quests = new List<string>();
+                    if (!quests.Contains(target.Quest.QuestName)) quests.Add(target.Quest.QuestName);
+                }
+            }
+            return maps;
+        }
+
+        /// <summary>Distinct quests a map advances (the QuestSupply of the plan).</summary>
+        private static int QuestSupply(Dictionary<int, List<string>> questMaps, int map) =>
+            questMaps.TryGetValue(map, out List<string> quests) ? quests.Count : 0;
+
+        /// <summary>Score multiplier for the quest goal: +50% a quest, at most three counted.</summary>
+        private static double QuestBonus(int supply) => 1 + 0.5 * Math.Min(3, supply);
+
+        /// <summary>
+        /// The third hunting goal. Rolled BEFORE the book/ordinary split - a multiplier applied
+        /// after it could never rescue a quest map from the pool that was not chosen.
+        /// </summary>
+        private bool PursueQuest(bool hasQuestMap, out int chance)
+        {
+            chance = 0;
+            if (!hasQuestMap || _recovery.Active) return false;
+            if (_consecutiveQuestHunts >= Math.Max(1, Config.MaxConsecutiveQuestHunts)) return false;
+            chance = Math.Clamp(Config.QuestHuntChancePercent, 0, 100);
+            return chance > 0 && _random.Next(100) < chance;
+        }
+
+        private static string QuestNames(Dictionary<int, List<string>> questMaps, int map) =>
+            questMaps.TryGetValue(map, out List<string> quests)
+                ? string.Join(", ", quests.Take(3)) + (quests.Count > 3 ? ", ..." : "")
+                : "";
         private string _xpSession = "";
         private DateTime _nextXpSample = DateTime.MinValue;
         private decimal _lastXpTotal = decimal.MinValue;
@@ -3483,6 +3850,7 @@ namespace MirBot
             if (_state != BotRunState.Playing) return "offline";
             if (_town != null && _town.Active) return "town";
             if (_questErrand != null && _questErrand.Active) return "quest";
+            if (_fameErrand != null && _fameErrand.Active) return "quest";
             if (_brain?.Travel != null && _brain.Travel.Active) return "travel";
 
             return "hunting";
@@ -3746,6 +4114,8 @@ namespace MirBot
                     Name = b.Type == BuffType.ItemBuff
                         ? Globals.ItemInfoList?.Binding?.FirstOrDefault(i => i.Index == b.ItemIndex)?.ItemName
                           ?? "Item buff"
+                        : b.Type == BuffType.Fame
+                        ? "Fame: " + (_host.Fame.Current(world.FameIndex)?.Name ?? "rank")
                         : b.Type.ToString(),
                     Permanent = b.RemainingTime == TimeSpan.MaxValue,
                     RemainingSeconds = world.BuffRemaining(b) is TimeSpan left ? (int)left.TotalSeconds : null,
@@ -3763,6 +4133,8 @@ namespace MirBot
                 QuestStatusText = _questErrand?.Status ?? "",
                 HuntGold = world.HuntGold,
                 StoreStatusText = StoreStatusText(),
+                FamePoints = world.FamePoints,
+                FameStatusText = FameStatusText(),
                 PetMode = world.PetMode.ToString(),
                 Pets = pets,
                 Equipment = equipment,

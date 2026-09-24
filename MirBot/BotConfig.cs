@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 
 namespace MirBot
@@ -105,7 +106,11 @@ namespace MirBot
         /// gathering nodes turn out to be worth the detour - its drop table has five chestnut
         /// tiers but only two of any one name, so the repeat detector does not catch it.
         /// </summary>
-        public string ButcherAIs = "1,2,5";
+        // The server's NeedHarvest AIs (MonsterObject.GetMonster): every drop of these - ordinary
+        // loot and quest items alike - stays in the corpse until the killer butchers it. 3 Wolf/
+        // Scorpion, 6 Spitting Spider (Venom)/Visceral Worm, 8 Spider Bat (Spider Curare)/Cave
+        // Maggot/Wedge Moth were missing, so their loot and two quest items were never collected.
+        public string ButcherAIs = "1,2,3,5,6,8";
 
         /// <summary>How far to walk to reach a corpse. Beyond this it is not worth the trip.</summary>
         public int ButcherRange = 8;
@@ -255,19 +260,37 @@ namespace MirBot
         public bool NotifyDeath = false;
         public bool NotifyFault = true;
         public bool NotifyQuest = true;
+        public bool NotifyFame = true;
 
-        /// <summary>Do the whitelisted NPCs' kill quests (see QuestBook).</summary>
+        /// <summary>Take and complete the database's quests (see QuestBook).</summary>
         public bool EnableQuests = true;
 
-        /// <summary>
-        /// Host-wide, first ini only, startup-only: the NPC names whose quests the bots take.
-        /// Only quests both started and finished by these NPCs, made only of kill tasks, are used.
-        /// </summary>
-        public string QuestNPCs = "Joeban";
+        /// <summary>Level from which a quest whose target is a mini-boss is taken.</summary>
+        public int QuestMiniBossMinLevel = 40;
+
+        /// <summary>Chance (%) a hunting choice pursues accepted quests, when quest maps exist.</summary>
+        public int QuestHuntChancePercent = 30;
+
+        /// <summary>Quest-goal hunting choices in a row before another goal is forced.</summary>
+        public int MaxConsecutiveQuestHunts = 2;
+
+        /// <summary>Buy fame ranks from the fame NPC (Frost Village) when affordable.</summary>
+        public bool EnableFame = true;
+
+        // Optional per-bot filter on quest GIVERS by NPC name, comma separated. Empty (the default)
+        // means every quest giver in the database; "Joeban" restores the original Bichon-only set.
+        public string QuestNPCs = "";
+
+        /// <summary>QuestNPCs as a set; empty means no filter.</summary>
+        public System.Collections.Generic.HashSet<string> QuestNpcFilter() =>
+            new System.Collections.Generic.HashSet<string>(
+                (QuestNPCs ?? "").Split(',').Select(x => x.Trim()).Where(x => x.Length > 0),
+                System.StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
-        /// A quest whose target is a boss (Level 40 - Well done: the Crazed Warrior) is only taken
-        /// from this level - the operator's call, above the server's own level 40. Raised from 45
+        /// A quest whose target is a HEAVY mini-boss (QuestBook.HeavyBossHealth, 3,000 HP or more -
+        /// in practice Level 40 - Well done's Crazed Warrior) is only taken from this level; lighter
+        /// mini-bosses use QuestMiniBossMinLevel and real bosses are never taken. From this level - the operator's call, above the server's own level 40. Raised from 45
         /// to 50 on 2026-09-24: Mirbot at 45 fled from Lost Paradise Forest's monsters at 8% HP,
         /// poisoned and out of potions, without reaching the boss.
         /// </summary>
@@ -1055,6 +1078,11 @@ namespace MirBot
                 case "notifyquest": config.NotifyQuest = bool.Parse(value); break;
                 case "enablequests": config.EnableQuests = bool.Parse(value); break;
                 case "questnpcs": config.QuestNPCs = value; break;
+                case "questminibossminlevel": config.QuestMiniBossMinLevel = int.Parse(value); break;
+                case "questhuntchancepercent": config.QuestHuntChancePercent = int.Parse(value); break;
+                case "maxconsecutivequesthunts": config.MaxConsecutiveQuestHunts = int.Parse(value); break;
+                case "enablefame": config.EnableFame = bool.Parse(value); break;
+                case "notifyfame": config.NotifyFame = bool.Parse(value); break;
                 case "questbossminlevel": config.QuestBossMinLevel = int.Parse(value); break;
                 case "enablestore": config.EnableStore = bool.Parse(value); break;
                 case "storerebuyminutes": config.StoreRebuyMinutes = int.Parse(value); break;

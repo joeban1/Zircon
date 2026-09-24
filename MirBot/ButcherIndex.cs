@@ -9,8 +9,9 @@ namespace MirBot
     /// <summary>
     /// Which monsters yield anything when their corpse is butchered.
     ///
-    /// The signal is MonsterInfo.AI, from System.db: 1 Chicken, 2 Cow/Deer/Pig/Sheep, 5
-    /// Carnivorous Plant. Passive things killed for their carcass rather than their drops.
+    /// The signal is MonsterInfo.AI, from System.db - the server's own NeedHarvest set: 1 Chicken,
+    /// 2 Cow/Deer/Pig/Sheep, 3 Wolf/Scorpion, 5 Carnivorous Plant, 6 Spitting Spider/Visceral
+    /// Worm, 8 Spider Bat/Cave Maggot/Wedge Moth. For these, EVERY drop waits in the corpse.
     ///
     /// NOT the Mir 2 agents' AutoHarvestAIs = { 1, 2, 4, 5, 7, 9 }. On this server AI 7 is Ant
     /// Needler, Bone Archer and Apparition Archer, and AI 9 is the sorcerers - ordinary combat

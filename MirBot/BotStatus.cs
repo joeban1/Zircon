@@ -379,6 +379,12 @@ namespace MirBot
 
         /// <summary>What the game store step is buying or saving for.</summary>
         public string StoreStatusText { get; init; } = "";
+
+        /// <summary>Fame Points: earned from quests, spent on fame ranks.</summary>
+        public long FamePoints { get; init; }
+
+        /// <summary>The fame rank held and progress to the next.</summary>
+        public string FameStatusText { get; init; } = "";
         public IReadOnlyList<ItemStatus> Inventory { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<ItemStatus> Storage { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<HistoryStatus> History { get; init; } = Array.Empty<HistoryStatus>();

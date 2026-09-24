@@ -53,6 +53,9 @@ namespace MirBot
 
         /// <summary>The game store shopping list (Hunt Gold), per class.</summary>
         public GameStore Store { get; } = new GameStore();
+
+        /// <summary>Fame ranks and the fame NPC.</summary>
+        public FameBook Fame { get; } = new FameBook();
         public ProgressHistory Progress { get; private set; }
 
         /// <summary>Phone notifications; a disabled no-op until Prepare has run.</summary>
@@ -613,11 +616,14 @@ namespace MirBot
             QuestLog = new QuestLogMemory(Path.Combine(memory, "quest-log.json"));
 
             // Host-wide like TownMaps: which NPCs' quests exist is a property of the server data.
-            Quests.Build(first.QuestNPCs);
+            Quests.Build();
             foreach (string line in Quests.Report) Log.Write("Quests: " + line);
 
             Store.Build(Library.Globals.StoreInfoList?.Binding);
             foreach (string line in Store.Report) Log.Write("Store: " + line);
+
+            Fame.Build();
+            foreach (string line in Fame.Report) Log.Write("Fame: " + line);
 
             Progress = new ProgressHistory(Path.Combine(memory, "progress.json"));
             Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));

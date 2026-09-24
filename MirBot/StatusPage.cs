@@ -496,7 +496,8 @@ const CARD_HTML = `
            <svg class="spark" data-r="spark" preserveAspectRatio="none" viewBox="0 0 100 26">
              <path class="fill" data-r="sparkfill"></path><path data-r="sparkline"></path></svg></div>
       <div><div class="k">Hunt Gold</div><div class="v" data-r="huntgold"></div>
-           <div class="detail" data-r="storestatus"></div></div>
+           <div class="detail" data-r="storestatus"></div>
+           <div class="detail" data-r="famestatus"></div></div>
       <div><div class="k">Bag</div><div class="v" data-r="bag"></div></div>
       <div><div class="k">Location</div><div class="v" data-r="loc"></div>
            <div class="detail" data-r="locdetail"></div></div>
@@ -802,6 +803,7 @@ function patch(card, b) {
   // HUNT GOLD - the game store currency, and what the store step is buying or saving for.
   text(el.huntgold, String(b.huntGold ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, ","));
   text(el.storestatus, b.storeStatusText ? "Store: " + b.storeStatusText : "");
+  text(el.famestatus, b.fameStatusText ? "Fame: " + b.fameStatusText : "");
 
   drawSpark(card, goldSeries.get(b.id));
   drawMap(card, b);
@@ -1798,6 +1800,7 @@ const NOTIFY_TYPES = [
   { key:"NotifyUpgrade", label:"Gear upgrades",  example:"Jill equipped Platinum Ring - replaced Ring Of Discipline (score +8)" },
   { key:"NotifySkill",   label:"Skills learned", example:"Jill learned Soul Shield" },
   { key:"NotifyQuest",   label:"Quests completed", example:"Sindo completed Do your dailies 2 - Daily Buffs v2 [T], Scroll Of Boss Tracking x2" },
+  { key:"NotifyFame",    label:"Fame ranks", example:"Mirbot reached fame rank Village Explorer - DC/MC/SC +4" },
   { key:"NotifyFault",   label:"Bot faults",     example:"Mirbot4 stopped - needs attention" },
   { key:"NotifyDeath",   label:"Deaths",         example:"Sindo died - killed by Stone Golem on Desert (can be noisy)" }
 ];

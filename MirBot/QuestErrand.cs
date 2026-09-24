@@ -8,8 +8,9 @@ using Library.SystemModels;
 namespace MirBot
 {
     /// <summary>
-    /// A short stop at a quest NPC's map: hand in what is done, take what is available, and kill
-    /// the targets that live here - then let whatever the bot was doing carry on.
+    /// A short stop on a map with quest NPCs (Bichon Town, Banya Village, Lost Paradise): hand in
+    /// what is done, take what is available - one NPC at a time, nearest first, each asked only
+    /// about ITS quests - and kill the targets that live here, then let the bot carry on.
     ///
     /// Only runs while the bot is ALREADY on the NPC's map (Joeban: Bichon Town), which is the
     /// operator's "only when passing through" rule; the bot never travels here for a quest on its
@@ -62,6 +63,15 @@ namespace MirBot
         private DateTime _progressAt;
         private DateTime _cooldownUntil = DateTime.MinValue;
         private readonly HashSet<int> _skipped = new HashSet<int>();
+
+        /// <summary>NPCs given up on for this visit (not where the database says, or silent).</summary>
+        private readonly HashSet<int> _skippedNpcs = new HashSet<int>();
+
+        /// <summary>The NPC being talked to. Switching resets the conversation (ResetTalk).</summary>
+        private NPCInfo _npc;
+
+        /// <summary>Set by BotInstance: this bot's acceptance rules (levels, huntable maps, filter).</summary>
+        public Func<QuestRules> Rules;
 
         private bool _pageOpen;
         private DateTime _calledAt = DateTime.MinValue;
@@ -137,24 +147,40 @@ namespace MirBot
 
         // ---- the work ----------------------------------------------------------------------
 
-        private NPCInfo NpcHere(WorldModel world) => NpcOn(world.MapIndex);
-
-        private NPCInfo NpcOn(int mapIndex) =>
-            _book?.Npcs.FirstOrDefault(n => n.Region?.Map?.Index == mapIndex);
-
-        /// <summary>The map of the first configured quest NPC, or null.</summary>
-        public MapInfo QuestNpcMap => _book?.Npcs.Select(n => n.Region?.Map).FirstOrDefault(m => m != null);
+        private QuestRules CurrentRules() =>
+            Rules?.Invoke() ?? new QuestRules
+            {
+                MiniBossMinLevel = _config.QuestMiniBossMinLevel,
+                BossMinLevel = _config.QuestBossMinLevel
+            };
 
         private static Point NpcPoint(NPCInfo npc) =>
             npc?.Region?.PointRegion != null && npc.Region.PointRegion.Length > 0
                 ? npc.Region.PointRegion[0] : Point.Empty;
 
-        private List<ClientUserQuest> HandIns(WorldModel world) =>
-            _book.ReadyToHandIn(world).Where(q => !_skipped.Contains(q.QuestIndex)).ToList();
+        /// <summary>This NPC's hand-ins and accepts, minus anything skipped this visit.</summary>
+        private (List<ClientUserQuest> HandIns, List<QuestInfo> Accepts) Work(NPCInfo npc,
+            WorldModel world, QuestRules rules)
+        {
+            var (handIns, accepts) = _book.WorkFor(npc, world, rules);
+            handIns.RemoveAll(q => _skipped.Contains(q.QuestIndex));
+            accepts.RemoveAll(q => _skipped.Contains(q.Index));
+            return (handIns, accepts);
+        }
 
-        private List<QuestInfo> Accepts(WorldModel world) =>
-            _book.Acceptable(world, _config.QuestBossMinLevel)
-                .Where(q => !_skipped.Contains(q.Index)).ToList();
+        private bool HasTalk(NPCInfo npc, WorldModel world, QuestRules rules)
+        {
+            var (handIns, accepts) = Work(npc, world, rules);
+            return handIns.Count > 0 || accepts.Count > 0;
+        }
+
+        /// <summary>The nearest NPC on this map with something to say to us, or null.</summary>
+        private NPCInfo NextNpc(WorldModel world, QuestRules rules) =>
+            _book.NpcsOn(world.MapIndex)
+                .Where(n => !_skippedNpcs.Contains(n.Index) && NpcPoint(n) != Point.Empty &&
+                            HasTalk(n, world, rules))
+                .OrderBy(n => WorldModel.Distance(world.Location, NpcPoint(n)))
+                .FirstOrDefault();
 
         /// <summary>Accepted, unfinished, non-boss targets that spawn on THIS map.</summary>
         private List<QuestKillTarget> HuntableHere(WorldModel world) => HuntableOn(world, world.MapIndex);
@@ -167,14 +193,27 @@ namespace MirBot
         public bool HasWork(WorldModel world) => HasWorkOn(world, world.MapIndex);
 
         /// <summary>
-        /// Would a visit to this map find anything to do? Lets the operator's "Do quests" button
-        /// ask about Bichon while the bot is somewhere else. Ignores this visit's skips.
+        /// Would a visit to this map find anything to do - a hand-in or accept with one of ITS
+        /// NPCs, or a target living here? Lets the travel logic and the "Do quests" button ask about
+        /// a town while the bot is somewhere else. Ignores this visit's skips.
         /// </summary>
-        public bool HasWorkOn(WorldModel world, int mapIndex) =>
-            _book != null && _book.Quests.Count > 0 && NpcOn(mapIndex) != null &&
-            (_book.ReadyToHandIn(world).Any() ||
-             _book.Acceptable(world, _config.QuestBossMinLevel).Any() ||
-             HuntableOn(world, mapIndex).Count > 0);
+        public bool HasWorkOn(WorldModel world, int mapIndex)
+        {
+            if (_book == null || _book.Quests.Count == 0 || !_config.EnableQuests) return false;
+            QuestRules rules = CurrentRules();
+            foreach (NPCInfo npc in _book.NpcsOn(mapIndex))
+            {
+                var (handIns, accepts) = _book.WorkFor(npc, world, rules);
+                if (handIns.Count > 0 || accepts.Count > 0) return true;
+            }
+            return _book.NpcsOn(mapIndex).Any() && HuntableOn(world, mapIndex).Count > 0;
+        }
+
+        /// <summary>Every quest-NPC map with work for us now (Do quests, hand-in travel).</summary>
+        public List<int> MapsWithWork(WorldModel world) =>
+            _book == null ? new List<int>() :
+            _book.Npcs.Select(n => n.Region?.Map?.Index ?? -1).Where(m => m >= 0).Distinct()
+                .Where(m => HasWorkOn(world, m)).ToList();
 
         /// <summary>
         /// The next step, or null to let the brain carry on (hunting, or nothing to do).
@@ -209,17 +248,27 @@ namespace MirBot
                 _visitStart = DateTime.UtcNow;
                 _progressAt = _visitStart;
                 _skipped.Clear();
+                _skippedNpcs.Clear();
                 _tries.Clear();
+                ResetTalk(null);
                 _log("Quest: errand on " + world.MapName + " - " + Describe(world) + ".");
             }
 
-            bool talk = HandIns(world).Count > 0 || Accepts(world).Count > 0;
+            QuestRules rules = CurrentRules();
 
-            if (talk)
+            // Talking: stay with the current NPC while it has work (or a request is in flight);
+            // otherwise re-pick - an accept or hand-in can open work at another NPC (Curing the
+            // Poison hands off between Mr. Kang and David).
+            if (_npc != null && _pendingQuest < 0 && !HasTalk(_npc, world, rules))
+                ResetTalk(null);
+
+            NPCInfo npc = _npc ?? NextNpc(world, rules);
+            if (npc != null)
             {
+                if (npc != _npc) ResetTalk(npc);
                 Phase = ErrandPhase.Talking;
                 HuntTargets.Clear();
-                return Talk(world, bag);
+                return Talk(world, bag, npc, rules);
             }
 
             List<QuestKillTarget> hunt = HuntableHere(world);
@@ -229,8 +278,7 @@ namespace MirBot
                     _log("Quest: hunting " + string.Join(", ",
                         hunt.Select(t => $"{t.MonsterName} ({t.Have}/{t.Need})").Distinct()) + ".");
                 Phase = ErrandPhase.Hunting;
-                _pageOpen = false;
-                _calls = 0;
+                ResetTalk(null);
                 HuntTargets.Clear();
                 foreach (QuestKillTarget t in hunt) HuntTargets.Add(t.MonsterIndex);
 
@@ -247,27 +295,45 @@ namespace MirBot
             return null;
         }
 
+        /// <summary>Start talking to a (different) NPC from scratch.</summary>
+        private void ResetTalk(NPCInfo npc)
+        {
+            _npc = npc;
+            _pageOpen = false;
+            _calledAt = DateTime.MinValue;
+            _calls = 0;
+            _atNpcSince = DateTime.MinValue;
+            _pendingQuest = -1;
+        }
+
         private string Describe(WorldModel world)
         {
+            QuestRules rules = CurrentRules();
             List<string> parts = new List<string>();
-            List<ClientUserQuest> handIns = HandIns(world);
-            List<QuestInfo> accepts = Accepts(world);
+            foreach (NPCInfo npc in _book.NpcsOn(world.MapIndex))
+            {
+                var (handIns, accepts) = _book.WorkFor(npc, world, rules);
+                if (handIns.Count > 0)
+                    parts.Add($"hand in {string.Join(", ", handIns.Select(q => q.Quest.QuestName))} to {npc.NPCName}");
+                if (accepts.Count > 0)
+                    parts.Add($"accept {string.Join(", ", accepts.Select(q => q.QuestName))} from {npc.NPCName}");
+            }
             List<QuestKillTarget> hunt = HuntableHere(world);
-            if (handIns.Count > 0) parts.Add("hand in " + string.Join(", ", handIns.Select(q => q.Quest.QuestName)));
-            if (accepts.Count > 0) parts.Add("accept " + string.Join(", ", accepts.Select(q => q.QuestName)));
             if (hunt.Count > 0) parts.Add("hunt " + string.Join(", ", hunt.Select(t => t.MonsterName).Distinct()));
             return string.Join("; ", parts);
         }
 
-        private Decision Talk(WorldModel world, Backpack bag)
+        /// <summary>Give up on one NPC for this visit and move on to the next.</summary>
+        private void SkipNpc(NPCInfo npc, string why)
         {
-            NPCInfo npc = NpcHere(world);
+            _log($"Quest: skipping {npc.NPCName} this visit - {why}.");
+            _skippedNpcs.Add(npc.Index);
+            ResetTalk(null);
+        }
+
+        private Decision Talk(WorldModel world, Backpack bag, NPCInfo npc, QuestRules rules)
+        {
             Point spot = NpcPoint(npc);
-            if (npc == null || spot == Point.Empty)
-            {
-                Abort("no position for the quest NPC", cooldown: true);
-                return null;
-            }
 
             int range = Math.Max(1, _config.VendorTalkRange);
             int distance = WorldModel.Distance(world.Location, spot);
@@ -296,7 +362,7 @@ namespace MirBot
             if (ob == null)
             {
                 if (DateTime.UtcNow - _atNpcSince > NpcSearch)
-                    Abort($"{npc.NPCName} is not where the database says", cooldown: true);
+                    SkipNpc(npc, "not where the database says");
                 return null;
             }
 
@@ -307,7 +373,7 @@ namespace MirBot
 
                 if (_calls >= Tries)
                 {
-                    Abort($"{npc.NPCName} did not answer", cooldown: true);
+                    SkipNpc(npc, "did not answer");
                     return null;
                 }
 
@@ -343,8 +409,10 @@ namespace MirBot
                 return Send(_pendingQuest, _pendingKind);
             }
 
+            var (handIns, accepts) = Work(npc, world, rules);
+
             // Hand in first: it frees the quest slot and the rewards may matter for what follows.
-            foreach (ClientUserQuest ready in HandIns(world))
+            foreach (ClientUserQuest ready in handIns)
             {
                 var rewards = QuestBook.RewardsFor(ready.Quest, world.Class)
                     .Select(r => (r.Item, (long)r.Amount, r.Bound, r.Duration > 0));
@@ -358,7 +426,7 @@ namespace MirBot
                 return Send(ready.QuestIndex, RequestKind.Complete);
             }
 
-            foreach (QuestInfo quest in Accepts(world))
+            foreach (QuestInfo quest in accepts)
                 return Send(quest.Index, RequestKind.Accept);
 
             return null;

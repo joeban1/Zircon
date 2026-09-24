@@ -392,6 +392,16 @@ namespace MirBot
         public long HuntGold;
         private int _huntGoldCurrencyIndex = -1;
 
+        /// <summary>Fame Points: earned from quests, spent on fame ranks (FameErrand).</summary>
+        public long FamePoints;
+        private int _fameCurrencyIndex = -1;
+
+        /// <summary>
+        /// The character's fame rank as a FameInfo.INDEX (0 = none), from Stats[Stat.Fame], which
+        /// RefreshStats sets to Character.Fame. Progression is by FameInfo.Order, not Index.
+        /// </summary>
+        public int FameIndex => PlayerStats?[Stat.Fame] ?? 0;
+
         /// <summary>
         /// When the server last told us combat time changed. S.CombatTime is empty - its arrival
         /// IS the information. The server refuses a logout within 10s of this.
@@ -460,11 +470,24 @@ namespace MirBot
                     HuntGold = currency.Amount;
                     Touch();
                 }
+                else if (currency.Info.Type == CurrencyType.FP && _fameCurrencyIndex < 0)
+                {
+                    _fameCurrencyIndex = currency.Info.Index;
+                    FamePoints = currency.Amount;
+                    Touch();
+                }
             }
         }
 
         public void ApplyCurrency(int currencyIndex, long amount)
         {
+            if (currencyIndex == _fameCurrencyIndex)
+            {
+                FamePoints = amount;
+                Touch();
+                return;
+            }
+
             if (currencyIndex == _huntGoldCurrencyIndex)
             {
                 HuntGold = amount;      // absolute, not a delta
@@ -806,6 +829,8 @@ namespace MirBot
             _goldCurrencyIndex = -1;
             HuntGold = 0;
             _huntGoldCurrencyIndex = -1;
+            FamePoints = 0;
+            _fameCurrencyIndex = -1;
             LastCombat = DateTime.MinValue;
             ApplyCurrencies(start.Currencies);
             Health = start.CurrentHP;
