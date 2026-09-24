@@ -16,6 +16,9 @@ namespace MirBot
         public Point Centre;
         public int Spawns;
         public int RespawnMinutes;
+
+        /// <summary>A boss actually seen (in view or on the tracker), not a spawn-region guess.</summary>
+        public bool Sighted;
     }
 
     /// <summary>

@@ -1681,6 +1681,9 @@ namespace MirBot
         /// </summary>
         private void NoteObjectDied(uint objectID)
         {
+            // Any death, ours or not: a tracked boss that died is not worth walking to.
+            _brain?.NoteBossDied(objectID);
+
             if (!_attackedAt.TryRemove(objectID, out DateTime hit) ||
                 DateTime.UtcNow - hit > TimeSpan.FromSeconds(30))
             {

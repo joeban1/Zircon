@@ -1161,7 +1161,13 @@ namespace MirBot
                     };
                 }
 
-                ClientUserMagic expel = FrugalRecoveryCombat ? null :
+                // EXPEL IS ONE KILL; AN AREA SPELL IS SEVERAL. Expel Undead was checked first and
+                // always offered on an undead pack, so Wizzler single-targeted a floor of ghosts
+                // for twenty minutes with its area spells idle. Only when no area aim covers
+                // enough of them (AoeMinimumTargets) is the instant kill the better cast.
+                bool areaAvailable = !FrugalRecoveryCombat &&
+                    Spells.ChooseArea(world, target, Maps?.For(world.MapIndex)) != null;
+                ClientUserMagic expel = FrugalRecoveryCombat || areaAvailable ? null :
                     Spells.ChooseExpel(world, target, distance);
                 if (expel != null)
                 {
@@ -2508,9 +2514,17 @@ namespace MirBot
             return pool.Count == 0 ? Point.Empty : pool[_random.Next(pool.Count)];
         }
 
-        /// <summary>A boss the tracker showed us, kept after it vanished from the data channel.</summary>
-        private (int Map, Point At, string Name, DateTime Utc) _trackedBoss;
-        private static readonly TimeSpan TrackedBossMemory = TimeSpan.FromMinutes(3);
+        /// <summary>
+        /// Every wanted boss the tracker showed us, by object id, kept after the scroll ends and
+        /// they vanish from the data channel. It used to be ONE sighting - the last to vanish -
+        /// for three minutes, so a scroll revealing several bosses led to one of them and the
+        /// rest fell back to spawn-region guesses, which on Deserted Mine Lv 3 were empty four
+        /// times while the Ghoul Champion stood 90 tiles away. Bosses barely wander, so ten
+        /// minutes; visited nearest-first, and dropped once killed or found gone.
+        /// </summary>
+        private readonly Dictionary<uint, (int Map, Point At, string Name, DateTime Utc)> _trackedBosses =
+            new Dictionary<uint, (int, Point, string, DateTime)>();
+        private static readonly TimeSpan TrackedBossMemory = TimeSpan.FromMinutes(10);
 
         /// <summary>A lair found empty since the last tracker use - the moment a scroll is worth it.</summary>
         private bool _lairFoundEmpty;
@@ -2525,8 +2539,11 @@ namespace MirBot
         {
             if (ob == null || ob.MonsterIndex < 0 || ob.Dead) return;
             if (!_lairsHere.Any(l => l.MonsterIndex == ob.MonsterIndex)) return;
-            _trackedBoss = (mapIndex, ob.Location, ob.Name, DateTime.UtcNow);
+            _trackedBosses[ob.ObjectID] = (mapIndex, ob.Location, ob.Name, DateTime.UtcNow);
         }
+
+        /// <summary>A tracked boss died (whoever killed it): nothing left to walk to.</summary>
+        public void NoteBossDied(uint objectId) => _trackedBosses.Remove(objectId);
 
         /// <summary>When each lair was last checked, so a cleared one waits out its respawn.</summary>
         private readonly Dictionary<(int Map, Point Centre), DateTime> _lairChecked =
@@ -2572,16 +2589,27 @@ namespace MirBot
 
                 if (seen != null)
                     return new BossLair { MapIndex = world.MapIndex, MonsterIndex = seen.MonsterIndex,
-                        MonsterName = seen.Name, Centre = seen.Location, Spawns = 1, RespawnMinutes = 5 };
+                        MonsterName = seen.Name, Centre = seen.Location, Spawns = 1, RespawnMinutes = 5,
+                        Sighted = true };
 
-                if (_trackedBoss.Map == world.MapIndex && now - _trackedBoss.Utc < TrackedBossMemory)
+                // Forget sightings that are stale, on another map, or whose spot has been walked to
+                // since (MarkLairChecked records it) - found empty, or killed there.
+                foreach (uint id in _trackedBosses.Keys.ToList())
                 {
-                    Point at = _trackedBoss.At;
-                    string name = _trackedBoss.Name ?? "tracked boss";
-                    _trackedBoss = default;   // one walk to it; a lair check re-arms the tracker
-                    return new BossLair { MapIndex = world.MapIndex, Centre = at, Spawns = 1,
-                        MonsterName = name, RespawnMinutes = 5 };
+                    var t = _trackedBosses[id];
+                    bool stale = now - t.Utc >= TrackedBossMemory || t.Map != world.MapIndex;
+                    bool visited = _lairChecked.TryGetValue((t.Map, t.At), out DateTime checkedAt) &&
+                                   checkedAt >= t.Utc;
+                    if (stale || visited) _trackedBosses.Remove(id);
                 }
+
+                var next = _trackedBosses.Values
+                    .OrderBy(t => WorldModel.Distance(world.Location, t.At))
+                    .Select(t => ((int, Point, string, DateTime)?)t).FirstOrDefault();
+
+                if (next is (int map, Point at, string name, DateTime _))
+                    return new BossLair { MapIndex = map, Centre = at, Spawns = 1,
+                        MonsterName = name ?? "tracked boss", RespawnMinutes = 5, Sighted = true };
             }
 
             foreach (BossLair lair in LairsHere(world))
@@ -3433,7 +3461,7 @@ namespace MirBot
                         _config.ManaPotionTarget(world.MaxBagWeight, unit),
                         world.Gold, _lootValue))
                 {
-                    if (!JourneyLootFilter(world) ||
+                    if (!JourneyLootFilter(world, candidate.Location) ||
                         _items.WorthLootingOnJourney(candidate.ItemInfo, candidate.Item, world.Class,
                             _config.JourneyLootMinValue, Books, world))
                         return candidate;
@@ -3494,19 +3522,26 @@ namespace MirBot
         /// Loot strictly while a journey is under way - unless poor, when every sale counts and
         /// poverty recovery owns the decision.
         /// </summary>
-        private bool JourneyLootFilter(WorldModel world)
+        private bool JourneyLootFilter(WorldModel world, Point itemAt)
         {
             // Also on the way to a boss lair: the same bag-space problem, one map deep. Close to
             // it, everything the boss drops is picked up as usual.
-            bool headingForLair = _roamKind == RoamTargetKind.BossLair &&
-                                  WorldModel.Distance(world.Location, _roamTarget) > 12;
-            bool on = (Travel != null && Travel.Active || headingForLair) &&
-                      _config.JourneyLootMinValue > 0 &&
-                      !InRecovery && world.Gold >= _config.PoorGold;
+            //
+            // Judged by where the ITEM lies, not where we stand. It used to be our own distance
+            // to the lair, and a Glass Ring lying just outside the 12-tile line was refused while
+            // we stood outside it and wanted as soon as we stepped in - so Banner walked in, turned
+            // back for the ring, was outside again, and did that for twelve minutes on Bichon Cave
+            // Lv 3 without a kill. An item's answer must not depend on which side we are on.
+            bool lairWalk = _roamKind == RoamTargetKind.BossLair && _roamTarget != Point.Empty;
+            bool farFromLair = lairWalk && WorldModel.Distance(itemAt, _roamTarget) > 12;
+            bool travelling = Travel != null && Travel.Active;
+            bool eligible = _config.JourneyLootMinValue > 0 && !InRecovery &&
+                            world.Gold >= _config.PoorGold;
 
-            if (!on) _saidJourneyLoot = false;
+            // Said once per walk, not once per flip.
+            if (!(travelling || lairWalk) || !eligible) _saidJourneyLoot = false;
 
-            return on;
+            return (travelling || farFromLair) && eligible;
         }
 
         private bool _saidJourneyLoot;
@@ -3590,9 +3625,16 @@ namespace MirBot
             // (plus anything already hitting us); cows and chickens that do not count are left
             // alone, or every one becomes a corpse to butcher and a detour - Sindo spent minutes
             // walking between a Pig and a Cow carcass in Bichon Town.
+            //
+            // CHASING A SIGHTED BOSS IS TOO. A boss the tracker revealed is a known position, and
+            // the walk to it only ran when nothing else was in range - on a packed floor that is
+            // never: Wizzler fought ghosts for fifteen minutes 28 tiles from a Ghoul Champion it
+            // had just paid a scroll to find. So on the way, only what is in contact is fought.
             WorldObject next = QuestHunting
                 ? QuestTargetInSight(world) ?? world.NearestLiveMonster(1, _unreachable.Keys)
-                : WantedBossInSight(world) ?? NearestWorthFighting(world);
+                : BossChasing
+                    ? WantedBossInSight(world) ?? world.NearestLiveMonster(1, _unreachable.Keys)
+                    : WantedBossInSight(world) ?? NearestWorthFighting(world);
 
             if (next != null)
             {
@@ -3817,6 +3859,10 @@ namespace MirBot
         /// </summary>
         /// <summary>The quest errand is hunting its targets on this map.</summary>
         private bool QuestHunting => Quest != null && Quest.Phase == QuestErrand.ErrandPhase.Hunting;
+
+        /// <summary>Walking to a boss that was actually seen (in view or on the tracker).</summary>
+        private bool BossChasing =>
+            _roamKind == RoamTargetKind.BossLair && _roamTarget != Point.Empty && _lair?.Sighted == true;
 
         private Decision TryButcher(WorldModel world)
         {
