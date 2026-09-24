@@ -47,6 +47,7 @@ namespace MirBot
         public DeathMemory Deaths { get; private set; }
         public LevelMemory Levels { get; private set; }
         public MapTripMemory MapTrips { get; private set; }
+        public BossKillMemory BossKills { get; private set; }
         public ProgressHistory Progress { get; private set; }
 
         /// <summary>Phone notifications; a disabled no-op until Prepare has run.</summary>
@@ -58,6 +59,7 @@ namespace MirBot
         public string MemoryFolder { get; private set; } = "";
         public WorldGraph World { get; } = new WorldGraph();
         public SafeZoneDirectory SafeZones { get; } = new SafeZoneDirectory();
+        public BossLairIndex BossLairs { get; } = new BossLairIndex();
 
         /// <summary>
         /// Every map the travel graph can name, for the status page's destination list. Not
@@ -602,6 +604,7 @@ namespace MirBot
             Deaths = new DeathMemory(Path.Combine(memory, "deaths.json"));
             Levels = new LevelMemory(Path.Combine(memory, "levels.json"));
             MapTrips = new MapTripMemory(Path.Combine(memory, "map-trips.json"));
+            BossKills = new BossKillMemory(Path.Combine(memory, "boss-kills.json"));
             Progress = new ProgressHistory(Path.Combine(memory, "progress.json"));
             Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));
             Xp = new XpLog(Path.Combine(memory, "xp.ndjson"));
@@ -612,7 +615,9 @@ namespace MirBot
             // Same reason, and needed before the first town trip: banking cannot happen outside a
             // safe zone, so the trip has to know where to stand.
             SafeZones.Build(Maps);
-
+            BossLairs.Build(Maps);
+            Log.Write($"Boss lairs: {BossLairs.LairCount} spawn region(s); " +
+                      $"{BookDrops.BossCount} boss(es) drop skill books.");
 
             // Teleport NPCs become extra edges in the same graph, so one search weighs a paid hop
             // against the walk rather than the two being planned separately.
@@ -1067,6 +1072,7 @@ namespace MirBot
             // opinion about where the bot keeps its memory.
             _status.IconPath = Path.Combine(MemoryFolder, "icons");
             _status.NotifyStatus = () => new { enabled = Notify.Enabled, recent = Notify.Recent() };
+            _status.BossKills = take => BossKills.Snapshot(take);
             _status.NotifyTest = () =>
             {
                 if (!Notify.Enabled) return false;
@@ -1087,6 +1093,7 @@ namespace MirBot
                 Deaths.FlushIfDue();
                 Levels.FlushIfDue();
                 MapTrips.FlushIfDue();
+                BossKills.FlushIfDue();
                 Progress.FlushIfDue();
                 Thread.Sleep(500);
             }
@@ -1149,6 +1156,7 @@ namespace MirBot
             Deaths.Flush();
             Levels.Flush();
             MapTrips.Flush();
+            BossKills.Flush();
             Progress.Flush();
         }
 

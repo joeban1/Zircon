@@ -793,7 +793,13 @@ namespace MirBot
             //     occupying the cell we are trying to walk through. Running is not an option the
             //     server will grant, so the choice is really "fight it" or "shuffle against it
             //     while it kills us", and the bot spent fourteen seconds picking the second one.
-            if (Travel != null && Travel.Active && FightingThrough(world))
+            // A town trip owns the bot until it finishes, even on a tick where it has no step to
+            // give (Banking and Returning have those). Walking the journey in that gap is how the
+            // journey's stuck clock expired mid-shop.
+            bool tripOwnsUs = Town != null && Town.Active;
+            if (tripOwnsUs) Travel?.Hold();
+
+            if (!tripOwnsUs && Travel != null && Travel.Active && FightingThrough(world))
             {
                 Travel.NoteFightingThrough();
 
@@ -809,7 +815,7 @@ namespace MirBot
                 }
                 // Fall through to combat; the journey resumes once nothing is in contact.
             }
-            else if (Travel != null && Travel.Active)
+            else if (!tripOwnsUs && Travel != null && Travel.Active)
             {
                 Decision leg = Travel.Next(world);
 
@@ -1097,6 +1103,24 @@ namespace MirBot
                     };
                 }
 
+                ClientUserMagic expel = FrugalRecoveryCombat ? null :
+                    Spells.ChooseExpel(world, target, distance);
+                if (expel != null)
+                {
+                    Spells.ExpelIssued(target.ObjectID);
+                    NoteAttacked();
+                    return new Decision
+                    {
+                        Action = BotAction.Cast,
+                        Reason = $"{expel.Info.Name} on {target.Name} at {distance}",
+                        Subject = expel.Info.Name,
+                        TargetID = target.ObjectID,
+                        Direction = WorldModel.DirectionTo(world.Location, target.Location),
+                        Point = target.Location,
+                        Magic = expel.Info.Magic
+                    };
+                }
+
                 // Assassins with melee skills need to close the gap. Hell Fire remains useful
                 // as an opening hit, but casting it every two seconds kept Sindo permanently
                 // at range and made every AttackMagic skill unreachable.
@@ -1217,6 +1241,25 @@ namespace MirBot
                             Direction = NextRoamDirection(world, true),
                             Distance = 1
                         };
+
+                    // Arm a one-shot charge (Blade Storm, Dragon Rise, Flaming Sword) for the
+                    // coming swing. The server answers with S.MagicToggle and the next swing names it.
+                    MagicType charge = FrugalRecoveryCombat
+                        ? MagicType.None
+                        : Skills.PendingCharge(world);
+
+                    if (charge != MagicType.None)
+                    {
+                        Skills.ChargeSent();
+
+                        return new Decision
+                        {
+                            Action = BotAction.MagicToggle,
+                            Reason = $"charging {charge} for {target.Name}",
+                            Subject = charge.ToString(),
+                            Magic = charge
+                        };
+                    }
 
                     MagicType magic = FrugalRecoveryCombat
                         ? MagicType.None
@@ -1822,6 +1865,15 @@ namespace MirBot
 
         private DateTime _nextSummon = DateTime.MinValue;
 
+        /// <summary>Summons strongest first, with the MonsterFlag of the pet each one creates.</summary>
+        /// Amulets is what each one takes (Player.UseAmulet in the server's summon sources).
+        private static readonly (MagicType Magic, MonsterFlag Pet, int Amulets)[] Summons =
+        {
+            (MagicType.SummonJinSkeleton, MonsterFlag.JinSkeleton, 2),
+            (MagicType.SummonShinsu, MonsterFlag.Shinsu, 5),
+            (MagicType.SummonSkeleton, MonsterFlag.Skeleton, 1)
+        };
+
         /// <summary>
         /// Put a skeleton out if we have none.
         ///
@@ -1848,15 +1900,47 @@ namespace MirBot
             if (world.Dead || DateTime.UtcNow < _nextSummon) return null;
             if (Town != null && Town.Active) return null;
 
-            if (!world.TryGetMagic(MagicType.SummonSkeleton, out ClientUserMagic magic)) return null;
-            if (magic.Info == null || world.Level < magic.Info.NeedLevel1) return null;
+            // The strongest summon we know. Summon Shinsu (30) and Summon Jin Skeleton (33) drop
+            // from the Lv 3 cave bosses; each one keys its pet by MonsterFlag, so recasting the SAME
+            // summon recalls that pet rather than adding one, and the server caps pets at two.
+            ClientUserMagic magic = null;
+            MonsterFlag flag = MonsterFlag.None;
+            int amulets = 1;
+            foreach ((MagicType type, MonsterFlag petFlag, int cost) in Summons)
+            {
+                if (!world.TryGetMagic(type, out ClientUserMagic known) || known.Info == null ||
+                    known.ItemRequired || world.Level < known.Info.NeedLevel1) continue;
+                // A better summon we cannot pay amulets for yields to the next one down.
+                if (items.EquippedReagentCount(ItemType.Amulet) < cost) continue;
+                magic = known;
+                flag = petFlag;
+                amulets = cost;
+                break;
+            }
+            if (magic == null)
+            {
+                if (Summons.Any(s => world.CanUseMagic(s.Magic)))
+                {
+                    SummonDiagnostic = "no amulet equipped or carried";
+                    _nextSummon = DateTime.UtcNow.AddSeconds(Math.Max(5, _config.SummonRetrySeconds));
+                }
+                return null;
+            }
 
-            // Already have one out.
-            foreach (WorldObject pet in world.OwnPets) return null;
+            // Already have the best pet out - or two of anything, the server's cap. One weaker pet
+            // (the old skeleton) is kept and the better summon added beside it.
+            int pets = 0;
+            foreach (WorldObject pet in world.OwnPets)
+            {
+                pets++;
+                if (BotConnection.Monsters?.Find(pet.MonsterIndex)?.Flag == flag) return null;
+            }
+            if (pets >= 2) return null;
+            if (pets == 1 && magic.Info.Magic == MagicType.SummonSkeleton) return null;
 
             // No reagent, no summon - and the server would take the amulet it does not have and
             // tell us nothing. Checked here so the refusal is ours and is logged.
-            if (items.EquippedReagentCount(ItemType.Amulet) <= 0)
+            if (items.EquippedReagentCount(ItemType.Amulet) < amulets)
             {
                 SummonDiagnostic = "no amulet equipped or carried";
                 _nextSummon = DateTime.UtcNow.AddSeconds(Math.Max(5, _config.SummonRetrySeconds));
@@ -1868,12 +1952,12 @@ namespace MirBot
 
             _nextSummon = DateTime.UtcNow.AddSeconds(Math.Max(5, _config.SummonRetrySeconds));
             SummonsCast++;
-            SummonDiagnostic = "summoning a skeleton";
+            SummonDiagnostic = $"summoning ({magic.Info.Name})";
 
             return new Decision
             {
                 Action = BotAction.Cast,
-                Reason = "summoning a skeleton",
+                Reason = $"summoning ({magic.Info.Name})",
                 Subject = magic.Info.Name,
                 // No target and no location: MagicCast ignores both and spawns the pet on the tile
                 // BEHIND the caster, chosen from the direction we send.
@@ -2061,7 +2145,8 @@ namespace MirBot
             LocalCoverage,
             MapWideCoverage,
             FallbackSweep,
-            Random
+            Random,
+            BossLair
         }
 
         /// <summary>
@@ -2169,6 +2254,15 @@ namespace MirBot
                 AbandonSweep($"no closer than {_sweepBest} tiles for " +
                              $"{SweepPatience.TotalSeconds:0}s");
 
+            if (_roamKind == RoamTargetKind.BossLair &&
+                WorldModel.Distance(world.Location, _roamTarget) <= LairSightRange)
+            {
+                // Standing in it with nothing to fight - a live boss in sight would have been
+                // targeted before Wander was reached - so it is dead or not yet respawned.
+                MarkLairChecked(_lair, "reached - nothing there");
+                ClearRoamTarget();
+            }
+
             if (_roamTarget != Point.Empty &&
                 (ShouldExpireRoamTarget(DateTime.UtcNow, _roamUntil, IsLongRoamTarget) ||
                  WorldModel.Distance(world.Location, _roamTarget) <= 1))
@@ -2178,6 +2272,25 @@ namespace MirBot
                                      $"target {_roamTarget.X},{_roamTarget.Y}.");
 
                 ClearRoamTarget();
+            }
+
+            if (_roamTarget == Point.Empty)
+            {
+                BossLair lair = NextLair(world);
+
+                if (lair != null)
+                {
+                    _lair = lair;
+                    _roamTarget = lair.Centre;
+                    _roamKind = RoamTargetKind.BossLair;
+                    _sweeping = true;
+                    _sweepBest = WorldModel.Distance(world.Location, _roamTarget);
+                    _sweepProgressAt = DateTime.UtcNow;
+                    _roamUntil = DateTime.UtcNow.AddMinutes(10);
+
+                    BrainLog?.Invoke($"Boss hunt: heading for the {lair.MonsterName} lair at " +
+                                     $"{lair.Centre.X},{lair.Centre.Y} ({_sweepBest} tiles).");
+                }
             }
 
             if (_roamTarget == Point.Empty)
@@ -2256,7 +2369,8 @@ namespace MirBot
             {
                 if (IsCoverageTarget)
                     AbandonExploration(world, "no route", SweepSentence);
-                else if (_roamKind == RoamTargetKind.FallbackSweep)
+                else if (_roamKind == RoamTargetKind.FallbackSweep ||
+                         _roamKind == RoamTargetKind.BossLair)
                     AbandonSweep("no route");
                 else
                     ClearRoamTarget();
@@ -2273,7 +2387,102 @@ namespace MirBot
 
         private bool IsLongRoamTarget =>
             _roamKind == RoamTargetKind.MapWideCoverage ||
-            _roamKind == RoamTargetKind.FallbackSweep;
+            _roamKind == RoamTargetKind.FallbackSweep ||
+            _roamKind == RoamTargetKind.BossLair;
+
+        // ---- boss lairs ------------------------------------------------------------------------
+
+        /// <summary>
+        /// Set by BotInstance: the lairs on this map whose boss drops a skill book this character
+        /// wants (unlearned, or a level 4 training copy). Empty when there is nothing to seek.
+        /// </summary>
+        public Func<WorldModel, IReadOnlyList<BossLair>> WantedLairs;
+
+        /// <summary>When each lair was last checked, so a cleared one waits out its respawn.</summary>
+        private readonly Dictionary<(int Map, Point Centre), DateTime> _lairChecked =
+            new Dictionary<(int, Point), DateTime>();
+
+        private BossLair _lair;
+        private IReadOnlyList<BossLair> _lairsHere = Array.Empty<BossLair>();
+        private int _lairsMap = -1;
+        private DateTime _lairsAt = DateTime.MinValue;
+
+        /// <summary>Close enough to a lair to see whatever lives in it.</summary>
+        private const int LairSightRange = 6;
+
+        private IReadOnlyList<BossLair> LairsHere(WorldModel world)
+        {
+            if (WantedLairs == null) return Array.Empty<BossLair>();
+            if (_lairsMap != world.MapIndex || DateTime.UtcNow - _lairsAt > TimeSpan.FromSeconds(30))
+            {
+                _lairsHere = WantedLairs(world) ?? Array.Empty<BossLair>();
+                _lairsMap = world.MapIndex;
+                _lairsAt = DateTime.UtcNow;
+            }
+            return _lairsHere;
+        }
+
+        /// <summary>The nearest wanted lair not checked within its respawn time, or null.</summary>
+        private BossLair NextLair(WorldModel world)
+        {
+            BossLair best = null;
+            int bestDistance = int.MaxValue;
+            DateTime now = DateTime.UtcNow;
+
+            foreach (BossLair lair in LairsHere(world))
+            {
+                if (_lairChecked.TryGetValue((lair.MapIndex, lair.Centre), out DateTime at) &&
+                    now - at < TimeSpan.FromMinutes(Math.Max(5, lair.RespawnMinutes)))
+                    continue;
+
+                int distance = WorldModel.Distance(world.Location, lair.Centre);
+                if (distance >= bestDistance) continue;
+                best = lair;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
+
+        private void MarkLairChecked(BossLair lair, string outcome)
+        {
+            if (lair == null) return;
+            _lairChecked[(lair.MapIndex, lair.Centre)] = DateTime.UtcNow;
+            BrainLog?.Invoke($"Boss hunt: {lair.MonsterName} lair at {lair.Centre.X},{lair.Centre.Y} " +
+                             $"{outcome}; next check in {Math.Max(5, lair.RespawnMinutes)} minutes.");
+        }
+
+        /// <summary>
+        /// A wanted boss we can see and are willing to fight: taken ahead of the nearest monster,
+        /// because clearing the crowd in between first is how it drifts back out of sight. Never
+        /// ahead of something already hitting us, and never one the danger memory says will
+        /// take us apart.
+        /// </summary>
+        private WorldObject WantedBossInSight(WorldModel world)
+        {
+            IReadOnlyList<BossLair> lairs = LairsHere(world);
+            if (lairs.Count == 0) return null;
+            if (world.NearestLiveMonster(1, _unreachable.Keys) != null) return null;
+
+            WorldObject best = null;
+            int bestDistance = int.MaxValue;
+
+            foreach (WorldObject ob in world.Objects)
+            {
+                if (!ob.IsLiveMonster || ob.IsPet || ob.MonsterIndex < 0) continue;
+                if (_unreachable.ContainsKey(ob.ObjectID)) continue;
+                if (!lairs.Any(l => l.MonsterIndex == ob.MonsterIndex)) continue;
+
+                int distance = world.DistanceTo(ob.Location);
+                if (distance > _config.AggroRange + 10 || distance >= bestDistance) continue;
+                if (TooDangerous(world, ob)) continue;
+
+                best = ob;
+                bestDistance = distance;
+            }
+
+            return best;
+        }
 
         internal static bool ShouldExpireRoamTarget(DateTime now, DateTime until,
             bool longTarget) => !longTarget && now > until;
@@ -2302,6 +2511,10 @@ namespace MirBot
                     return $"{reason} - nothing here for {_config.SweepAfterIdleSeconds}s, " +
                            $"exploring map-wide at {_roamTarget.X},{_roamTarget.Y} " +
                            $"({remaining} tiles; {CoverageAge(_explorationChoice)})";
+
+                case RoamTargetKind.BossLair:
+                    return $"{reason} - heading for the {_lair?.MonsterName ?? "boss"} lair at " +
+                           $"{_roamTarget.X},{_roamTarget.Y} ({remaining} tiles)";
 
                 case RoamTargetKind.FallbackSweep:
                     return $"{reason} - nothing here for {_config.SweepAfterIdleSeconds}s, " +
@@ -2338,6 +2551,7 @@ namespace MirBot
 
         private void ClearRoamTarget()
         {
+            _lair = null;
             _roamTarget = Point.Empty;
             _roamKind = RoamTargetKind.None;
             _explorationChoice = null;
@@ -2582,6 +2796,13 @@ namespace MirBot
 
         private void AbandonSweep(string why)
         {
+            if (_roamKind == RoamTargetKind.BossLair)
+            {
+                MarkLairChecked(_lair, $"abandoned - {why}");
+                ClearRoamTarget();
+                return;
+            }
+
             if (IsCoverageTarget)
             {
                 if (_roamTarget != Point.Empty && _roamMapIndex >= 0)
@@ -2873,6 +3094,13 @@ namespace MirBot
         {
             HashSet<uint> skip = new HashSet<uint>(_unreachable.Keys);
 
+            // A book we want goes first, however much else is on the floor: nearest-first would
+            // pick up a pile of potions and rings while the one Blade Storm in the drop sat there,
+            // and a boss drop is exactly that kind of pile. Unlearned skills before level 4
+            // training copies; the ordinary loot rules still have to agree.
+            WorldObject book = WantedBookOnFloor(world, skip, heavy, full);
+            if (book != null) return book;
+
             while (true)
             {
                 WorldObject candidate = world.NearestItem(_config.LootRange, skip);
@@ -2906,13 +3134,57 @@ namespace MirBot
             }
         }
 
+        private WorldObject WantedBookOnFloor(WorldModel world, HashSet<uint> skip, bool heavy,
+            bool full)
+        {
+            if (Books == null) return null;
+
+            List<(WorldObject Item, int Rank, int Distance)> books =
+                new List<(WorldObject, int, int)>();
+
+            foreach (WorldObject ob in world.Objects)
+            {
+                if (ob.Kind != ObjectKind.Item || ob.ItemInfo?.ItemType != ItemType.Book) continue;
+                if (skip.Contains(ob.ObjectID)) continue;
+
+                int distance = world.DistanceTo(ob.Location);
+                if (distance > _config.LootRange) continue;
+
+                ClientUserItem probe = ob.Item ?? new ClientUserItem { Info = ob.ItemInfo, Count = 1 };
+                if (Books.Judge(probe, world.Class, world.Level, world.PlayerStats, world) !=
+                    BookVerdict.Wanted) continue;
+
+                Library.SystemModels.MagicInfo magic = Books.For(ob.ItemInfo);
+                books.Add((ob, magic != null && world.Knows(magic.Index) ? 1 : 0, distance));
+            }
+
+            foreach ((WorldObject item, int _, int _) in books.OrderBy(x => x.Rank)
+                         .ThenBy(x => x.Distance))
+            {
+                int unit = Math.Max(1, item.ItemInfo?.Weight ?? 1);
+                if (_items.WorthLooting(item.ItemInfo, item.Item, world.Class, world.Gender,
+                        heavy, full,
+                        _config.HealthPotionTarget(world.MaxBagWeight, unit),
+                        _config.ManaPotionTarget(world.MaxBagWeight, unit),
+                        world.Gold, _lootValue))
+                    return item;
+            }
+
+            return null;
+        }
+
         /// <summary>
         /// Loot strictly while a journey is under way - unless poor, when every sale counts and
         /// poverty recovery owns the decision.
         /// </summary>
         private bool JourneyLootFilter(WorldModel world)
         {
-            bool on = Travel != null && Travel.Active && _config.JourneyLootMinValue > 0 &&
+            // Also on the way to a boss lair: the same bag-space problem, one map deep. Close to
+            // it, everything the boss drops is picked up as usual.
+            bool headingForLair = _roamKind == RoamTargetKind.BossLair &&
+                                  WorldModel.Distance(world.Location, _roamTarget) > 12;
+            bool on = (Travel != null && Travel.Active || headingForLair) &&
+                      _config.JourneyLootMinValue > 0 &&
                       !InRecovery && world.Gold >= _config.PoorGold;
 
             if (!on) _saidJourneyLoot = false;
@@ -2997,7 +3269,7 @@ namespace MirBot
                 ForgetFight();
             }
 
-            WorldObject next = NearestWorthFighting(world);
+            WorldObject next = WantedBossInSight(world) ?? NearestWorthFighting(world);
 
             if (next != null)
             {

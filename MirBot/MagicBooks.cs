@@ -80,9 +80,19 @@ namespace MirBot
             if (!magic.MatchesClass(mirClass)) return BookVerdict.WrongClass;
             if (!Backpack.CanClassUseInfo(item.Info, mirClass)) return BookVerdict.WrongClass;
 
-            // Known already: the server refuses the book below skill level 3, and a vendor copy is
-            // NonRefinable so it is refused at any level. Either way it is dead weight.
-            if (world != null && world.Knows(magic.Index)) return BookVerdict.AlreadyKnown;
+            // Known already. A further copy is how a skill reaches level 4: at skill level 3 each
+            // read rolls the book's learn chance and a success adds its learn % as pages, 500 pages
+            // for level 4 (PlayerObject ItemType.Book). The server refuses the book below level 3,
+            // at level 4, and at ANY level for a vendor copy - bought books are NonRefinable
+            // (CanUseItem) - so only a dropped copy of a level 3 skill is worth reading.
+            if (world != null && world.Knows(magic.Index))
+            {
+                bool bought = (item.Flags & UserItemFlags.NonRefinable) == UserItemFlags.NonRefinable;
+                return !bought && world.Trainable(magic.Index) &&
+                       Backpack.MeetsRequirement(item.Info, level, stats)
+                    ? BookVerdict.Wanted
+                    : BookVerdict.AlreadyKnown;
+            }
 
             // The item's own level/stat requirement - the real "can I learn this" gate.
             if (!Backpack.MeetsRequirement(item.Info, level, stats)) return BookVerdict.TooEarly;

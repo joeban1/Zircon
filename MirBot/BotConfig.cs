@@ -380,6 +380,13 @@ namespace MirBot
         /// the wrong thing to weigh against that.
         public int BookHuntBonusPercent = 100;
 
+        /// <summary>
+        /// Extra levels above ExploreLevelsAbove that a map dropping a wanted skill book may be
+        /// explored at. The danger memory, the three-deaths lethal rule and the death penalty
+        /// still decide whether the bot stays; this only lets it look.
+        /// </summary>
+        public int BookExploreExtraLevels = 10;
+
         public int ExploreLevelsAbove = 3;
 
         /// <summary>
@@ -1044,6 +1051,7 @@ namespace MirBot
                 case "maxconsecutivegearhunts": config.MaxConsecutiveGearHunts = int.Parse(value); break;
                 case "explorelevelsabove": config.ExploreLevelsAbove = int.Parse(value); break;
                 case "bookhuntbonuspercent": config.BookHuntBonusPercent = int.Parse(value); break;
+                case "bookexploreextralevels": config.BookExploreExtraLevels = int.Parse(value); break;
                 case "huntinghalflifehours": config.HuntingHalfLifeHours = double.Parse(value); break;
                 case "huntlevelsbelow": config.HuntLevelsBelow = int.Parse(value); break;
                 case "travelgoldperhop": config.TravelGoldPerHop = long.Parse(value); break;

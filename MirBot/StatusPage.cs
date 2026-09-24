@@ -312,6 +312,17 @@ namespace MirBot
     <span class="n" id="huntcount"></span>
   </div>
   <div id="hunttable"></div></details>
+<details class="mem" id="bossmem"><summary>Boss kills</summary>
+  <div class="controls">
+    <input type="search" id="bossq" placeholder="search boss, map, loot, character" autocomplete="off">
+    <label>Character <select id="bosschar"><option value="">all characters</option></select></label>
+    <label>Boss <select id="bossname"><option value="">all bosses</option></select></label>
+    <label>Map <select id="bossmap"><option value="">all maps</option></select></label>
+    <label>Kind <select id="bosskind"><option value="">any</option>
+      <option value="mini-boss">mini-boss</option><option value="boss">boss</option></select></label>
+    <span class="n" id="bosscount"></span></div>
+  <div class="detail">A boss counts when it dies within 30s of this bot hitting it. Dropped is everything new on the ground within 8 tiles two seconds after it died (other kills nearby in the same moment can add to it): taken, left behind, or gone (someone else, or expired). Picked up is what reached the bag in the two minutes after.</div>
+  <div id="bosstable"></div></details>
 <details class="mem" id="deathmem"><summary>Recent deaths</summary>
   <div class="controls">
     <input type="search" id="deathq" placeholder="search map, killer, character" autocomplete="off">
@@ -833,7 +844,8 @@ function patch(card, b) {
               : ` <span class="count">${s.use}</span>`}</td>
         <td class="num">${s.level}</td>
         <td>${s.nextExperience > 0
-              ? `<span class="count">${group(s.experience)}/${group(s.nextExperience)}</span>`
+              ? `<span class="count">${group(s.experience)}/${group(s.nextExperience)}${
+                  s.level >= 3 ? " pages" : ""}</span>`
               : `<span class="count">max</span>`}</td>
       </tr>`).join("")
     : `<tr><td colspan="3" style="color:var(--dim)">none learnt</td></tr>`);
@@ -1270,6 +1282,66 @@ function renderDeaths() {
 }
 
 document.getElementById("deathq").addEventListener("input", renderDeaths);
+
+let bossRows = [];
+
+async function loadBossKills() {
+  try { bossRows = await (await fetch("/api/boss-kills?take=1000", { cache:"no-store" })).json(); }
+  catch (e) { return; }
+  fillFilter("bosschar", "all characters", bossRows.map(r => [levelKey(r), r.character || r.bot]));
+  fillFilter("bossname", "all bosses", bossRows.map(r => [r.monster, r.monster]));
+  fillFilter("bossmap", "all maps", bossRows.map(r => [r.map, r.map]));
+  renderBossKills();
+}
+
+function renderBossKills() {
+  const q = document.getElementById("bossq").value.trim();
+  const who = document.getElementById("bosschar").value;
+  const boss = document.getElementById("bossname").value;
+  const map = document.getElementById("bossmap").value;
+  const kind = document.getElementById("bosskind").value;
+  const rows = bossRows.filter(r =>
+    (!who || levelKey(r) === who) && (!boss || r.monster === boss) &&
+    (!map || r.map === map) && (!kind || r.kind === kind) &&
+    matchesQuery(q, [r.monster, r.map, r.character, r.bot, r.class, (r.loot || []).join(" "),
+      (r.dropped || []).map(d => d.name).join(" ")]));
+  document.getElementById("bosscount").textContent =
+    `${rows.length} of ${bossRows.length} kill${bossRows.length === 1 ? "" : "s"}`;
+  const box = document.getElementById("bosstable");
+  if (!rows.length) {
+    box.innerHTML = `<div class='detail'>${bossRows.length ? "no kills match" : "none recorded yet"}</div>`;
+    return;
+  }
+  box.innerHTML = "<table><tr><th>When</th><th>Boss</th><th>Kind</th><th>Who</th>" +
+    "<th class='num'>Lvl</th><th>Map</th><th>Where</th><th>Dropped</th><th>Picked up</th></tr>" +
+    rows.map(r => "<tr><td>" + new Date(r.utc).toLocaleString() + "</td>" +
+      "<td>" + esc(r.monster) + "</td><td>" + esc(r.kind) + "</td>" +
+      "<td>" + esc(r.character || r.bot) + "</td><td class='num'>" + r.level + "</td>" +
+      "<td>" + esc(r.map) + "</td><td>" + r.x + "," + r.y + "</td>" +
+      "<td>" + bossDrops(r.dropped) + "</td>" +
+      "<td>" + ((r.loot && r.loot.length) ? esc(r.loot.join(", ")) : "—") + "</td></tr>").join("") +
+    "</table>";
+}
+
+// Grouped by name and outcome: "Rejuvenation Potion x3 (taken)", "Gold 90,000 (taken)".
+function bossDrops(drops) {
+  if (!drops || !drops.length) return "—";
+  const groups = new Map();
+  for (const d of drops) {
+    const key = d.name + "\u0001" + d.outcome;
+    const g = groups.get(key) || { name: d.name, outcome: d.outcome, gold: d.gold, n: 0, sum: 0 };
+    g.n++; g.sum += d.count; groups.set(key, g);
+  }
+  const colour = { taken: "", left: "color:var(--bad,#c33)", gone: "opacity:.6" };
+  return [...groups.values()].map(g =>
+    `<span style="${colour[g.outcome] || ""}">${esc(g.name)}` +
+    (g.gold ? " " + group(g.sum) : g.n > 1 ? " x" + g.n : "") +
+    ` (${esc(g.outcome)})</span>`).join(", ");
+}
+
+document.getElementById("bossq").addEventListener("input", renderBossKills);
+for (const id of ["bosschar", "bossname", "bossmap", "bosskind"])
+  document.getElementById(id).addEventListener("change", renderBossKills);
 for (const id of ["deathchar", "deathmap", "deathkiller"])
   document.getElementById(id).addEventListener("change", renderDeaths);
 
@@ -1461,13 +1533,14 @@ async function loadMemory(bots) {
 
   if (document.getElementById("huntmem").open) loadHunting(bots);
   if (document.getElementById("deathmem").open) loadDeaths();
+  if (document.getElementById("bossmem").open) loadBossKills();
   if (document.getElementById("levelmem").open) loadLevels();
   if (document.getElementById("maptripmem").open) loadMapTrips();
   if (document.getElementById("upgrademem").open) loadUpgrades();
   if (document.getElementById("skillmem").open) loadSkills();
 }
 
-for (const id of ["huntmem", "deathmem", "levelmem", "maptripmem", "upgrademem", "skillmem"]) {
+for (const id of ["huntmem", "deathmem", "bossmem", "levelmem", "maptripmem", "upgrademem", "skillmem"]) {
   document.getElementById(id).addEventListener("toggle", () => { memFetchedAt = 0; });
 }
 

@@ -18,9 +18,16 @@ namespace MirBot
         /// <summary>Total spawn count across all respawns - a rough density.</summary>
         public int Population;
 
-        /// <summary>Levels of the monsters here, weighted by how many of each spawn.</summary>
+        /// <summary>
+        /// EFFECTIVE levels of the monsters here, weighted by how many of each spawn. See
+        /// MapProfile.EffectiveLevel: a label above the level cap is replaced by what the
+        /// monster's health and attack say it is.
+        /// </summary>
         public int MedianLevel;
         public int MaxLevel;
+
+        /// <summary>The median of the database's own Level labels, for comparison.</summary>
+        public int StatedMedianLevel;
 
         /// <summary>The best experience a single kill here is worth.</summary>
         public decimal BestExperience;
@@ -33,7 +40,9 @@ namespace MirBot
 
         public override string ToString() =>
             $"{MapName} ({MapIndex}): {Kinds} kinds, {Population} spawns, " +
-            $"levels median {MedianLevel} max {MaxLevel}, best exp {BestExperience:N0}" +
+            $"levels median {MedianLevel}" +
+            (StatedMedianLevel != MedianLevel ? $" (stated {StatedMedianLevel})" : "") +
+            $" max {MaxLevel}, best exp {BestExperience:N0}" +
             (HasBoss ? ", BOSS" : "") +
             (MinimumLevel > 0 ? $", entry level {MinimumLevel}+" : "") +
             (MaximumLevel > 0 ? $", entry level {MaximumLevel}-" : "");
@@ -94,9 +103,12 @@ namespace MirBot
                 return;
             }
 
+            BuildLevelCurve(monsters);
+
             // Levels collected per map, one entry per spawned individual, so a map with forty
             // chickens and one ogre reads as a chicken map rather than an ogre map.
             Dictionary<int, List<int>> levels = new Dictionary<int, List<int>>();
+            Dictionary<int, List<int>> stated = new Dictionary<int, List<int>>();
 
             foreach (MonsterInfo monster in monsters)
             {
@@ -121,16 +133,22 @@ namespace MirBot
                         };
 
                         levels[map.Index] = new List<int>();
+                        stated[map.Index] = new List<int>();
                     }
 
                     entry.Kinds++;
                     entry.Population += respawn.Count;
 
-                    if (monster.Level > entry.MaxLevel) entry.MaxLevel = monster.Level;
+                    int effective = EffectiveLevel(monster);
+                    if (effective > entry.MaxLevel) entry.MaxLevel = effective;
                     if (monster.Experience > entry.BestExperience) entry.BestExperience = monster.Experience;
                     if (monster.IsBoss) entry.HasBoss = true;
 
-                    for (int i = 0; i < respawn.Count; i++) levels[map.Index].Add(monster.Level);
+                    for (int i = 0; i < respawn.Count; i++)
+                    {
+                        levels[map.Index].Add(effective);
+                        stated[map.Index].Add(monster.Level);
+                    }
                 }
             }
 
@@ -141,7 +159,89 @@ namespace MirBot
 
                 list.Sort();
                 _byMap[pair.Key].MedianLevel = list[list.Count / 2];
+
+                List<int> labels = stated[pair.Key];
+                labels.Sort();
+                _byMap[pair.Key].StatedMedianLevel = labels[labels.Count / 2];
             }
+        }
+
+        /// <summary>Character levels stop here; a monster label above it is not a comparison.</summary>
+        public const int LevelCap = 60;
+
+        // Median health and attack of ordinary monsters at each labelled level up to the cap,
+        // made non-decreasing so a lookup always moves one way.
+        private readonly List<(int Level, int Health, int Attack)> _curve =
+            new List<(int, int, int)>();
+
+        private static int StatSum(MonsterInfo monster, Stat stat) =>
+            monster.MonsterInfoStats?.Where(x => x.Stat == stat).Sum(x => x.Amount) ?? 0;
+
+        private void BuildLevelCurve(IEnumerable<MonsterInfo> monsters)
+        {
+            _curve.Clear();
+
+            var byLevel = monsters
+                .Where(m => m != null && !m.IsBoss && m.Level >= 1 && m.Level <= LevelCap &&
+                            m.Respawns != null && m.Respawns.Any(r => r != null && !r.EventSpawn))
+                .GroupBy(m => m.Level)
+                .OrderBy(g => g.Key);
+
+            int health = 0, attack = 0;
+            foreach (var group in byLevel)
+            {
+                List<int> hp = group.Select(m => StatSum(m, Stat.Health)).OrderBy(x => x).ToList();
+                List<int> dc = group.Select(m => Math.Max(StatSum(m, Stat.MaxDC), StatSum(m, Stat.MaxMC)))
+                    .OrderBy(x => x).ToList();
+                health = Math.Max(health, hp[hp.Count / 2]);
+                attack = Math.Max(attack, dc[dc.Count / 2]);
+                _curve.Add((group.Key, health, attack));
+            }
+        }
+
+        /// <summary>
+        /// The level a monster fights like.
+        ///
+        /// Monster levels on this server are labels, and above the character cap of 60 they stop
+        /// meaning anything: the Desert Dungeon lizards say 68 while their health (about 2,000)
+        /// matches level 50-52 monsters and their attack (about 130) level 58-63; the Lv 3 cave
+        /// bosses say 250. A label at or below the cap on an ordinary monster is kept. Anything
+        /// else is read off the curve - the average of the level its health and its attack point
+        /// to, extrapolated in proportion past the top of the curve, and never above its label.
+        /// </summary>
+        public int EffectiveLevel(MonsterInfo monster)
+        {
+            if (monster == null) return 0;
+            if (!monster.IsBoss && monster.Level <= LevelCap) return monster.Level;
+            if (_curve.Count < 3) return monster.Level;
+
+            double byHealth = LevelFor(StatSum(monster, Stat.Health), c => c.Health);
+            double byAttack = LevelFor(Math.Max(StatSum(monster, Stat.MaxDC),
+                StatSum(monster, Stat.MaxMC)), c => c.Attack);
+            int estimate = (int)Math.Round((byHealth + byAttack) / 2);
+
+            return Math.Max(1, Math.Min(monster.Level, estimate));
+        }
+
+        private double LevelFor(int value, Func<(int Level, int Health, int Attack), int> pick)
+        {
+            (int Level, int Health, int Attack) top = _curve[_curve.Count - 1];
+            int topValue = Math.Max(1, pick(top));
+
+            if (value > topValue) return top.Level * (double)value / topValue;
+
+            for (int i = 0; i < _curve.Count; i++)
+            {
+                int here = pick(_curve[i]);
+                if (value > here) continue;
+                if (i == 0) return _curve[0].Level;
+
+                int below = pick(_curve[i - 1]);
+                double t = here == below ? 1 : (value - below) / (double)(here - below);
+                return _curve[i - 1].Level + t * (_curve[i].Level - _curve[i - 1].Level);
+            }
+
+            return top.Level;
         }
 
         /// <summary>

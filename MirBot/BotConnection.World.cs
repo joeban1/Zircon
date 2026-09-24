@@ -154,7 +154,14 @@ namespace MirBot
         public void Process(S.ObjectDied p)
         {
             World.MarkDead(p.ObjectID, true);
+            OnObjectDied?.Invoke(p.ObjectID);
         }
+
+        /// <summary>Something in view died - the boss kill log listens for this.</summary>
+        public Action<uint> OnObjectDied;
+
+        /// <summary>Items that arrived in the bag (pickups, purchases, rewards).</summary>
+        public Action<ClientUserItem> OnItemGained;
 
         /// <summary>
         /// An item is gone from a grid for good.
@@ -894,6 +901,7 @@ namespace MirBot
                 }
 
                 Items.Set(item);
+                OnItemGained?.Invoke(item);
             }
         }
 

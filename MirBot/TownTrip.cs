@@ -321,6 +321,31 @@ namespace MirBot
         /// </summary>
         public bool NeedsStorage { get; private set; }
 
+        /// <summary>
+        /// A full bag or broken gear - work only a vendor can do - published for the travel layer
+        /// the same way ShortOfSupplies is.
+        ///
+        /// A town scroll lands at the bind point, and the bind point is the last safe zone the bot
+        /// walked through - which, once the route planner learned to take the Hexa Stone via Sabuk
+        /// Keep, was Sabuk Keep: a town with no vendors. Mirbot scrolled out of Ant Cave North with
+        /// 45 of 48 slots used, landed there, the trip aborted with "nothing to do there", and
+        /// travel sent it straight back to the cave because neither published flag was set. It
+        /// only sold because the walk back happened to cross Bichon Town.
+        /// </summary>
+        public bool NeedsVendor { get; private set; }
+
+        /// <summary>The Town button was pressed; set until the bot is standing in a town.</summary>
+        public bool WalkToTownRequested { get; set; }
+
+        private bool _scrollShopFailed;
+
+        /// <summary>
+        /// Did the most recent trip get as far as finishing its trading? False for one cut short
+        /// by the low-health rule or aborted, which is what travel must not treat as "restocked".
+        /// </summary>
+        public bool LastTripTraded { get; private set; } = true;
+        private int _scrollsHeld = -1;
+
         private Point Destination =>
             Phase == TownPhase.Returning ? _huntingSpot : _target?.Point ?? Point.Empty;
 
@@ -344,6 +369,7 @@ namespace MirBot
         /// </summary>
         private void ResetTripState()
         {
+            LastTripTraded = false;
             _currentPage = null;
             _buttonPath.Clear();
             _itinerary.Clear();
@@ -394,6 +420,11 @@ namespace MirBot
 
         private void Enter(TownPhase phase, string status)
         {
+            // A trip that has finished its trading and still holds no scroll could not buy one
+            // here; see the out-of-scrolls note in Next.
+            if (phase == TownPhase.Returning && _scrollsHeld == 0) _scrollShopFailed = true;
+            if (phase == TownPhase.Returning) LastTripTraded = true;
+
             Phase = phase;
             Status = status;
             _phaseSince = DateTime.Now;
@@ -495,6 +526,19 @@ namespace MirBot
                 int floor = Math.Max(1, budget * _config.RestockAtPotionPercent / 100);
 
                 shortOfPotions = items.HealthPotionLoad() < floor;
+
+                // The same affordability test mana has always had. A broke bot out of healing
+                // potions cannot fix that in a shop, and since a shortage now also WALKS a bot to
+                // town when it has no scroll, leaving this ungated would march a penniless
+                // character to town and back every thirty seconds. It fights and earns instead,
+                // and poverty recovery owns where it does so.
+                if (shortOfPotions && !CanAffordAnyHealth(world))
+                {
+                    shortOfPotions = false;
+                    SupplyDiagnostic =
+                        $"short of healing potions but only {world.Gold:N0} gold - staying out to " +
+                        "earn rather than walking to a shop we cannot buy from";
+                }
             }
 
             // MANA potions count too, for anyone who spends mana.
@@ -549,6 +593,19 @@ namespace MirBot
 
             shortOfPotions = shortOfPotions || shortOfMana;
 
+            // OUT OF TOWN SCROLLS is a supply shortage too. Nothing looked at it: Sindo spent its
+            // last scroll getting unstuck in Banya Village, its trip was cut short at 35% health,
+            // and it walked back to Deserted Mine Lv 3 with none - then filled its bag there with
+            // no way home. The latch stops a town that sells none (or a bot that cannot pay) from
+            // turning this into a trip every cooldown: it is set when a trip finishes trading still
+            // holding none, and cleared as soon as one is held again.
+            int scrollsHeld = items.CountTownScrolls();
+            if (scrollsHeld > 0) _scrollShopFailed = false;
+            _scrollsHeld = scrollsHeld;
+            bool outOfScrolls = _config.TownScrollReserve > 0 && scrollsHeld == 0 &&
+                                !_scrollShopFailed && world.Gold >= _config.PoorGold;
+            shortOfPotions = shortOfPotions || outOfScrolls;
+
             // Published so the TRAVEL layer can see it. The trip itself can only walk to vendors
             // on the map it is standing on; choosing a different map is the journey's job, and
             // until now the journey had no idea the bot was out of supplies.
@@ -557,6 +614,14 @@ namespace MirBot
             bool bankedReady = items.StorageReclaims(world.Class, world.Gender, world.Level,
                 world.PlayerStats, _books, world).Count > 0 || items.HasCompletableParts();
             NeedsStorage = bankedReady;
+            // Out of slots only counts when something in them can go: a bag full of keepers is
+            // not fixed by a vendor, and travel would otherwise walk to town and back for ever.
+            NeedsVendor = overweight || repairable ||
+                          items.FreeSlotCount <= Math.Max(0, _config.TownAtFreeSlots) &&
+                          items.DisposableSlots(world.Class, world.Gender, world.Level,
+                              world.PlayerStats, _config.HealthPotionTarget(world.MaxBagWeight),
+                              _config.ManaPotionTarget(world.MaxBagWeight),
+                              _config.TownScrollReserve, _books, world).Count > 0;
 
             // Stocked up again: the next shortage gets its urgent trip back.
             if (!shortOfPotions) _supplyUrgencySpent = false;
@@ -617,6 +682,11 @@ namespace MirBot
 
                 bool forced = _forced;
                 _forced = false;
+
+                // The button must always end in town. With no scroll and no vendor on this map
+                // the trip below aborts in the same tick, so remember the request for the travel
+                // layer, which walks there instead (cleared once we stand in a town).
+                if (forced) WalkToTownRequested = true;
 
                 return Begin(world, items, brokenUrgent || forced, supplyUrgent, bankedReady);
             }
@@ -2445,6 +2515,8 @@ namespace MirBot
         /// </summary>
         private static bool NeedsAmulet(WorldModel world) =>
             world.CanUseMagic(MagicType.SummonSkeleton) ||
+            world.CanUseMagic(MagicType.SummonShinsu) ||
+            world.CanUseMagic(MagicType.SummonJinSkeleton) ||
             world.CanUseMagic(MagicType.MagicResistance) ||
             world.CanUseMagic(MagicType.Resilience) ||
             world.CanUseMagic(MagicType.StrengthOfFaith) ||
@@ -2704,6 +2776,46 @@ namespace MirBot
         /// buyer agree about what "enough" means instead of the trigger sending the bot to a shop
         /// the buyer will then refuse to use.
         /// </summary>
+        private static int _cheapestHealth = -1;
+
+        /// <summary>The cheapest pure healing potion anywhere; 0 when unknown.</summary>
+        private static int CheapestHealthPotionPrice()
+        {
+            if (_cheapestHealth >= 0) return _cheapestHealth;
+
+            int cheapest = int.MaxValue;
+
+            try
+            {
+                foreach (ItemInfo info in Globals.ItemInfoList?.Binding
+                                          ?? Enumerable.Empty<ItemInfo>())
+                {
+                    if (info == null || info.ItemType != ItemType.Consumable) continue;
+                    if (info.Stats[Stat.Health] <= 0 || info.Stats[Stat.Mana] > 0) continue;
+                    if (info.Price <= 0) continue;
+
+                    if (info.Price < cheapest) cheapest = info.Price;
+                }
+            }
+            catch
+            {
+                // Database not loaded: 0 disables the gate.
+            }
+
+            _cheapestHealth = cheapest == int.MaxValue ? 0 : cheapest;
+            return _cheapestHealth;
+        }
+
+        /// <summary>Enough gold to make a healing-potion trip worth walking? See CanAffordAnyMana.</summary>
+        private bool CanAffordAnyHealth(WorldModel world)
+        {
+            int price = CheapestHealthPotionPrice();
+
+            if (price <= 0) return true;   // unknown - never suppress on a guess
+
+            return world.Gold >= (long)price * Math.Max(1, _config.MinUsefulPotionBuy);
+        }
+
         private bool CanAffordAnyMana(WorldModel world)
         {
             int price = CheapestManaPotionPrice();

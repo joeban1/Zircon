@@ -113,6 +113,9 @@ namespace MirBot
         private static readonly HashSet<MagicType> Passive = new HashSet<MagicType>
         {
             MagicType.Swordsmanship, MagicType.PotionMastery,
+            // Spirit Sword is the Taoist's Swordsmanship: an accuracy passive the server applies
+            // on every swing (SpiritSword.cs AttackCast/GetPassiveStats). Not "no path".
+            MagicType.SpiritSword,
             MagicType.WillowDance, MagicType.BloodyFlower,
             MagicType.PledgeOfBlood, MagicType.GhostWalk,
             MagicType.TouchOfTheDeparted
@@ -133,8 +136,11 @@ namespace MirBot
                 case MagicType.Heal:
                 case MagicType.PoisonDust:
                 case MagicType.SummonSkeleton:
+                case MagicType.SummonShinsu:
+                case MagicType.SummonJinSkeleton:
                 case MagicType.SummonPuppet:
                 case MagicType.WraithGrip:
+                case MagicType.ExpelUndead:
                     return true;
             }
 
@@ -341,6 +347,7 @@ namespace MirBot
 
                 if (EnabledAttackType(magic.Info.Magic) ||
                     magic.Info.Magic == MagicType.WraithGrip ||
+                    magic.Info.Magic == MagicType.ExpelUndead ||
                     magic.Info.Magic == MagicType.SummonPuppet) return true;
 
                 foreach ((MagicType Magic, BuffType? Buff, bool AtOwnFeet) self in SelfBuffs)
@@ -728,6 +735,46 @@ namespace MirBot
         public void WraithIssued(uint targetID) =>
             _wraithPending[targetID] = DateTime.UtcNow.AddSeconds(10);
 
+        /// <summary>Expel Undead attempts per target, so a resisted one is not tried for ever.</summary>
+        private readonly Dictionary<uint, int> _expelTries = new Dictionary<uint, int>();
+
+        /// <summary>
+        /// Expel Undead: an instant kill, not damage (ExpelUndead.cs MagicComplete). The server
+        /// ignores it on anything not Undead, on a boss, at monster level 70+, and whenever the
+        /// monster's level reaches ours minus one plus a 0-3 roll - so it is only offered where it
+        /// can work: an undead, non-boss target at least two levels below us with most of its
+        /// health left (a kill is worth least on something nearly dead). Success is then
+        /// 35% + 9% per skill level + 5% per level of difference, so two tries per target.
+        ///
+        /// Jane learnt it and it sat at skill level 0: it was in no list, so nothing ever cast it.
+        /// </summary>
+        public ClientUserMagic ChooseExpel(WorldModel world, WorldObject target, int distance)
+        {
+            if (!_config.CastSpells || target == null || target.MonsterIndex < 0 ||
+                distance > Math.Min(_config.CastRange, 10) || DateTime.UtcNow < _nextCast)
+                return null;
+            if (!world.TryGetMagic(MagicType.ExpelUndead, out ClientUserMagic magic) ||
+                magic.Info == null || magic.ItemRequired || world.Level < magic.Info.NeedLevel1)
+                return null;
+
+            Library.SystemModels.MonsterInfo info = BotConnection.Monsters?.Find(target.MonsterIndex);
+            if (info == null || !info.Undead || info.IsBoss || info.Level >= 70) return null;
+            if (info.Level > world.Level - 2) return null;
+            if (target.MaxHealth > 0 && target.Health * 100 < target.MaxHealth * 50) return null;
+            if (_expelTries.TryGetValue(target.ObjectID, out int tries) && tries >= 2) return null;
+
+            if (_cooldowns.TryGetValue(magic.InfoIndex, out DateTime ready) &&
+                DateTime.UtcNow < ready) return null;
+            int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
+            return world.Mana - magic.Cost >= floor ? magic : null;
+        }
+
+        public void ExpelIssued(uint targetID)
+        {
+            _expelTries.TryGetValue(targetID, out int tries);
+            _expelTries[targetID] = tries + 1;
+        }
+
         /// <summary>
         /// Puppet is a five-second explosive decoy, not a persistent pet. The server also moves
         /// the caster a few cells and applies Cloak, so use it only in close combat and throttle
@@ -808,6 +855,7 @@ namespace MirBot
             _poisonPending.Remove(targetID);
             _wraithPending.Remove(targetID);
             _petHealRetry.Remove(targetID);
+            _expelTries.Remove(targetID);
         }
 
         public void ForgetAllPoison()

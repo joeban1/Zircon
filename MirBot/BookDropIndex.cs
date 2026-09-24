@@ -30,16 +30,30 @@ namespace MirBot
         /// <summary>MagicInfo.Index -> the book item that teaches it, for drop-only books.</summary>
         private readonly Dictionary<int, ItemInfo> _dropOnly = new Dictionary<int, ItemInfo>();
 
-        /// <summary>Map index -> the drop-only magics obtainable there.</summary>
+        /// <summary>
+        /// Map index -> every magic whose book DROPS there, sold or not. Unlearned skills are only
+        /// ever wanted from drop-only books (a sold one is bought), but a level 4 training read
+        /// needs a dropped copy of ANY book - a bought one is refused - so both live here and
+        /// Wanted decides which count.
+        /// </summary>
         private readonly Dictionary<int, HashSet<int>> _byMap = new Dictionary<int, HashSet<int>>();
 
+        /// <summary>MagicInfo.Index -> a book item for it, for names in the log.</summary>
+        private readonly Dictionary<int, ItemInfo> _anyBook = new Dictionary<int, ItemInfo>();
+
+        /// <summary>Boss monster index -> the magics its books teach (boss lairs).</summary>
+        private readonly Dictionary<int, HashSet<int>> _bossBooks = new Dictionary<int, HashSet<int>>();
+
         public int BookCount => _dropOnly.Count;
+        public int BossCount => _bossBooks.Count;
         public int MapCount => _byMap.Count;
 
         public void Build(MagicBooks books)
         {
             _dropOnly.Clear();
             _byMap.Clear();
+            _anyBook.Clear();
+            _bossBooks.Clear();
 
             if (books == null) return;
 
@@ -93,12 +107,20 @@ namespace MirBot
                         if (drop?.Item == null || drop.Item.ItemType != ItemType.Book) continue;
 
                         MagicInfo magic = books.For(drop.Item);
-                        if (magic == null || !_dropOnly.ContainsKey(magic.Index)) continue;
+                        if (magic == null) continue;
 
                         magics.Add(magic.Index);
+                        if (!_anyBook.ContainsKey(magic.Index)) _anyBook[magic.Index] = drop.Item;
                     }
 
                     if (magics.Count == 0) continue;
+
+                    if (monster.IsBoss)
+                    {
+                        if (!_bossBooks.TryGetValue(monster.Index, out HashSet<int> taught))
+                            _bossBooks[monster.Index] = taught = new HashSet<int>();
+                        taught.UnionWith(magics);
+                    }
 
                     foreach (RespawnInfo respawn in monster.Respawns)
                     {
@@ -118,6 +140,8 @@ namespace MirBot
                 // and travel behaves exactly as it did before this existed.
                 _dropOnly.Clear();
                 _byMap.Clear();
+                _anyBook.Clear();
+                _bossBooks.Clear();
             }
         }
 
@@ -141,29 +165,51 @@ namespace MirBot
                 wanted.Add(pair.Key);
             }
 
+            // Level 4 training: a known level 3 skill wants any dropped copy of its book.
+            if (world != null)
+                foreach (KeyValuePair<int, ItemInfo> pair in _anyBook)
+                    if (world.Trainable(pair.Key) &&
+                        Backpack.MeetsRequirement(pair.Value, level, stats))
+                        wanted.Add(pair.Key);
+
             return wanted;
         }
 
+        /// <summary>The wanted magics a boss monster's books teach, or none.</summary>
+        public IEnumerable<int> BossTeaches(int monsterIndex, HashSet<int> wanted)
+        {
+            if (wanted == null || !_bossBooks.TryGetValue(monsterIndex, out HashSet<int> taught))
+                yield break;
+            foreach (int magic in taught)
+                if (wanted.Contains(magic)) yield return magic;
+        }
+
+        /// <summary>A book's name for a magic, for the log.</summary>
+        public string BookName(int magic) =>
+            _anyBook.TryGetValue(magic, out ItemInfo info) ? info.ItemName : $"magic {magic}";
+
         /// <summary>How many of the wanted skills this map can supply.</summary>
-        public int Supplies(int mapIndex, HashSet<int> wanted)
+        public int Supplies(int mapIndex, HashSet<int> wanted, Func<int, bool> counts = null)
         {
             if (wanted == null || wanted.Count == 0) return 0;
             if (!_byMap.TryGetValue(mapIndex, out HashSet<int> here)) return 0;
 
             int count = 0;
-            foreach (int magic in here) if (wanted.Contains(magic)) count++;
+            foreach (int magic in here)
+                if (wanted.Contains(magic) && (counts == null || counts(magic))) count++;
             return count;
         }
 
         /// <summary>The book names a map supplies, for the travel log.</summary>
-        public string Names(int mapIndex, HashSet<int> wanted)
+        public string Names(int mapIndex, HashSet<int> wanted, Func<int, bool> counts = null)
         {
             if (!_byMap.TryGetValue(mapIndex, out HashSet<int> here)) return "";
 
             List<string> names = new List<string>();
 
             foreach (int magic in here)
-                if (wanted.Contains(magic) && _dropOnly.TryGetValue(magic, out ItemInfo info))
+                if (wanted.Contains(magic) && (counts == null || counts(magic)) &&
+                    _anyBook.TryGetValue(magic, out ItemInfo info))
                     names.Add(info.ItemName);
 
             names.Sort(StringComparer.OrdinalIgnoreCase);

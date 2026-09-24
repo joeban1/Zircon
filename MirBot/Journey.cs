@@ -276,6 +276,16 @@ namespace MirBot
             return true;
         }
 
+        /// <summary>
+        /// Something else has the bot - a town trip - so time passing is not a failure to move.
+        /// Without this the no-progress clock ran through Mirbot's whole shopping stop in Bichon
+        /// Town, and the first tick after it read as "stuck 197 tiles from the exit".
+        /// </summary>
+        public void Hold()
+        {
+            if (_lastProgress != DateTime.MinValue) _lastProgress = DateTime.UtcNow;
+        }
+
         public Decision Next(WorldModel world)
         {
             if (_route == null || Phase == JourneyPhase.Arrived || Phase == JourneyPhase.Failed)

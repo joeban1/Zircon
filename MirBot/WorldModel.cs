@@ -363,6 +363,18 @@ namespace MirBot
 
         public bool Knows(int magicInfoIndex) => _magics.ContainsKey(magicInfoIndex);
 
+        /// <summary>Book pages banked towards the next level (S.MagicLeveled Experience).</summary>
+        public long MagicExperience(int magicInfoIndex) =>
+            _magics.TryGetValue(magicInfoIndex, out ClientUserMagic known) ? known.Experience : 0;
+
+        /// <summary>
+        /// A known skill a DROPPED copy of its book would train: the server takes a further book
+        /// only at skill level 3 and below Globals.MagicMaxLevel (4). See MagicBooks.Judge.
+        /// </summary>
+        public bool Trainable(int magicInfoIndex) =>
+            _magics.TryGetValue(magicInfoIndex, out ClientUserMagic known) &&
+            known.Level >= 3 && known.Level < Globals.MagicMaxLevel;
+
         /// <summary>Every learned skill. Read-only use on the bot thread only.</summary>
         public IEnumerable<ClientUserMagic> Magics => _magics.Values;
 

@@ -67,6 +67,9 @@ namespace MirBot
         public Func<object> NotifyStatus;
         public Func<bool> NotifyTest;
 
+        /// <summary>Boss kill log for the Info tab. Set by the host after construction.</summary>
+        public Func<int, List<BossKillEntry>> BossKills;
+
         private Thread _thread;
         private volatile bool _stopping;
         private bool _warnedAboutOverride;
@@ -296,6 +299,17 @@ namespace MirBot
                     take = Math.Clamp(parsedTake, 1, 2000);
                 Send(context, 200, "application/json; charset=utf-8",
                     JsonSerializer.Serialize(_levels(take), Json));
+                return;
+            }
+
+            if (path == "/api/boss-kills" && !post)
+            {
+                int take = 500;
+                string rawTake = context.Request.QueryString["take"];
+                if (rawTake != null && int.TryParse(rawTake, out int parsedTake))
+                    take = Math.Clamp(parsedTake, 1, 2000);
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(BossKills?.Invoke(take) ?? new List<BossKillEntry>(), Json));
                 return;
             }
 

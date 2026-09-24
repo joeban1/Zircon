@@ -55,14 +55,40 @@ namespace MirBot
 
         /// <summary>
         /// Toggles that stay on once set (C.MagicToggle with CanUse = true). The server then arms
-        /// them per swing. The one-shot kind - FlamingSword, DragonRise, BladeStorm, DefensiveBlow,
-        /// OffensiveBlow - cost mana per arm and are left alone for now.
+        /// them per swing.
         /// </summary>
         private static readonly MagicType[] Sustained =
         {
             MagicType.Thrusting, MagicType.HalfMoon, MagicType.DestructiveSurge, MagicType.FlameSplash,
             MagicType.VineTreeDance, MagicType.Discipline
         };
+
+        /// <summary>
+        /// One-shot charges, strongest first. Each C.MagicToggle pays the mana, starts the skill's
+        /// cooldown and arms the NEXT swing for 12 seconds (FlamingSword.cs Toggle/AttackCast);
+        /// charging one also pushes the other two back by two seconds.
+        ///
+        /// These were "left alone for now", which is why Mirbot learnt Dragon Rise and Banner learnt
+        /// Blade Storm from the Lv 3 bosses and both still sat at skill level 0. Shoulder Dash is
+        /// deliberately absent - it is a charge across the map, not a hit.
+        /// </summary>
+        private static readonly MagicType[] Charges =
+        {
+            MagicType.BladeStorm, MagicType.DragonRise, MagicType.FlamingSword
+        };
+
+        /// <summary>
+        /// Which armed skill to name when several are armed. A charge expires unused after twelve
+        /// seconds, so it goes first; Destructive Surge hits every side where Half Moon hits three.
+        /// </summary>
+        private static readonly MagicType[] SwingPriority =
+        {
+            MagicType.BladeStorm, MagicType.DragonRise, MagicType.FlamingSword,
+            MagicType.DestructiveSurge, MagicType.HalfMoon
+        };
+
+        /// <summary>A charge request is answered by S.MagicToggle; do not repeat it meanwhile.</summary>
+        private DateTime _nextCharge = DateTime.MinValue;
 
         /// <summary>
         /// Does the bot actively drive this melee skill?
@@ -109,7 +135,39 @@ namespace MirBot
             _armed.Clear();
             _enabled.Clear();
             _cooldowns.Clear();
+            _nextCharge = DateTime.MinValue;
         }
+
+        /// <summary>
+        /// A one-shot charge worth arming for the swing we are about to make, or None.
+        ///
+        /// Only while in contact - an armed charge lasts twelve seconds and is spent by the next
+        /// swing - and only when nothing is already armed, since a second charge would be a
+        /// "charge failed" that still costs mana.
+        /// </summary>
+        public MagicType PendingCharge(WorldModel world)
+        {
+            if (DateTime.UtcNow < _nextCharge) return MagicType.None;
+
+            foreach (MagicType magic in Charges)
+                if (_armed.Contains(magic)) return MagicType.None;
+
+            foreach (MagicType magic in Charges)
+            {
+                if (!world.TryGetMagic(magic, out ClientUserMagic known) ||
+                    known?.Info == null || known.ItemRequired) continue;
+                if (!world.CanUseMagic(magic)) continue;
+                if (world.Mana < known.Cost) continue;
+                if (_cooldowns.TryGetValue(known.InfoIndex, out DateTime until) &&
+                    DateTime.UtcNow < until) continue;
+
+                return magic;
+            }
+
+            return MagicType.None;
+        }
+
+        public void ChargeSent() => _nextCharge = DateTime.UtcNow.AddMilliseconds(1500);
 
         /// <summary>
         /// A sustained toggle we know, can use at this level, and have not switched on yet, or None.
@@ -152,6 +210,10 @@ namespace MirBot
             foreach (MagicType magic in ChosenAssassinAttacks)
                 if (magic != preferred && ManualReady(world, magic)) return magic;
 
+            // A charge first: it is spent or wasted within twelve seconds either way.
+            foreach (MagicType magic in Charges)
+                if (IsArmed(magic) && Usable(world, magic)) return magic;
+
             if (IsArmed(MagicType.Thrusting) && Usable(world, MagicType.Thrusting))
             {
                 if (distance == 2) return MagicType.Thrusting;
@@ -164,6 +226,9 @@ namespace MirBot
                     if (world.SomethingAt(behind, target.ObjectID)) return MagicType.Thrusting;
                 }
             }
+
+            foreach (MagicType magic in SwingPriority)
+                if (IsArmed(magic) && Usable(world, magic)) return magic;
 
             foreach (MagicType magic in _armed)
             {

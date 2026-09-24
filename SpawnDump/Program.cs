@@ -330,6 +330,17 @@ namespace SpawnDump
                 return 0;
             }
 
+            string costQ = Environment.GetEnvironmentVariable("SPAWNDUMP_COSTS");
+
+            if (!string.IsNullOrEmpty(costQ))
+            {
+                foreach (NPCGood g in session.GetCollection<NPCGood>().Binding)
+                    if (g?.Item?.ItemName != null &&
+                        g.Item.ItemName.IndexOf(costQ, StringComparison.OrdinalIgnoreCase) >= 0)
+                        Console.WriteLine($"   {g.Item.ItemName,-28} Item.Price={g.Item.Price,-8} NPCGood.Cost={g.Cost}");
+                return 0;
+            }
+
             string sellerQ = Environment.GetEnvironmentVariable("SPAWNDUMP_SELLERS");
 
             if (!string.IsNullOrEmpty(sellerQ))
@@ -350,6 +361,32 @@ namespace SpawnDump
                              .OrderBy(n => n.Region?.Map?.Description))
                     Console.WriteLine($"   {npc.Region?.Map?.Description,-24} {npc.NPCName,-18} goodsIndex={npc.GoodsIndex}");
 
+                return 0;
+            }
+
+            // Every monster's classification fields, for spotting what marks a boss or mini-boss.
+            if (Environment.GetEnvironmentVariable("SPAWNDUMP_MONSTERFIELDS") == "1")
+            {
+                Console.WriteLine("name\tai\tlevel\tisBoss\tflag\tfaceImage\timage\tundead\tcanTame\t" +
+                                  "exp\thealth\tspawnRegions\tspawnCount\tminDelay\tmaxDelay\tmaps\tdrops\t" +
+                                  "maxDC\tmaxMC\tmaxAC\tmaxMR");
+                foreach (MonsterInfo mi in session.GetCollection<MonsterInfo>().Binding
+                             .Where(x => x.MonsterName != null))
+                {
+                    int Sum(Stat stat) => mi.MonsterInfoStats?.Where(s => s.Stat == stat)
+                        .Sum(s => s.Amount) ?? 0;
+                    int health = Sum(Stat.Health);
+                    List<RespawnInfo> spawns = mi.Respawns?.ToList() ?? new List<RespawnInfo>();
+                    string maps = string.Join("|", spawns.Select(r => r.Region?.Map?.Description)
+                        .Where(x => x != null).Distinct());
+                    Console.WriteLine($"{mi.MonsterName}\t{mi.AI}\t{mi.Level}\t{mi.IsBoss}\t{mi.Flag}\t" +
+                                      $"{mi.FaceImage}\t{mi.Image}\t{mi.Undead}\t{mi.CanTame}\t" +
+                                      $"{mi.Experience}\t{health}\t{spawns.Count}\t{spawns.Sum(r => r.Count)}\t" +
+                                      $"{(spawns.Count == 0 ? 0 : spawns.Min(r => r.Delay))}\t" +
+                                      $"{(spawns.Count == 0 ? 0 : spawns.Max(r => r.Delay))}\t{maps}\t" +
+                                      $"{mi.Drops?.Count ?? 0}\t{Sum(Stat.MaxDC)}\t{Sum(Stat.MaxMC)}\t" +
+                                      $"{Sum(Stat.MaxAC)}\t{Sum(Stat.MaxMR)}");
+                }
                 return 0;
             }
 

@@ -177,6 +177,7 @@ namespace MirBot
             F("HuntingHalfLifeHours", 0, 168, "Travel", "hours for a hunting measurement to lose half its weight"),
             F("GatherSafeRange", 0, 20, "Combat", "loot and butcher before a new fight when nothing is this close"),
             F("BookHuntBonusPercent", 0, 1000, "Travel", "score bonus per drop-only skill book a map supplies"),
+            F("BookExploreExtraLevels", 0, 30, "Travel", "extra levels above us a map may be explored at for a wanted book"),
             B("SweepEntersNextFloor", "Movement", "walk through to the next floor on arrival"),
             F("RoamRetargetSeconds", 1, 300, "Movement", "how long to keep one"),
             F("ReturnWithin", 1, 60, "Movement", "close enough to count as back at the hunt")

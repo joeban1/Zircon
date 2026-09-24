@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -465,8 +466,34 @@ namespace MirBot
                 Butcher = _host.Butcher
             };
             _brain.BrainLog = message => _log.Write(message);
+            // Boss lairs worth walking to: this map's bosses that drop a book we want - an
+            // unlearned skill or a level 4 training copy. Independent of BookHuntBonusPercent,
+            // which only weighs map choice; finding the boss once here is always worth it.
+            //
+            // MINI-BOSSES ONLY: several spawns that return within the hour (the Lv 3 cave bosses,
+            // the Warlords). Tainted Terror (7,700 health, one spawn every nine hours) also drops
+            // warrior books in the Underground maps, and walking a level 42 bot to its lair would
+            // be walking it to its death; the world bosses are the same only more so.
+            _brain.WantedLairs = world =>
+            {
+                IReadOnlyList<BossLair> here = _host.BossLairs.On(world.MapIndex);
+                if (here.Count == 0) return here;
+                HashSet<int> wanted = _host.BookDrops.Wanted(world.Class, world.Level,
+                    world.PlayerStats, world);
+                return here.Where(l => IsMiniBoss(here, l.MonsterIndex) &&
+                                       _host.BookDrops.BossTeaches(l.MonsterIndex, wanted).Any())
+                    .ToList();
+            };
             _brain.IsDropPending = () => _connection != null && _connection.DropPending;
             _connection.OnDropRefused = slot => _brain?.NoteDropRefused(slot);
+            _connection.OnObjectDied = NoteObjectDied;
+            _connection.OnItemGained = item =>
+            {
+                BossKillEntry kill = _lastBossKill;
+                if (kill == null || item?.Info == null || !BossKillMemory.LootWindowOpen(kill)) return;
+                _host.BossKills.NoteLoot(kill, _connection.World.MapIndex,
+                    item.Count > 1 ? $"{item.Info.ItemName} x{item.Count}" : item.Info.ItemName);
+            };
             _connection.OnSellRefused = slot => _brain?.Town?.NoteSellRefused(slot);
             _connection.OnSellOrderRefused = () =>
             {
@@ -686,6 +713,11 @@ namespace MirBot
             _connection.CheckPendingBuy();
             CheckPendingLearn(decision);
 
+            if (decision.TargetID != 0 &&
+                (decision.Action == BotAction.Attack || decision.Action == BotAction.Cast))
+                _attackedAt[decision.TargetID] = DateTime.UtcNow;
+            WatchBossDrops(decision);
+
             SampleExperience();
             ConsiderTravel();
             CheckIdleNotify();
@@ -851,7 +883,8 @@ namespace MirBot
             // has vendors, and nowhere else. Affordability and danger still apply - this narrows
             // the choice, it does not force a journey the bot cannot make.
             if (_brain.Town != null &&
-                (_brain.Town.ShortOfSupplies || _brain.Town.NeedsStorage) &&
+                (_brain.Town.ShortOfSupplies || _brain.Town.NeedsStorage ||
+                 _brain.Town.NeedsVendor || _brain.Town.WalkToTownRequested) &&
                 !_host.Vendors.TownMaps.Contains(world.MapIndex))
             {
                 int best = -1, bestHops = int.MaxValue;
@@ -870,6 +903,10 @@ namespace MirBot
                 {
                     string why = _brain.Town.ShortOfSupplies
                         ? "out of supplies - going to town, not hunting"
+                        : _brain.Town.NeedsVendor
+                        ? "bag full or gear broken - going to town, not hunting"
+                        : _brain.Town.WalkToTownRequested
+                        ? "asked to go to town - walking, no town scroll"
                         : "banked item ready - going to a safe town";
                     Begin(best, _host.Profiles.For(best)?.MapName ?? $"map {best}", why,
                           farmingChoice: false);
@@ -878,7 +915,23 @@ namespace MirBot
 
                 _log.Write(_brain.Town.ShortOfSupplies
                     ? "Travel: out of supplies and no town reachable - staying put rather than hunting on empty."
+                    : _brain.Town.NeedsVendor
+                    ? "Travel: bag full or gear broken but no vendor town is reachable - staying put."
                     : "Travel: storage work is ready but no safe town is reachable - staying put.");
+                return;
+            }
+
+            // IN TOWN, STILL SHORT, AND THE TRIP NEVER TRADED: stay and let it run again rather
+            // than choose a hunting ground. The trip that brought us here was cut short (the low
+            // health rule, a stuck walk), so nothing was bought - Sindo left Banya Village this way
+            // with no scrolls. A trip that DID trade and is still short cannot be helped by
+            // waiting, so that case goes on to the ordinary choice as before.
+            if (_brain.Town != null && !_brain.Town.LastTripTraded &&
+                (_brain.Town.ShortOfSupplies || _brain.Town.NeedsVendor) &&
+                _host.Vendors.TownMaps.Contains(world.MapIndex))
+            {
+                _log.Write("Travel: the last town trip was cut short before trading and we are " +
+                           "still short - staying in town for the trip to run again.");
                 return;
             }
 
@@ -1049,6 +1102,16 @@ namespace MirBot
                 Affordable, Permitted, gearFocus)
                 ? Math.Max(Config.ExploreChancePercent, Config.UpgradeExploreChancePercent)
                 : Config.ExploreChancePercent;
+
+            // An unmeasured map that drops a wanted book can only ever be reached by exploring -
+            // the exploit list holds measured maps alone - so it gets the book-goal chance to be
+            // looked at. TryExplore then applies the same book-versus-ordinary split as exploiting.
+            bool bookToExplore = HasSafeUnmeasuredBookMap(world, mirClass, hops,
+                Affordable, Permitted);
+            if (bookToExplore)
+                exploreChance = Math.Max(exploreChance, _profitPolicy?.Active == true
+                    ? Config.LossBookHuntChancePercent
+                    : Config.BookHuntChancePercent);
             bool wantExplore = known < Config.ExploreUntilMapsKnown ||
                                _random.Next(100) < exploreChance;
 
@@ -1123,9 +1186,9 @@ namespace MirBot
             // the time (20% under loss watch), but force an ordinary goal after two book-priority
             // decisions. Within the chosen pool the existing XP/death weighting still decides.
             List<HuntingEntry> bookCandidates = candidates
-                .Where(x => _host.BookDrops.Supplies(x.MapIndex, wantedBooks) > 0).ToList();
+                .Where(x => BookSupply(x.MapIndex, wantedBooks) > 0).ToList();
             List<HuntingEntry> ordinaryCandidates = candidates
-                .Where(x => _host.BookDrops.Supplies(x.MapIndex, wantedBooks) == 0).ToList();
+                .Where(x => BookSupply(x.MapIndex, wantedBooks) == 0).ToList();
             bool bookGoal = HuntingGoalChoice.PursueBook(bookCandidates.Count > 0,
                 ordinaryCandidates.Count > 0, _profitPolicy?.Active == true,
                 _consecutiveBookHunts, Config.BookHuntChancePercent,
@@ -1159,7 +1222,7 @@ namespace MirBot
                     _random, out double chance);
                 HuntingEntry pick = candidates[index];
 
-                int supplies = _host.BookDrops.Supplies(pick.MapIndex, wantedBooks);
+                int supplies = BookSupply(pick.MapIndex, wantedBooks);
                 GearTarget pickedGear = !bookGoal && gearTargets.TryGetValue(pick.MapIndex,
                     out GearTarget target) ? target : null;
 
@@ -1171,14 +1234,14 @@ namespace MirBot
                       $"{deathPenalty:P0}" +
                       (bookCandidates.Count > 0 ? $"; {bookChance}% book-goal chance" : "") +
                       (supplies > 0
-                          ? $"; drops {_host.BookDrops.Names(pick.MapIndex, wantedBooks)}"
+                          ? $"; drops {BookNames(pick.MapIndex, wantedBooks)}"
                           : "") +
                       (pickedGear != null ? $"; {GearChoiceReason(pickedGear)}" : ""),
                       displayReason: pickedGear != null
                           ? GearChoiceReason(pickedGear)
                           : supplies > 0
                           ? $"looking for {supplies} skill book(s): " +
-                            _host.BookDrops.Names(pick.MapIndex, wantedBooks)
+                            BookNames(pick.MapIndex, wantedBooks)
                           : $"hunting score {weights[index]:N0}; " +
                             $"{pick.AverageExperiencePerHour:N0} XP/hour average");
                 _consecutiveBookHunts = bookGoal ? _consecutiveBookHunts + 1 : 0;
@@ -1254,6 +1317,71 @@ namespace MirBot
             return false;
         }
 
+        /// <summary>
+        /// DeeperUnmeasuredFloor, except for a floor that supplies a wanted book in a cave the
+        /// character has outgrown.
+        ///
+        /// Summon Shinsu (level 30) and Summon Jin Skeleton (level 33) drop only from the Skeleton
+        /// Lord and the Ghoul Champion, and those live only on the Lv 3 floors of Banya Cave,
+        /// Bichon Cave, Lost Paradise Cave and Deserted Mine. Both level 34-35 Taoists had a
+        /// shallower floor of every one of those caves unmeasured at their level, so the Lv 3 was
+        /// held back before the book goal ever saw it - the rule is written for caves that are a
+        /// fight, and these have a median monster level of 18-20.
+        /// </summary>
+        private bool HeldBackFloor(int mapIndex, HashSet<int> measured, Dictionary<int, int> hops,
+            WorldModel world, HashSet<int> wantedBooks)
+        {
+            if (!DeeperUnmeasuredFloor(mapIndex, measured, hops)) return false;
+            if (BookSupply(mapIndex, wantedBooks) <= 0) return true;
+
+            int median = _host.Profiles.For(mapIndex)?.MedianLevel ?? int.MaxValue;
+            return median > world.Level - Config.ExploreLevelsAbove;
+        }
+
+        /// <summary>
+        /// How far above our level a map's typical monster may be for us to explore it: the usual
+        /// ExploreLevelsAbove, plus BookExploreExtraLevels where it drops a skill book we want.
+        /// Destructive Surge, Defiance and Interchange drop only in Desert Dungeon and the
+        /// Underground maps - effective level about 55 - which no bot would otherwise try before
+        /// level 52, while players take them at 40-45.
+        /// </summary>
+        private int ExploreReach(int mapIndex, HashSet<int> wantedBooks) =>
+            Config.ExploreLevelsAbove +
+            (BookSupply(mapIndex, wantedBooks) > 0 ? Math.Max(0, Config.BookExploreExtraLevels) : 0);
+
+        /// <summary>
+        /// Is there a wanted-book map that exploration would accept? Mirrors TryExplore's
+        /// filters; used only to raise the chance of exploring, as a gear source does.
+        /// </summary>
+        private bool HasSafeUnmeasuredBookMap(WorldModel world, string mirClass,
+            Dictionary<int, int> hops, AffordableCheck affordable, Func<int, bool> permitted)
+        {
+            HashSet<int> wantedBooks = WantedDropOnlyBooks(world);
+            if (wantedBooks.Count == 0) return false;
+
+            HashSet<int> measured = new HashSet<int>(_host.Hunting.Best(mirClass,
+                world.Level, 500, Config.HuntingDeathPenaltyPercent / 100.0)
+                .Select(entry => entry.MapIndex));
+            HashSet<int> lethal = _host.Hunting.Lethal(mirClass, world.Level);
+
+            foreach (int map in hops.Keys)
+            {
+                if (BookSupply(map, wantedBooks) <= 0) continue;
+                if (map == world.MapIndex || measured.Contains(map) || lethal.Contains(map) ||
+                    !permitted(map) || _host.Danger.TooDangerous(map, world.MaxHealth) ||
+                    !_host.Profiles.WorthExploring(map, world.Level,
+                        ExploreReach(map, wantedBooks), out _) ||
+                    _host.Profiles.OutgrownBy(map, world.Level, Config.HuntLevelsBelow, out _) ||
+                    !affordable(map, out _) ||
+                    OutgrownShoppingTown(world, map, wantedBooks, out _) ||
+                    HeldBackFloor(map, measured, hops, world, wantedBooks)) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
         private bool HasSafeUnmeasuredGearMap(WorldModel world, string mirClass,
             Dictionary<int, int> hops, AffordableCheck affordable,
             Func<int, bool> permitted, bool gearFocus)
@@ -1287,12 +1415,24 @@ namespace MirBot
             int level, double deathPenalty)
         {
             double score = _host.Hunting.Ranked(entry, level, deathPenalty);
-            int supplies = _host.BookDrops.Supplies(entry.MapIndex, wanted);
+            int supplies = BookSupply(entry.MapIndex, wanted);
 
             if (supplies <= 0) return score;
 
             return score * (1 + Config.BookHuntBonusPercent / 100.0 * supplies);
         }
+
+        /// <summary>
+        /// How many wanted books this map supplies - unlearned skills and level 4 training copies
+        /// alike. Training books deliberately count on the early caves too: that is where most of
+        /// them drop, and the book-versus-ordinary split (BookHuntChancePercent,
+        /// MaxConsecutiveBookHunts) is what keeps a bot from living there.
+        /// </summary>
+        private int BookSupply(int mapIndex, HashSet<int> wanted) =>
+            _host.BookDrops.Supplies(mapIndex, wanted);
+
+        private string BookNames(int mapIndex, HashSet<int> wanted) =>
+            _host.BookDrops.Names(mapIndex, wanted);
 
         private HashSet<int> WantedDropOnlyBooks(WorldModel world) =>
             Config.BookHuntBonusPercent > 0
@@ -1306,14 +1446,182 @@ namespace MirBot
             int median = profile?.MedianLevel ?? 0;
             bool defer = HuntingTownPolicy.Defer(_host.Vendors.TownMaps.Contains(mapIndex),
                 median, world.Level, Config.TownHuntLevelGap, world.Gold < Config.PoorGold,
-                _recovery.Active, _host.BookDrops.Supplies(mapIndex, wantedBooks) > 0);
+                _recovery.Active, BookSupply(mapIndex, wantedBooks) > 0);
             why = defer ? $"typical monster level {median} is far below level {world.Level}" : "";
             return defer;
+        }
+
+        /// <summary>When this bot last swung or cast at each object - set on the bot thread,
+        /// read on the socket thread when something dies.</summary>
+        private readonly ConcurrentDictionary<uint, DateTime> _attackedAt =
+            new ConcurrentDictionary<uint, DateTime>();
+
+        private volatile BossKillEntry _lastBossKill;
+
+        /// <summary>
+        /// The rule that separates mini-bosses from bosses in System.db, which has no flag for it:
+        /// at least two spawns on the map, all returning within an hour.
+        /// </summary>
+        private static bool IsMiniBoss(IReadOnlyList<BossLair> lairsOnMap, int monsterIndex)
+        {
+            List<BossLair> mine = lairsOnMap.Where(l => l.MonsterIndex == monsterIndex).ToList();
+            return mine.Count > 0 && mine.Sum(l => l.Spawns) >= 2 &&
+                   mine.All(l => l.RespawnMinutes <= 60);
+        }
+
+        /// <summary>
+        /// A monster died in view. Logged as a boss kill when it is boss-flagged and this bot hit
+        /// it in the last 30 seconds. Classified as a mini-boss by the rule that separates them in
+        /// System.db (there is no flag): several spawns that return within the hour.
+        /// </summary>
+        private void NoteObjectDied(uint objectID)
+        {
+            if (!_attackedAt.TryRemove(objectID, out DateTime hit) ||
+                DateTime.UtcNow - hit > TimeSpan.FromSeconds(30))
+            {
+                if (_attackedAt.Count > 500) _attackedAt.Clear();
+                return;
+            }
+
+            WorldModel world = _connection?.World;
+            WorldObject ob = world?.Objects.FirstOrDefault(x => x.ObjectID == objectID);
+            MonsterInfo info = ob == null ? null : BotConnection.Monsters?.Find(ob.MonsterIndex);
+            if (info == null || !info.IsBoss) return;
+
+            bool mini = IsMiniBoss(_host.BossLairs.On(world.MapIndex), info.Index);
+
+            // Whatever is already on the floor around it is not this boss's drop. The drop
+            // itself arrives as S.ObjectItem just after S.ObjectDied, so it is read a moment later
+            // on the bot thread - see WatchBossDrops.
+            HashSet<uint> before = new HashSet<uint>(world.Objects
+                .Where(x => x.Kind == ObjectKind.Item &&
+                            WorldModel.Distance(x.Location, ob.Location) <= BossDropRadius)
+                .Select(x => x.ObjectID));
+
+            _lastBossKill = _host.BossKills.Record(new BossKillEntry
+            {
+                Bot = Id, Character = world.Name, Class = world.Class.ToString(),
+                Level = world.Level, Monster = info.MonsterName ?? ob.Name,
+                Kind = mini ? "mini-boss" : "boss", MapIndex = world.MapIndex,
+                Map = world.MapName, X = ob.Location.X, Y = ob.Location.Y, Utc = DateTime.UtcNow
+            });
+            _log.Write($"Boss kill: {info.MonsterName} ({(mini ? "mini-boss" : "boss")}) on " +
+                       $"{world.MapName} at {ob.Location.X},{ob.Location.Y}.");
+
+            _dropWatch = new BossDropWatch
+            {
+                Entry = _lastBossKill, MapIndex = world.MapIndex, Centre = ob.Location,
+                Before = before, CaptureAt = DateTime.UtcNow.AddSeconds(2),
+                Until = DateTime.UtcNow.AddMinutes(4)
+            };
+        }
+
+        private const int BossDropRadius = 8;
+
+        private sealed class BossDropWatch
+        {
+            public BossKillEntry Entry;
+            public int MapIndex;
+            public Point Centre;
+            public HashSet<uint> Before;
+            public DateTime CaptureAt, Until;
+            public bool Captured;
+            public readonly Dictionary<uint, (BossDrop Drop, Point At)> Drops =
+                new Dictionary<uint, (BossDrop, Point)>();
+        }
+
+        private volatile BossDropWatch _dropWatch;
+
+        /// <summary>Cells we sent C.PickUp on, and when - a pickup takes the whole cell.</summary>
+        private readonly Dictionary<Point, DateTime> _pickedUpAt = new Dictionary<Point, DateTime>();
+
+        /// <summary>
+        /// Build a boss kill's drop list and follow each item until it is taken or gone.
+        ///
+        /// Sindo's first Ghoul Champion read "health potions and bones", which could not say
+        /// whether the boss dropped rubbish or the bot walked past something good. The server
+        /// never names a drop's source, so the drop is whatever appears around the corpse in the
+        /// two seconds after it dies; each item is then "taken" when it vanishes within five
+        /// seconds of a pickup on its cell, "gone" when it vanishes otherwise, and "left" if it
+        /// is still there when the watch ends or we leave the map.
+        /// </summary>
+        private void WatchBossDrops(Decision decision)
+        {
+            WorldModel world = _connection.World;
+
+            if (decision?.Action == BotAction.Loot)
+                _pickedUpAt[world.Location] = DateTime.UtcNow;
+
+            BossDropWatch watch = _dropWatch;
+            if (watch == null) return;
+
+            DateTime now = DateTime.UtcNow;
+            bool changed = false;
+
+            if (!watch.Captured)
+            {
+                if (now < watch.CaptureAt) return;
+                watch.Captured = true;
+
+                foreach (WorldObject item in world.Objects)
+                {
+                    if (item.Kind != ObjectKind.Item || watch.Before.Contains(item.ObjectID)) continue;
+                    if (WorldModel.Distance(item.Location, watch.Centre) > BossDropRadius) continue;
+
+                    bool gold = item.ItemInfo?.ItemType == ItemType.Currency ||
+                                string.Equals(item.Name, "Gold", StringComparison.OrdinalIgnoreCase);
+                    watch.Drops[item.ObjectID] = (new BossDrop
+                    {
+                        Name = item.ItemInfo?.ItemName ?? item.Name ?? "item",
+                        Count = Math.Max(1, item.Item?.Count ?? 1),
+                        Gold = gold
+                    }, item.Location);
+                }
+
+                changed = true;
+            }
+
+            bool over = now > watch.Until || world.MapIndex != watch.MapIndex;
+            HashSet<uint> present = new HashSet<uint>(world.Objects
+                .Where(x => x.Kind == ObjectKind.Item).Select(x => x.ObjectID));
+
+            foreach (KeyValuePair<uint, (BossDrop Drop, Point At)> pair in watch.Drops)
+            {
+                BossDrop drop = pair.Value.Drop;
+                if (drop.Outcome != "left" || over || present.Contains(pair.Key)) continue;
+
+                drop.Outcome = _pickedUpAt.TryGetValue(pair.Value.At, out DateTime at) &&
+                               now - at <= TimeSpan.FromSeconds(5)
+                    ? "taken" : "gone";
+                changed = true;
+            }
+
+            if (changed || over)
+                _host.BossKills.SetDrops(watch.Entry, watch.Drops.Values.Select(x => x.Drop).ToList());
+
+            if (over)
+            {
+                BossDrop[] drops = watch.Drops.Values.Select(x => x.Drop).ToArray();
+                _log.Write($"Boss drop for {watch.Entry.Monster}: " + (drops.Length == 0
+                    ? "nothing seen on the ground"
+                    : string.Join(", ", drops.GroupBy(d => (d.Name, d.Outcome))
+                        .Select(g => $"{g.Key.Name}" +
+                                     (g.First().Gold ? $" {g.Sum(d => d.Count):N0}" :
+                                      g.Count() > 1 ? $" x{g.Count()}" : "") +
+                                     $" ({g.Key.Outcome})"))) + ".");
+                _dropWatch = null;
+                _pickedUpAt.Clear();
+            }
+
+            if (_pickedUpAt.Count > 200) _pickedUpAt.Clear();
         }
 
         private string _learningBook;
         private DateTime _learnAt;
         private int _magicsBeforeLearn;
+        private int _trainingMagic = -1;
+        private int _trainingLevelBefore;
+        private long _trainingPagesBefore;
 
         /// <summary>
         /// Did a book we tried to read actually teach us anything?
@@ -1330,18 +1638,71 @@ namespace MirBot
         {
             if (decision != null && decision.Action == BotAction.LearnBook)
             {
-                _learningBook = _connection.Items.InSlot(decision.PotionSlot)?.Info?.ItemName
-                                ?? $"slot {decision.PotionSlot}";
+                // A second book read before the first was judged would overwrite it: Jill read
+                // Spirit Sword then Poison Dust three seconds apart and the Spirit Sword outcome
+                // was never recorded. The server answers a read at once, so judge it now.
+                if (_learningBook != null) ResolvePendingLearn();
+
+                ItemInfo info = _connection.Items.InSlot(decision.PotionSlot)?.Info;
+                _learningBook = info?.ItemName ?? $"slot {decision.PotionSlot}";
                 _magicsBeforeLearn = _connection.World.KnownMagicCount;
                 _learnAt = DateTime.UtcNow;
+
+                // A book for a skill we already know is a level 4 training read.
+                MagicInfo magic = _brain.Books?.For(info);
+                _trainingMagic = magic != null && _connection.World.Knows(magic.Index) ? magic.Index : -1;
+                if (_trainingMagic >= 0)
+                {
+                    _trainingLevelBefore = _connection.World.MagicLevel(_trainingMagic);
+                    _trainingPagesBefore = _connection.World.MagicExperience(_trainingMagic);
+                }
                 return;
             }
 
             if (_learningBook == null) return;
             if (DateTime.UtcNow - _learnAt < TimeSpan.FromSeconds(3)) return;
 
+            ResolvePendingLearn();
+        }
+
+        private void ResolvePendingLearn()
+        {
             string book = _learningBook;
             _learningBook = null;
+
+            if (_trainingMagic >= 0)
+            {
+                WorldModel world = _connection.World;
+                int level = world.MagicLevel(_trainingMagic);
+                long pages = world.MagicExperience(_trainingMagic);
+
+                if (level > _trainingLevelBefore)
+                {
+                    _log.Write($"Trained {book} to skill level {level}.");
+                    RecordSkillAttempt($"{book} (level {level})", true);
+                }
+                else if (pages > _trainingPagesBefore)
+                {
+                    _log.Write($"Trained {book}: +{pages - _trainingPagesBefore} pages, " +
+                               $"{pages} of {(level - 2) * 500} for level {level + 1}.");
+                    _host.Progress.Record(new ProgressEntry
+                    {
+                        Kind = "skill", Bot = Id, Character = world.Name,
+                        Class = world.Class.ToString(), Utc = _learnAt,
+                        Skill = $"{book} (+{pages - _trainingPagesBefore} pages, " +
+                                $"{pages}/{(level - 2) * 500})",
+                        Success = true
+                    });
+                }
+                else
+                {
+                    _log.Write($"Training read of {book} failed its learn roll - the book is gone.");
+                    RecordSkillAttempt($"{book} (level {level + 1} pages)", false);
+                }
+
+                _trainingMagic = -1;
+                return;
+            }
 
             if (_connection.World.KnownMagicCount > _magicsBeforeLearn)
             {
@@ -1428,7 +1789,7 @@ namespace MirBot
                 if (_host.Danger.TooDangerous(mapIndex, world.MaxHealth)) continue;
 
                 if (!_host.Profiles.WorthExploring(mapIndex, world.Level,
-                        Config.ExploreLevelsAbove, out _))
+                        ExploreReach(mapIndex, wantedHere), out _))
                 {
                     tooStrong++;
                     continue;
@@ -1491,7 +1852,7 @@ namespace MirBot
             // already been measured. Explore Lv 1, learn what it is worth, and Lv 2 becomes
             // available on the next decision.
             int deeper = options.RemoveAll(mapIndex =>
-                DeeperUnmeasuredFloor(mapIndex, measured, hops));
+                HeldBackFloor(mapIndex, measured, hops, world, wantedHere));
 
             // Nearer before further - measured from TOWN, not from where the bot is standing.
             //
@@ -1513,9 +1874,9 @@ namespace MirBot
             // zero-hop town, or conversely the old hard book filter chooses books 100% of the
             // time and defeats the configured 70%/20% preference.
             List<int> bookMaps = options
-                .Where(x => _host.BookDrops.Supplies(x, wantedHere) > 0).ToList();
+                .Where(x => BookSupply(x, wantedHere) > 0).ToList();
             List<int> ordinaryMaps = options
-                .Where(x => _host.BookDrops.Supplies(x, wantedHere) == 0).ToList();
+                .Where(x => BookSupply(x, wantedHere) == 0).ToList();
             bool bookGoal = HuntingGoalChoice.PursueBook(bookMaps.Count > 0,
                 ordinaryMaps.Count > 0, _profitPolicy?.Active == true,
                 _consecutiveBookHunts, Config.BookHuntChancePercent,
@@ -1713,6 +2074,11 @@ namespace MirBot
 
             if (resume == null) return false;
 
+            // Not while the trip that interrupted it still has work: a trip cut short by the
+            // low-health rule used to hand straight back to the journey, and Sindo walked into
+            // Deserted Mine Lv 3 with no scrolls and nothing bought. The resume waits.
+            if (_town != null && (_town.ShortOfSupplies || _town.NeedsVendor)) return false;
+
             if (_connection.World.MapIndex == resume.MapIndex ||
                 DateTime.UtcNow - resume.FirstFailureUtc >
                     TimeSpan.FromMinutes(Config.JourneyRetryWindowMinutes))
@@ -1796,6 +2162,8 @@ namespace MirBot
         /// every twenty minutes or so. The Mir 2 agents instead re-pick on a bare hourly clock,
         /// which can fire in the middle of anything.
         /// </summary>
+        private DateTime _nextTownNeedTravel = DateTime.MinValue;
+
         private void ConsiderTravel()
         {
             bool active = _town != null && _town.Active;
@@ -1820,13 +2188,28 @@ namespace MirBot
             // A storage-only trip can begin and abort in the same tick when no town scroll is in
             // the bag, so tripJustFinished never observes an active phase. Promote the published
             // storage need directly into a journey to the nearest safe town instead.
+            //
+            // The same is true of a full bag, broken gear and running out of potions, and it was
+            // only ever handled for storage: Sindo sat in Deserted Mine Lv 3 at 48 of 48 slots with
+            // no town scroll for over an hour, the trip logging "no town scroll to reach one" and
+            // nothing ever walking it out. Rate-limited because, unlike storage, a bot may have no
+            // reachable town and must not re-plan every tick.
+            if (_town != null && _town.WalkToTownRequested && _connection != null &&
+                _host.Vendors.TownMaps.Contains(_connection.World.MapIndex))
+                _town.WalkToTownRequested = false;
+
+            bool townNeed = _town != null &&
+                            (_town.NeedsStorage || _town.NeedsVendor || _town.ShortOfSupplies ||
+                             _town.WalkToTownRequested);
             bool storageTravel = !active &&
                                  _connection != null &&
                                  _connection.Stage == BotStage.InGame &&
                                  !_connection.World.Dead &&
-                                 _town != null && _town.NeedsStorage &&
+                                 townNeed &&
+                                 DateTime.UtcNow >= _nextTownNeedTravel &&
                                  (_brain?.Travel == null || !_brain.Travel.Active) &&
                                  !_host.Vendors.TownMaps.Contains(_connection.World.MapIndex);
+            if (storageTravel) _nextTownNeedTravel = DateTime.UtcNow.AddSeconds(30);
 
             // Standing somewhere with nothing to kill.
             //
@@ -2090,10 +2473,10 @@ namespace MirBot
 
         private string BookChoiceReason(int mapIndex, HashSet<int> wanted, bool exploring)
         {
-            int count = _host.BookDrops.Supplies(mapIndex, wanted);
+            int count = BookSupply(mapIndex, wanted);
             return $"{(exploring ? "exploring for" : "looking for")} {count} skill " +
                    $"{(count == 1 ? "book" : "books")}: " +
-                   _host.BookDrops.Names(mapIndex, wanted);
+                   BookNames(mapIndex, wanted);
         }
 
         private int MapTripKillProxy() => _mapTrip == null || !_mapTrip.ArrivedUtc.HasValue ||
@@ -2967,14 +3350,16 @@ namespace MirBot
 
                 MagicInfo info = magic.Info;
 
-                // The threshold for the NEXT skill level, not the current one. Level 3 is the cap,
-                // so there is no next and both figures are reported as zero rather than as a bar
-                // that can never fill.
+                // The threshold for the NEXT skill level, not the current one. Levels 1-3 come from
+                // use; level 4 (Globals.MagicMaxLevel) only from reading dropped books at level 3,
+                // where Experience counts book pages against (level - 2) * 500. At 4 there is no
+                // next and both figures are zero rather than a bar that can never fill.
                 long next = magic.Level switch
                 {
                     0 => info.Experience1,
                     1 => info.Experience2,
                     2 => info.Experience3,
+                    _ when magic.Level < Globals.MagicMaxLevel => (magic.Level - 2) * 500L,
                     _ => 0
                 };
 

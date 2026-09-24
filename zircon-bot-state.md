@@ -98,6 +98,75 @@ backup and validation detail is in [zircon-npc-authoring.md](zircon-npc-authorin
   band, no has-paid exemption), capped at 1,500. `Lethal()`/`Avoid` and hunting choice unchanged.
   `--check-travel` accepts `"Origin@x,y>Destination"` and prints L42/2M-gold routes with leg costs.
   Map trips now close as `died on the way in <map> (<killer>)` or `died (<killer>)` at death.
+- **22:50 deploy (vendorless scroll landing, journey clock, Lv 3 book floors):** backup
+  `mirbot-deploy-backups/2026-09-23-trip-books`, host PID 12188.
+  1. The Hexa Stone route walks through Sabuk Keep's safe zone, so the town scroll then binds
+     there - no vendors. Mirbot scrolled out of Ant Cave North at 45/48 slots, the trip aborted
+     "landed on Sabuk Keep with nothing to do there" and travel went straight back to the cave.
+     New `TownTrip.NeedsVendor` (overweight/repairable/out of slots) joins ShortOfSupplies and
+     NeedsStorage in ConsiderTravel's "go to the nearest vendor town" rule.
+  2. `Journey`'s 30s no-progress clock ran during town trips (Banking/Returning return null
+     ticks, so the brain fell through to `Travel.Next`), giving "stuck 197 tiles" after every
+     shop and then a forced scroll trip. The brain now skips the journey while `Town.Active`
+     and calls `Journey.Hold()`.
+  3. Summon Shinsu (L30) and Summon Jin Skeleton (L33) drop 1/20 only from Skeleton Lord (Bichon,
+     Banya, Lost Paradise Cave Lv 3) and Ghoul Champion (Deserted Mine Lv 3), both IsBoss L250.
+     Taoists never saw them: exploit needs measured maps, and TryExplore held back Lv 3 because a
+     shallower floor was unmeasured at band 6. `HeldBackFloor` exempts a wanted-book floor whose
+     median is <= level - ExploreLevelsAbove, and a reachable one raises explore chance to the
+     book-hunt chance (`HasSafeUnmeasuredBookMap`).
+- **2026-09-24 07:0x deploy (boss books, skills, level 4):** backup
+  `mirbot-deploy-backups/2026-09-24-boss-books`. 101 tests.
+  - Charged warrior skills: Blade Storm / Dragon Rise / Flaming Sword need C.MagicToggle to arm
+    the next swing (mana + cooldown, 12s); SkillSet.PendingCharge sends it in contact, and
+    ChooseAttackMagic names charges first, then Destructive Surge over Half Moon. Shoulder Dash
+    excluded. Mirbot/Banner had Dragon Rise/Blade Storm at skill level 0 before this.
+  - Expel Undead (Wizard) via SpellBook.ChooseExpel: undead, non-boss, monster level < 70 and
+    <= ours - 2, target >= 50% HP, 2 tries per target (server instant-kill roll).
+  - Taoist summons: best of Jin Skeleton (2 amulets) > Shinsu (5) > Skeleton (1); added beside
+    a weaker pet (cap 2). NeedsAmulet covers the new summons.
+  - Level 4: a known level 3 skill + DROPPED book (not NonRefinable - bought books are refused)
+    judges Wanted; each successful read adds the book's durability as pages, 500 for level 4.
+    CheckPendingLearn logs "Trained X: +N pages". BookDropIndex now indexes every dropped book;
+    Wanted() adds trainable skills, which count on low caves too (operator's call).
+  - Loot: a wanted book on the floor (unlearned first, then training) is picked before anything.
+  - MapProfile.EffectiveLevel: labels above 60 (and bosses) re-estimated from HP and max DC/MC
+    against the <=60 curve; Desert Dungeon 68 -> 55, Underground 68 -> 56, endgame maps ~55-57
+    (server combat does not use monster level). `--maps` shows "(stated N)".
+  - Book maps may be explored up to ExploreLevelsAbove + BookExploreExtraLevels (10) above us.
+  - Boss lairs (BossLairIndex, 86 regions): on a map with a MINI-boss (>=2 spawns, <=60 min) that
+    drops a wanted book, roaming walks to its lair (checked again after its respawn time), a
+    visible one is targeted ahead of nearer monsters (not ahead of one hitting us), and the
+    journey loot filter applies while > 12 tiles from the lair. Tainted Terror/world bosses excluded.
+  - Boss kill log: boss-kills.json, /api/boss-kills, Info tab "Boss kills" (search/filters,
+    loot gained within 2 min). A kill = boss dies within 30s of this bot hitting it.
+  - Follow-up deploy (backup `2026-09-24-learn-fix`): Spirit Sword marked passive (it is the
+    Taoist Swordsmanship, accuracy on every swing), and a second book read now resolves the
+    pending one first (Jill's Spirit Sword read was overwritten by a Poison Dust read 3s later).
+    Jill's Spirit Sword was genuinely level 3 (112/500 pages); a consumed book on a known skill
+    proves level >= 3, since the server refuses below that without consuming it.
+  - Boss drop tracking (backup `2026-09-24-boss-drops`): at a boss death the ground items within
+    8 tiles are baselined; items new 2s later are its drop, each followed for 4 minutes as taken
+    (vanished within 5s of a C.PickUp on its cell) / gone / left. Stored as BossKillEntry.Dropped,
+    logged as "Boss drop for X: ...", shown in the Info tab's Dropped column. Context: this
+    server's Ghoul Champion drops no gear - 90,000 gold, 10x 1/4 Rejuvenation Potion, ~45 book
+    rolls (all classes, 1/10-1/50), oils; other classes' books are left unless worth 1,500+.
+  - Scrolls / stranded bots (backup `2026-09-24-scrolls`): Sindo spent its last scroll on the
+    "stuck, scroll clear" rule in Banya Village, the trip was cut short at 35% HP, and the journey
+    resume sent it to Deserted Mine Lv 3 with no scrolls; there it filled 48/48 slots and the
+    trip aborted every time ("no town scroll to reach one") because a trip that begins and aborts
+    in one tick was only promoted to travel for storage. Now: out of town scrolls is a supply
+    shortage (latched off if a completed trip still bought none); ConsiderTravel promotes
+    NeedsStorage/NeedsVendor/ShortOfSupplies/WalkToTownRequested (30s rate limit); NeedsVendor
+    on slots needs something disposable; TryResumeJourney waits while supplies/vendor are needed;
+    StartTravel stays in town when the last trip never traded (TownTrip.LastTripTraded) and is
+    still short. The Town button sets WalkToTownRequested, so without a scroll it walks.
+    Deploy gotcha: Copy-Item right after Stop-Process can hit a still-locked MirBot.dll; copy
+    with retry and start only when all three hashes match. Stops sent while bots are still
+    logging in are ignored - wait for Playing before stopping.
+  - LOMCN vs ZirconBuild System.db: same 173 magics/levels; 10 differ only in School; Summon
+    Skeleton SOLD vs drop-only, Scorched Earth the reverse. Cross Half Moon exists in neither DB
+    nor in `LibraryCore/Enum.cs` MagicType.
   Verified live at 22:11: Mirbot to Zuma Temple planned `Banya Village to Sabuk Keep via Hexa
   Holy Stone for 3,000 gold`. 93/93 tests (3 new `RoutePlanningTests`); backups in
   `2026-09-23-route-cost`; host PID 50052.

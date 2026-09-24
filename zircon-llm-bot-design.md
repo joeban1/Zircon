@@ -794,9 +794,11 @@ refuses every route (see above). Two routes forward:
 **Built.** `WorldGraph` reads `MovementInfo` at startup — **554 exits across 195 maps, 0 unusable**,
 with each source region's bitmap decoded to concrete walkable cells using the map width. Level gates,
 class gates and exits needing an item or an instance are excluded *while planning*, so the bot never
-walks into one and bounces. `Journey` runs breadth-first over maps for the sequence of transitions
-and plain A* for each leg, re-planned on arrival because the server drops the player at a random
-point inside the destination region.
+walks into one and bounces. `Journey` plans the sequence of transitions with a cost search over
+maps (originally breadth-first; since 2026-09-23 it weighs estimated tiles walked, +15 per hop,
+teleport fares against gold held, and this class's recorded deaths on each map crossed - see
+`WorldGraph.Route`) and plain A* for each leg, re-planned on arrival because the server drops the
+player at a random point inside the destination region.
 
 Verify without sending a character anywhere:
 
@@ -811,7 +813,7 @@ has none from Bichon, which is why the vendor whitelist matters.
 dialogue tree the same way `VendorDirectory` does, looking for `NPCActionType.Teleport` with a
 `MapParameter1` (instance teleports are skipped — the server refuses to move between instances).
 Destination, landing cell, button path, level gate and price all come out of `System.db` at startup,
-and each route is registered as an extra `MapExit` so one breadth-first search weighs a paid hop
+and each route is registered as an extra `MapExit` so one route search weighs a paid hop
 against the walk instead of the two being planned separately. `Journey` executes such a leg as a
 conversation — walk into talking range, `C.NPCCall`, replay the recorded button path, wait for the
 map change — rather than as a step onto a trigger cell.
@@ -877,7 +879,10 @@ proc was armed and then thrown away. Three traps:
 - **Swordsmanship must never be named.** It is an `AttackSkill` and it does apply on every swing, but
   its `AttackCast` never sets `Cast`, so requesting it is rejected. It needs no bot support at all.
 - Sustained toggles — Thrusting, HalfMoon, DestructiveSurge, FlameSplash — are set once with
-  `C.MagicToggle` and stay on. The one-shot kind cost mana per arm.
+  `C.MagicToggle` and stay on. The one-shot kind — Blade Storm, Dragon Rise, Flaming Sword — cost
+  mana per arm: each `C.MagicToggle` pays, starts the cooldown and arms the next swing for 12
+  seconds. Built 2026-09-24 as `SkillSet.PendingCharge`, sent only while in contact; a swing names
+  an armed charge first, then Destructive Surge over Half Moon. Shoulder Dash is left out.
 
 *Cast skills* — Fire Ball and everything a wizard actually does — go through `C.Magic`, and are now
 **built** in `SpellBook`. Until this, a wizard would walk to town, spend its gold on a spell book,
