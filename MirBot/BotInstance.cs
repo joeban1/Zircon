@@ -899,9 +899,30 @@ namespace MirBot
                 return;
             }
 
-            _log.Write($"Do quests: heading for {map.Description}.");
-            StartTravel(map.Index.ToString());
+            // Walking there from a hunting map is the wrong way round: the first press did exactly
+            // that from the Desert, and the journey sat on "hostiles in contact" for as long as the
+            // map kept spawning. Go home the way the Town button does - a scroll if one is
+            // carried, the walk-to-town fallback if not, and a shop on the way - then head for the
+            // quest NPC when the trip ends (ConsiderTravel, _questRequestPending).
+            _questRequestPending = true;
+            _questRequestAt = DateTime.UtcNow;
+
+            if (_town != null)
+            {
+                _log.Write($"Do quests: going to town first, then {map.Description}.");
+                _town.Force();
+            }
+            else
+            {
+                _questRequestPending = false;
+                _log.Write($"Do quests: heading for {map.Description}.");
+                StartTravel(map.Index.ToString());
+            }
         }
+
+        /// <summary>Do quests was pressed away from the quest NPC: travel there after the town trip.</summary>
+        private bool _questRequestPending;
+        private DateTime _questRequestAt;
 
         private void StartTravel(string requestedMap = null)
         {
@@ -2478,6 +2499,27 @@ namespace MirBot
                 barren = false;
                 outgrownHere = false;
                 unproductive = false;
+            }
+
+            // DO QUESTS, second half: the town trip it forced is over (or never started - no
+            // scroll, so the walk-to-town path wanted to fire instead), so head for the quest NPC.
+            if (_questRequestPending && !active && _connection != null &&
+                _connection.Stage == BotStage.InGame && !_connection.World.Dead)
+            {
+                MapInfo questMap = _questErrand?.QuestNpcMap;
+
+                if (questMap == null || _connection.World.MapIndex == questMap.Index)
+                    _questRequestPending = false;          // there already: the errand takes over
+                else if (tripJustFinished || storageTravel ||
+                         DateTime.UtcNow - _questRequestAt > TimeSpan.FromMinutes(2))
+                {
+                    _questRequestPending = false;
+                    _town?.ClearReturn();
+                    if (_town != null) _town.WalkToTownRequested = false;
+                    _log.Write($"Do quests: heading for {questMap.Description}.");
+                    StartTravel(questMap.Index.ToString());
+                    return;
+                }
             }
 
             if (!tripJustFinished && !barren && !outgrownHere && !storageTravel &&
