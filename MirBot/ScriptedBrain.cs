@@ -1630,8 +1630,13 @@ namespace MirBot
         private bool TrySteer(Decision decision, WorldModel world, Point destination, int goalRange,
             int straightDistance, bool ignoreCreatures = false, string routeKind = "move")
         {
+            // Only a journey's own leg may walk onto a map exit. Anything else steered while a
+            // journey merely EXISTS - held by a quest errand or a town trip - must still treat
+            // doors as walls. See Steer.
+            _steeringJourney = routeKind == "travel";
             bool steered = Steer(decision, world, destination, goalRange, straightDistance,
                 ignoreCreatures, out List<Point> path);
+            _steeringJourney = false;
 
             if (steered)
             {
@@ -1645,6 +1650,9 @@ namespace MirBot
 
         private Point[] _route = Array.Empty<Point>();
         private string _routeKind = "";
+
+        /// <summary>True only while TrySteer is steering a journey leg (routeKind "travel").</summary>
+        private bool _steeringJourney;
         private DateTime _routeAt = DateTime.MinValue;
 
         /// <summary>
@@ -1743,7 +1751,15 @@ namespace MirBot
                 //
                 // Travel.Active is our version of that gate: a journey walks ONTO an exit on
                 // purpose, and its aim is a cell of the very exit this would otherwise forbid.
-                if (Exits != null && _config.AvoidMapExits && (Travel == null || !Travel.Active))
+                //
+                // But only the JOURNEY's own steps (_steeringJourney). The gate used to be the
+                // mere existence of a journey, and a journey held by a quest errand is still
+                // Active: Wizzler, quest-hunting in Banya Village with a Deserted Mine journey on
+                // hold, walked to a Chestnut Tree across the Banya Cave entrance - then the held
+                // journey stepped it back out, the errand walked it back in, 4,328 map changes
+                // in 2h45m and not one kill.
+                if (Exits != null && _config.AvoidMapExits &&
+                    (Travel == null || !Travel.Active || !_steeringJourney))
                 {
                     HashSet<Point> doors = Exits.ExitCellsOn(world.MapIndex);
 
