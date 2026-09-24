@@ -343,6 +343,14 @@ namespace MirBot
         public int TownHuntLevelGap = 10;
         public bool AoeEnabled = true;
         public int AoeMinimumTargets = 3;
+        // Class-specific override: every area spell the bot aims (AoeGeometry.Shapes) is a
+        // Wizard's, and a wizard's area cast on two monsters already beats Expel Undead or a
+        // single-target spell on one of them. Other classes use AoeMinimumTargets.
+        public int AoeMinimumTargetsWizard = 2;
+
+        /// <summary>The area-cast threshold for this character's class.</summary>
+        public int AoeMinimumFor(Library.MirClass mirClass) => Math.Clamp(
+            mirClass == Library.MirClass.Wizard ? AoeMinimumTargetsWizard : AoeMinimumTargets, 1, 10);
         public int LossWatchHours = 4;
         public long LossWatchDropGold = 20000;
         public long LossWatchRecoverGold = 20000;
@@ -1063,6 +1071,7 @@ namespace MirBot
                 case "huntingdeathpenaltypercent": config.HuntingDeathPenaltyPercent = int.Parse(value); break;
                 case "aoeenabled": config.AoeEnabled = bool.Parse(value); break;
                 case "aoeminimumtargets": config.AoeMinimumTargets = int.Parse(value); break;
+                case "aoeminimumtargetswizard": config.AoeMinimumTargetsWizard = int.Parse(value); break;
                 case "huntingpickweightpower": config.HuntingPickWeightPower = int.Parse(value); break;
                 case "bookhuntchancepercent": config.BookHuntChancePercent = int.Parse(value); break;
                 case "lossbookhuntchancepercent": config.LossBookHuntChancePercent = int.Parse(value); break;

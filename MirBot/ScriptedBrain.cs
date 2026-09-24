@@ -1164,7 +1164,7 @@ namespace MirBot
                 // EXPEL IS ONE KILL; AN AREA SPELL IS SEVERAL. Expel Undead was checked first and
                 // always offered on an undead pack, so Wizzler single-targeted a floor of ghosts
                 // for twenty minutes with its area spells idle. Only when no area aim covers
-                // enough of them (AoeMinimumTargets) is the instant kill the better cast.
+                // enough of them (AoeMinimumFor the class) is the instant kill the better cast.
                 bool areaAvailable = !FrugalRecoveryCombat &&
                     Spells.ChooseArea(world, target, Maps?.For(world.MapIndex)) != null;
                 ClientUserMagic expel = FrugalRecoveryCombat || areaAvailable ? null :

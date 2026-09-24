@@ -468,7 +468,7 @@ namespace MirBot
             _areaReservations.RemoveAll(r => r.ExpiresUtc <= now);
 
             WorldObject[] hostiles = world.Objects.Where(x => x.IsValidTarget).ToArray();
-            if (hostiles.Length < Math.Clamp(_config.AoeMinimumTargets, 1, 10)) return null;
+            if (hostiles.Length < _config.AoeMinimumFor(world.Class)) return null;
             int floor = world.MaxMana * Math.Clamp(_config.SpellManaFloorPercent, 0, 90) / 100;
             int range = Math.Min(_config.CastRange, 10);
             AreaAim? best = null;
@@ -515,7 +515,7 @@ namespace MirBot
                         int covered = hostiles.Count(x => cells.Contains(x.Location) &&
                             (shape != AoeShape.Meteor || WorldModel.Distance(world.Location, x.Location) <= 10));
                         if (shape == AoeShape.Meteor) covered = Math.Min(covered, 6 + magic.Level);
-                        if (covered < Math.Clamp(_config.AoeMinimumTargets, 1, 10)) continue;
+                        if (covered < _config.AoeMinimumFor(world.Class)) continue;
                         if (best != null && (covered < best.Value.Covered ||
                             covered == best.Value.Covered && magic.Cost >= bestCost)) continue;
                         best = new AreaAim(magic, aim, direction, covered);
