@@ -48,6 +48,11 @@ namespace MirBot
         public LevelMemory Levels { get; private set; }
         public MapTripMemory MapTrips { get; private set; }
         public BossKillMemory BossKills { get; private set; }
+        public QuestLogMemory QuestLog { get; private set; }
+        public QuestBook Quests { get; } = new QuestBook();
+
+        /// <summary>The game store shopping list (Hunt Gold), per class.</summary>
+        public GameStore Store { get; } = new GameStore();
         public ProgressHistory Progress { get; private set; }
 
         /// <summary>Phone notifications; a disabled no-op until Prepare has run.</summary>
@@ -605,6 +610,15 @@ namespace MirBot
             Levels = new LevelMemory(Path.Combine(memory, "levels.json"));
             MapTrips = new MapTripMemory(Path.Combine(memory, "map-trips.json"));
             BossKills = new BossKillMemory(Path.Combine(memory, "boss-kills.json"));
+            QuestLog = new QuestLogMemory(Path.Combine(memory, "quest-log.json"));
+
+            // Host-wide like TownMaps: which NPCs' quests exist is a property of the server data.
+            Quests.Build(first.QuestNPCs);
+            foreach (string line in Quests.Report) Log.Write("Quests: " + line);
+
+            Store.Build(Library.Globals.StoreInfoList?.Binding);
+            foreach (string line in Store.Report) Log.Write("Store: " + line);
+
             Progress = new ProgressHistory(Path.Combine(memory, "progress.json"));
             Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));
             Xp = new XpLog(Path.Combine(memory, "xp.ndjson"));
@@ -1073,6 +1087,7 @@ namespace MirBot
             _status.IconPath = Path.Combine(MemoryFolder, "icons");
             _status.NotifyStatus = () => new { enabled = Notify.Enabled, recent = Notify.Recent() };
             _status.BossKills = take => BossKills.Snapshot(take);
+            _status.QuestLog = take => QuestLog.Snapshot(take);
             _status.NotifyTest = () =>
             {
                 if (!Notify.Enabled) return false;
@@ -1094,6 +1109,7 @@ namespace MirBot
                 Levels.FlushIfDue();
                 MapTrips.FlushIfDue();
                 BossKills.FlushIfDue();
+                QuestLog.FlushIfDue();
                 Progress.FlushIfDue();
                 Thread.Sleep(500);
             }
@@ -1157,6 +1173,7 @@ namespace MirBot
             Levels.Flush();
             MapTrips.Flush();
             BossKills.Flush();
+            QuestLog.Flush();
             Progress.Flush();
         }
 

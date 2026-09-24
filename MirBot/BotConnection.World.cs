@@ -37,6 +37,7 @@ namespace MirBot
         public void Process(S.ObjectPlayer p)
         {
             World.AddPlayer(p.ObjectID, p.Name, p.Location, p.Direction);
+            World.MarkSeen(p.ObjectID, asData: false);
         }
 
         public void Process(S.ObjectMonster p)
@@ -47,21 +48,25 @@ namespace MirBot
                 !string.IsNullOrEmpty(p.CustomName) ? p.CustomName : info?.MonsterName ?? "monster",
                 info?.AI ?? 0, p.Location, p.Direction, p.Dead,
                 p.PetOwner, p.MonsterIndex, p.Poison);
+            World.MarkSeen(p.ObjectID, asData: false);
         }
 
         public void Process(S.ObjectNPC p)
         {
             World.AddNPC(p.ObjectID, p.CurrentLocation, p.Direction);
+            World.MarkSeen(p.ObjectID, asData: false);
         }
 
         public void Process(S.ObjectItem p)
         {
             World.AddItem(p.ObjectID, p.Item?.Info?.ItemName ?? "item", p.Item?.Info, p.Item, p.Location);
+            World.MarkSeen(p.ObjectID, asData: false);
         }
 
         public void Process(S.DataObjectPlayer p)
         {
             World.AddPlayer(p.ObjectID, p.Name, p.CurrentLocation, MirDirection.Up);
+            World.MarkSeen(p.ObjectID, asData: true);
             World.ApplyHealthMana(p.ObjectID, p.Health, p.Mana, p.Dead);
             World.ApplyMaxHealthMana(p.ObjectID, p.MaxHealth, p.MaxMana);
         }
@@ -75,6 +80,7 @@ namespace MirBot
                 p.MonsterInfo?.AI ?? 0, p.CurrentLocation, MirDirection.Up, p.Dead,
                 p.PetOwner, p.MonsterIndex);
             World.ApplyHealthMana(p.ObjectID, p.Health, 0, p.Dead);
+            World.MarkSeen(p.ObjectID, asData: true);
         }
 
         /// <summary>A monster was tamed, released, or a summon's tame time ran out.</summary>
@@ -113,6 +119,7 @@ namespace MirBot
         public void Process(S.DataObjectItem p)
         {
             World.AddItem(p.ObjectID, p.ItemInfo?.ItemName ?? "item", p.ItemInfo, null, p.CurrentLocation);
+            World.MarkSeen(p.ObjectID, asData: true);
         }
 
         #endregion
@@ -199,12 +206,44 @@ namespace MirBot
 
         public void Process(S.ObjectRemove p)
         {
-            World.ApplyRemove(p.ObjectID);
-
             // Object ids are recycled. Anything the bot remembers ABOUT an id has to die with the
-            // object, or it silently applies to whatever inherits the number next.
-            OnObjectGone?.Invoke(p.ObjectID);
+            // object, or it silently applies to whatever inherits the number next - but only once
+            // it is really gone: a boss still shown through the data channel is not.
+            if (World.ApplyRemove(p.ObjectID)) OnObjectGone?.Invoke(p.ObjectID);
         }
+
+        /// <summary>
+        /// S.DataObjectRemove - unhandled until the quest work, which left every data-only object
+        /// (a Boss Tracking boss in particular) in the model for ever as a phantom target.
+        /// </summary>
+        public void Process(S.DataObjectRemove p)
+        {
+            WorldObject gone = World.ApplyDataRemove(p.ObjectID);
+            if (gone == null) return;
+
+            OnObjectGone?.Invoke(p.ObjectID);
+            OnDataObjectGone?.Invoke(gone);
+        }
+
+        /// <summary>A data-only object disappeared (e.g. a tracked boss when the buff ended).</summary>
+        public Action<WorldObject> OnDataObjectGone;
+
+        // ---- quests --------------------------------------------------------------------------
+
+        public void Process(S.QuestChanged p)
+        {
+            QuestTransition transition = World.ApplyQuestChanged(p.Quest);
+            if (transition != null) OnQuestChanged?.Invoke(transition);
+        }
+
+        public void Process(S.QuestCancelled p)
+        {
+            ClientUserQuest removed = World.RemoveQuest(p.Index);
+            if (removed != null) OnQuestCancelled?.Invoke(removed);
+        }
+
+        public Action<QuestTransition> OnQuestChanged;
+        public Action<ClientUserQuest> OnQuestCancelled;
 
         /// <summary>Raised when an object leaves our view, so per-object bookkeeping can be cleared.</summary>
         public Action<uint> OnObjectGone;
@@ -222,8 +261,14 @@ namespace MirBot
             // The server reports auto-path failures as a system chat line (Language.AutoPathNoRoute),
             // so without this the route silently never starts and the bot just stands there.
             if (p.Type == MessageType.System || p.Type == MessageType.Announcement)
+            {
                 Log($"[server] {p.Text}");
+                OnSystemChat?.Invoke(p.Text);
+            }
         }
+
+        /// <summary>A system chat line: the only way the server explains a refused store buy.</summary>
+        public Action<string> OnSystemChat;
 
         public void Process(S.NPCResponse p)
         {
@@ -1127,6 +1172,31 @@ namespace MirBot
 
                 case BotAction.NPCCall:
                     Enqueue(new C.NPCCall { ObjectID = decision.TargetID });
+                    break;
+
+                case BotAction.QuestAccept:
+                    Enqueue(new C.QuestAccept { Index = decision.QuestIndex });
+                    break;
+
+                case BotAction.QuestComplete:
+                    // None of the configured quests offers a choice; ChoiceIndex is ignored then.
+                    Enqueue(new C.QuestComplete { Index = decision.QuestIndex, ChoiceIndex = 0 });
+                    break;
+
+                case BotAction.UseItem:
+                    // Same path as a potion: TryItemUse owns the pending/cooldown rules.
+                    TryItemUse(decision.PotionSlot);
+                    break;
+
+                case BotAction.StoreBuy:
+                    // The reply packet is empty and sent before validation; StoreShopper settles
+                    // the purchase from the Hunt Gold balance instead.
+                    Enqueue(new C.MarketPlaceStoreBuy
+                    {
+                        Index = decision.StoreIndex,
+                        Count = 1,
+                        UseHuntGold = true
+                    });
                     break;
 
                 case BotAction.NPCButton:

@@ -56,6 +56,15 @@ namespace MirBot
 
         public DateTime LastSeen;
 
+        /// <summary>
+        /// How the server is showing us this object. It sends ordinary objects (S.ObjectMonster
+        /// etc.) for what is in view AND "data objects" (S.DataObjectMonster etc.) for what is in
+        /// view, grouped, or - with a Boss Tracking buff - every boss on the map. Each channel has
+        /// its own remove packet, so the object only goes when neither channel still shows it.
+        /// </summary>
+        public bool SeenNormally;
+        public bool SeenAsData;
+
         public bool IsLiveMonster => Kind == ObjectKind.Monster && !Dead;
 
         /// <summary>
@@ -173,6 +182,33 @@ namespace MirBot
         /// </summary>
         private readonly Dictionary<int, ClientBuffInfo> _buffs = new Dictionary<int, ClientBuffInfo>();
 
+        /// <summary>
+        /// When each buff's RemainingTime was last told to us. The server counts it down itself and
+        /// only sends S.BuffTime when it changes by other means, so the time left NOW is the
+        /// stored value minus what has elapsed - unless the buff is paused (safe zone).
+        /// </summary>
+        private readonly Dictionary<int, DateTime> _buffSyncedAt = new Dictionary<int, DateTime>();
+
+        /// <summary>Time left on a buff now; null for a permanent one.</summary>
+        public TimeSpan? BuffRemaining(ClientBuffInfo buff)
+        {
+            if (buff == null || buff.RemainingTime == TimeSpan.MaxValue) return null;
+            if (buff.Pause || !_buffSyncedAt.TryGetValue(buff.Index, out DateTime at))
+                return buff.RemainingTime;
+            TimeSpan left = buff.RemainingTime - (DateTime.UtcNow - at);
+            return left < TimeSpan.Zero ? TimeSpan.Zero : left;
+        }
+
+        /// <summary>An item buff from this item is running (paused counts).</summary>
+        public bool HasItemBuff(int itemIndex)
+        {
+            foreach (ClientBuffInfo buff in _buffs.Values)
+                if (buff.Type == BuffType.ItemBuff && buff.ItemIndex == itemIndex) return true;
+            return false;
+        }
+
+        private void SyncBuff(ClientBuffInfo buff) => _buffSyncedAt[buff.Index] = DateTime.UtcNow;
+
         public int BuffCount => _buffs.Count;
 
         public IEnumerable<ClientBuffInfo> Buffs => _buffs.Values;
@@ -188,10 +224,15 @@ namespace MirBot
         public void ResetBuffs(IEnumerable<ClientBuffInfo> buffs)
         {
             _buffs.Clear();
+            _buffSyncedAt.Clear();
 
             if (buffs != null)
                 foreach (ClientBuffInfo buff in buffs)
-                    if (buff != null) _buffs[buff.Index] = buff;
+                    if (buff != null)
+                    {
+                        _buffs[buff.Index] = buff;
+                        SyncBuff(buff);
+                    }
 
             Touch();
         }
@@ -201,11 +242,13 @@ namespace MirBot
             if (buff == null) return;
 
             _buffs[buff.Index] = buff;
+            SyncBuff(buff);
             Touch();
         }
 
         public void RemoveBuff(int index)
         {
+            _buffSyncedAt.Remove(index);
             if (_buffs.Remove(index)) Touch();
         }
 
@@ -222,6 +265,7 @@ namespace MirBot
             if (!_buffs.TryGetValue(index, out ClientBuffInfo buff)) return;
 
             buff.RemainingTime = time;
+            SyncBuff(buff);
             Touch();
         }
 
@@ -229,8 +273,67 @@ namespace MirBot
         {
             if (!_buffs.TryGetValue(index, out ClientBuffInfo buff)) return;
 
+            // Bank the time spent running before the pause flips, so the countdown stays right.
+            TimeSpan? left = BuffRemaining(buff);
+            if (left.HasValue) buff.RemainingTime = left.Value;
+            SyncBuff(buff);
             buff.Pause = paused;
             Touch();
+        }
+
+        // ---- quests ---------------------------------------------------------------------------
+
+        /// <summary>
+        /// The character's quest log, keyed by the USER quest's index - the one S.QuestCancelled
+        /// names - not by the QuestInfo definition. Seeded at login from StartInformation.Quests
+        /// and kept current by S.QuestChanged (accept, every counted kill, completion) and
+        /// S.QuestCancelled (the daily reset).
+        /// </summary>
+        private readonly Dictionary<int, ClientUserQuest> _quests = new Dictionary<int, ClientUserQuest>();
+
+        public IEnumerable<ClientUserQuest> Quests => _quests.Values;
+
+        public void ResetQuests(IEnumerable<ClientUserQuest> quests)
+        {
+            _quests.Clear();
+            if (quests != null)
+                foreach (ClientUserQuest quest in quests)
+                    if (quest?.Quest != null) _quests[quest.Index] = quest;
+            Touch();
+        }
+
+        /// <summary>Apply S.QuestChanged and say what kind of change it was.</summary>
+        public QuestTransition ApplyQuestChanged(ClientUserQuest quest)
+        {
+            if (quest?.Quest == null) return null;
+
+            _quests.TryGetValue(quest.Index, out ClientUserQuest before);
+            _quests[quest.Index] = quest;
+            Touch();
+
+            return new QuestTransition
+            {
+                Quest = quest,
+                Accepted = before == null,
+                Completed = quest.Completed && (before == null || !before.Completed),
+                Progressed = before != null && !before.Completed && !quest.Completed
+            };
+        }
+
+        public ClientUserQuest RemoveQuest(int userQuestIndex)
+        {
+            if (!_quests.TryGetValue(userQuestIndex, out ClientUserQuest quest)) return null;
+            _quests.Remove(userQuestIndex);
+            Touch();
+            return quest;
+        }
+
+        /// <summary>The log entry for a quest definition, or null.</summary>
+        public ClientUserQuest FindQuest(int questInfoIndex)
+        {
+            foreach (ClientUserQuest quest in _quests.Values)
+                if (quest.QuestIndex == questInfoIndex) return quest;
+            return null;
         }
 
         /// <summary>
@@ -284,6 +387,10 @@ namespace MirBot
 
         public long Gold;
         private int _goldCurrencyIndex = -1;
+
+        /// <summary>Account Hunt Gold: earned while hunting, spent in the game store.</summary>
+        public long HuntGold;
+        private int _huntGoldCurrencyIndex = -1;
 
         /// <summary>
         /// When the server last told us combat time changed. S.CombatTime is empty - its arrival
@@ -339,17 +446,32 @@ namespace MirBot
 
             foreach (ClientUserCurrency currency in currencies)
             {
-                if (currency?.Info == null || currency.Info.Type != CurrencyType.Gold) continue;
+                if (currency?.Info == null) continue;
 
-                _goldCurrencyIndex = currency.Info.Index;
-                Gold = currency.Amount;
-                Touch();
-                return;
+                if (currency.Info.Type == CurrencyType.Gold && _goldCurrencyIndex < 0)
+                {
+                    _goldCurrencyIndex = currency.Info.Index;
+                    Gold = currency.Amount;
+                    Touch();
+                }
+                else if (currency.Info.Type == CurrencyType.HuntGold && _huntGoldCurrencyIndex < 0)
+                {
+                    _huntGoldCurrencyIndex = currency.Info.Index;
+                    HuntGold = currency.Amount;
+                    Touch();
+                }
             }
         }
 
         public void ApplyCurrency(int currencyIndex, long amount)
         {
+            if (currencyIndex == _huntGoldCurrencyIndex)
+            {
+                HuntGold = amount;      // absolute, not a delta
+                Touch();
+                return;
+            }
+
             if (currencyIndex != _goldCurrencyIndex) return;
 
             Gold = amount;              // absolute, not a delta
@@ -674,6 +796,7 @@ namespace MirBot
             // Authoritative seeds for the two things the server owns and we must never guess:
             // the buffs already running, and how our pets are currently told to behave.
             ResetBuffs(start.Buffs);
+            ResetQuests(start.Quests);
             PetMode = start.PetMode;
 
             Experience = start.Experience;
@@ -681,6 +804,8 @@ namespace MirBot
             MaxExperienceKnown = false;
             Gold = 0;
             _goldCurrencyIndex = -1;
+            HuntGold = 0;
+            _huntGoldCurrencyIndex = -1;
             LastCombat = DateTime.MinValue;
             ApplyCurrencies(start.Currencies);
             Health = start.CurrentHP;
@@ -995,10 +1120,48 @@ namespace MirBot
             return best;
         }
 
-        public void ApplyRemove(uint objectID)
+        /// <summary>S.ObjectRemove. True when the object is now gone entirely.</summary>
+        public bool ApplyRemove(uint objectID)
         {
-            if (_objects.Remove(objectID))
-                Touch();
+            if (!_objects.TryGetValue(objectID, out WorldObject ob)) return true;
+
+            // Still shown through the data channel (grouped, or a tracked boss): keep it.
+            if (ob.SeenAsData)
+            {
+                ob.SeenNormally = false;
+                return false;
+            }
+
+            _objects.Remove(objectID);
+            Touch();
+            return true;
+        }
+
+        /// <summary>
+        /// S.DataObjectRemove. Returns the object when this removal made it disappear entirely,
+        /// so a tracked boss's last position can be kept; null otherwise.
+        /// </summary>
+        public WorldObject ApplyDataRemove(uint objectID)
+        {
+            if (!_objects.TryGetValue(objectID, out WorldObject ob)) return null;
+
+            if (ob.SeenNormally)
+            {
+                ob.SeenAsData = false;
+                return null;
+            }
+
+            _objects.Remove(objectID);
+            Touch();
+            return ob;
+        }
+
+        /// <summary>Record which channel just showed us an object.</summary>
+        public void MarkSeen(uint objectID, bool asData)
+        {
+            if (!_objects.TryGetValue(objectID, out WorldObject ob)) return;
+            if (asData) ob.SeenAsData = true;
+            else ob.SeenNormally = true;
         }
 
         public void MarkDead(uint objectID, bool dead)
@@ -1032,5 +1195,20 @@ namespace MirBot
                    (pets > 0 ? $"{pets} pets, " : "") + $"{_objects.Count} objects | " +
                    $"{KnownMagicCount} magics";
         }
+    }
+
+    /// <summary>What an S.QuestChanged meant for one quest.</summary>
+    public sealed class QuestTransition
+    {
+        public ClientUserQuest Quest;
+
+        /// <summary>The quest was not in our log before: an accept succeeded.</summary>
+        public bool Accepted;
+
+        /// <summary>Completed went false to true: a hand-in succeeded.</summary>
+        public bool Completed;
+
+        /// <summary>An in-progress quest changed (a counted kill).</summary>
+        public bool Progressed;
     }
 }

@@ -506,7 +506,9 @@ namespace SpawnDump
                              .OrderBy(x => x.QuestName, StringComparer.Ordinal))
                 {
                     Console.WriteLine($"QUEST	{q.QuestName}	{q.QuestType}	" +
-                                      $"{q.StartNPC?.NPCName ?? "-"}	{q.FinishNPC?.NPCName ?? "-"}");
+                                      $"{q.StartNPC?.NPCName ?? "-"}	{q.FinishNPC?.NPCName ?? "-"}	" +
+                                      $"start={q.StartNPC?.Region?.Map?.Description ?? "-"}#{q.StartNPC?.Index}	" +
+                                      $"finish={q.FinishNPC?.Region?.Map?.Description ?? "-"}#{q.FinishNPC?.Index}");
 
                     if (q.Requirements != null)
                         foreach (var r in q.Requirements)
@@ -520,8 +522,15 @@ namespace SpawnDump
 
                     if (q.Tasks != null)
                         foreach (var t in q.Tasks)
+                        {
                             Console.WriteLine($"QTSK	{q.QuestName}	{t.Task}	{t.Amount}	" +
-                                              $"{t.ItemParameter?.ItemName ?? "-"}	{t.MobDescription ?? "-"}");
+                                              $"{t.ItemParameter?.ItemName ?? "-"}	{t.MobDescription ?? "-"}	" +
+                                              $"region={t.RegionParameter?.Description ?? "-"}");
+                            if (t.MonsterDetails != null)
+                                foreach (var m in t.MonsterDetails)
+                                    Console.WriteLine($"QMON	{q.QuestName}	{m.Monster?.MonsterName ?? "-"}	" +
+                                                      $"map={m.Map?.Description ?? "any"}	1/{m.Chance}	x{m.Amount}	set={m.DropSet}");
+                        }
                 }
                 return 0;
             }

@@ -312,6 +312,17 @@ namespace MirBot
     <span class="n" id="huntcount"></span>
   </div>
   <div id="hunttable"></div></details>
+<details class="mem" id="questmem"><summary>Quest log</summary>
+  <div class="controls">
+    <input type="search" id="questq" placeholder="search quest, rewards, map, character" autocomplete="off">
+    <label>Bot <select id="questchar"><option value="">all bots</option></select></label>
+    <label>Quest <select id="questname"><option value="">all quests</option></select></label>
+    <label>Event <select id="questevent"><option value="">any</option>
+      <option value="accepted">accepted</option><option value="completed">completed</option>
+      <option value="journey">journey</option></select></label>
+    <span class="n" id="questcount"></span></div>
+  <div class="detail">From the server's own quest updates: accepted when a quest appears in the log, completed when it is handed in. A journey row is a bot setting off to kill a quest boss.</div>
+  <div id="questtable"></div></details>
 <details class="mem" id="bossmem"><summary>Boss kills</summary>
   <div class="controls">
     <input type="search" id="bossq" placeholder="search boss, map, loot, character" autocomplete="off">
@@ -456,6 +467,7 @@ const CARD_HTML = `
       <button data-a="towntrip">Town trip</button>
       <button data-a="forcerepair">Repair</button>
       <button data-a="nexttarget" title="Skip the current target and pick another nearby">Next target</button>
+      <button data-a="quests" title="Go to the quest NPC's map now and do the quests there">Do quests</button>
       <button data-a="travel">Travel</button>
       <select data-r="map"></select>
       <button data-a="go">Go</button>
@@ -483,6 +495,8 @@ const CARD_HTML = `
       <div><div class="k">Gold</div><div class="v" data-r="gold"></div>
            <svg class="spark" data-r="spark" preserveAspectRatio="none" viewBox="0 0 100 26">
              <path class="fill" data-r="sparkfill"></path><path data-r="sparkline"></path></svg></div>
+      <div><div class="k">Hunt Gold</div><div class="v" data-r="huntgold"></div>
+           <div class="detail" data-r="storestatus"></div></div>
       <div><div class="k">Bag</div><div class="v" data-r="bag"></div></div>
       <div><div class="k">Location</div><div class="v" data-r="loc"></div>
            <div class="detail" data-r="locdetail"></div></div>
@@ -521,6 +535,14 @@ const CARD_HTML = `
     <div class="pane"><h4 data-r="petshead">Pets</h4>
       <div class="scroll"><table><tr><th>Pet</th><th>HP</th><th>Away</th></tr>
         <tbody data-r="pets"></tbody></table></div></div>
+
+    <div class="pane"><h4 data-r="buffshead">Buffs</h4>
+      <div class="scroll"><table><tr><th>Buff</th><th>Time left</th></tr>
+        <tbody data-r="buffs"></tbody></table></div></div>
+
+    <div class="pane"><h4 data-r="questshead">Quests</h4>
+      <div class="scroll"><table><tr><th>Quest</th><th>Progress</th></tr>
+        <tbody data-r="quests"></tbody></table></div></div>
 
 
     <div class="pane"><h4>History</h4>
@@ -695,7 +717,7 @@ function dotFor(b) {
   const idle = idleSeconds(b);
   if (idle === null || idle === undefined) return "grey";
   if (idle > STALE_SECONDS) return "red";
-  if (b.activity === "town" || b.activity === "travel") return "yellow";
+  if (b.activity === "town" || b.activity === "travel" || b.activity === "quest") return "yellow";
   return "green";
 }
 
@@ -776,6 +798,10 @@ function patch(card, b) {
   // Gold arrives as a STRING because it can exceed 2^53 - see the comment on BotStatus. Grouping
   // is done on the digits themselves rather than via Number(), which would quietly round it.
   text(el.gold, String(b.gold).replace(/\B(?=(\d{3})+(?!\d))/g, ","));
+
+  // HUNT GOLD - the game store currency, and what the store step is buying or saving for.
+  text(el.huntgold, String(b.huntGold ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, ","));
+  text(el.storestatus, b.storeStatusText ? "Store: " + b.storeStatusText : "");
 
   drawSpark(card, goldSeries.get(b.id));
   drawMap(card, b);
@@ -869,6 +895,29 @@ function patch(card, b) {
         <td>${p.distance}</td>
       </tr>`).join("")
     : `<tr><td colspan="3" style="color:var(--dim)">none summoned</td></tr>`);
+
+  // BUFFS - what the server says is running now. A timed item buff pauses in a safe zone, so
+  // "paused" is normal in town, not a stuck timer.
+  const buffs = b.buffs || [];
+  text(el.buffshead, buffs.length ? `Buffs (${buffs.length})` : "Buffs");
+  rows(card, "buffs", el.buffs, buffs.length
+    ? buffs.map(f => `<tr title="${esc((f.stats || []).map(x => x.name + " +" + x.amount).join(", "))}">
+        <td>${esc(f.name)}</td>
+        <td>${f.permanent ? `<span class="count">permanent</span>`
+          : (f.paused ? `<span class="count">paused in town</span> ` : "") + buffLeft(f.remainingSeconds)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="2" style="color:var(--dim)">none</td></tr>`);
+
+  // QUESTS - the character's log, with the errand's current step in the heading.
+  const quests = b.quests || [];
+  text(el.questshead, "Quests" + (b.questStatusText ? " - " + b.questStatusText : ""));
+  rows(card, "quests", el.quests, quests.length
+    ? quests.map(q => `<tr style="${q.completed ? "opacity:.5" : ""}">
+        <td>${esc(q.name)}${q.daily ? ` <span class="count">daily</span>` : ""}</td>
+        <td>${q.completed ? `<span class="count">done</span>`
+          : q.readyToHandIn ? `<span class="count">ready to hand in</span>` : esc(q.progress)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="2" style="color:var(--dim)">none</td></tr>`);
 
   rows(card, "hist", el.hist, b.history.slice().reverse().map(e => `<tr>
       <td>${esc(e.action)} ${e.count > 1 ? `<span class="count">x${e.count}</span>` : ""}</td>
@@ -1283,6 +1332,44 @@ function renderDeaths() {
 
 document.getElementById("deathq").addEventListener("input", renderDeaths);
 
+let questRows = [];
+
+async function loadQuestLog() {
+  try { questRows = await (await fetch("/api/quest-log?take=2000", { cache:"no-store" })).json(); }
+  catch (e) { return; }
+  fillFilter("questchar", "all bots", questRows.map(r => [levelKey(r), r.character || r.bot]));
+  fillFilter("questname", "all quests", questRows.map(r => [r.quest, r.quest]));
+  renderQuestLog();
+}
+
+function renderQuestLog() {
+  const q = document.getElementById("questq").value.trim();
+  const who = document.getElementById("questchar").value;
+  const quest = document.getElementById("questname").value;
+  const evt = document.getElementById("questevent").value;
+  const rows = questRows.filter(r =>
+    (!who || levelKey(r) === who) && (!quest || r.quest === quest) && (!evt || r.event === evt) &&
+    matchesQuery(q, [r.quest, r.rewards, r.map, r.character, r.bot, r.class, r.event]));
+  document.getElementById("questcount").textContent =
+    `${rows.length} of ${questRows.length} entr${questRows.length === 1 ? "y" : "ies"}`;
+  const box = document.getElementById("questtable");
+  if (!rows.length) {
+    box.innerHTML = `<div class='detail'>${questRows.length ? "no entries match" : "none recorded yet"}</div>`;
+    return;
+  }
+  box.innerHTML = "<table><tr><th>When</th><th>Bot</th><th class='num'>Lvl</th><th>Quest</th>" +
+    "<th>Event</th><th>Map</th><th>Rewards / note</th></tr>" +
+    rows.map(r => "<tr><td>" + new Date(r.utc).toLocaleString() + "</td>" +
+      "<td>" + esc(r.character || r.bot) + "</td><td class='num'>" + r.level + "</td>" +
+      "<td>" + esc(r.quest) + "</td><td>" + esc(r.event) + "</td>" +
+      "<td>" + esc(r.map) + "</td><td>" + (r.rewards ? esc(r.rewards) : "—") + "</td></tr>").join("") +
+    "</table>";
+}
+
+document.getElementById("questq").addEventListener("input", renderQuestLog);
+for (const id of ["questchar", "questname", "questevent"])
+  document.getElementById(id).addEventListener("change", renderQuestLog);
+
 let bossRows = [];
 
 async function loadBossKills() {
@@ -1534,13 +1621,14 @@ async function loadMemory(bots) {
   if (document.getElementById("huntmem").open) loadHunting(bots);
   if (document.getElementById("deathmem").open) loadDeaths();
   if (document.getElementById("bossmem").open) loadBossKills();
+  if (document.getElementById("questmem").open) loadQuestLog();
   if (document.getElementById("levelmem").open) loadLevels();
   if (document.getElementById("maptripmem").open) loadMapTrips();
   if (document.getElementById("upgrademem").open) loadUpgrades();
   if (document.getElementById("skillmem").open) loadSkills();
 }
 
-for (const id of ["huntmem", "deathmem", "bossmem", "levelmem", "maptripmem", "upgrademem", "skillmem"]) {
+for (const id of ["huntmem", "deathmem", "bossmem", "questmem", "levelmem", "maptripmem", "upgrademem", "skillmem"]) {
   document.getElementById(id).addEventListener("toggle", () => { memFetchedAt = 0; });
 }
 
@@ -1698,10 +1786,18 @@ document.getElementById("tab-notify").addEventListener("click", () => showTab("n
 // A friendlier face on the Notify* settings: the same /api/config values the Settings tab edits,
 // as switches, plus a test button and what was actually sent (from /api/notify).
 
+function buffLeft(sec) {
+  if (sec === null || sec === undefined) return "";
+  if (sec >= 3600) return Math.floor(sec / 3600) + "h " + Math.floor(sec % 3600 / 60) + "m left";
+  if (sec >= 60) return Math.floor(sec / 60) + "m left";
+  return sec + "s left";
+}
+
 const NOTIFY_TYPES = [
   { key:"NotifyLevelUp", label:"Level-ups",      example:"Wizzler reached level 37 - Wizard on Deserted Mine Lv 2" },
   { key:"NotifyUpgrade", label:"Gear upgrades",  example:"Jill equipped Platinum Ring - replaced Ring Of Discipline (score +8)" },
   { key:"NotifySkill",   label:"Skills learned", example:"Jill learned Soul Shield" },
+  { key:"NotifyQuest",   label:"Quests completed", example:"Sindo completed Do your dailies 2 - Daily Buffs v2 [T], Scroll Of Boss Tracking x2" },
   { key:"NotifyFault",   label:"Bot faults",     example:"Mirbot4 stopped - needs attention" },
   { key:"NotifyDeath",   label:"Deaths",         example:"Sindo died - killed by Stone Golem on Desert (can be noisy)" }
 ];

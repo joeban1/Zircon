@@ -254,6 +254,29 @@ namespace MirBot
         public bool NotifySkill = true;
         public bool NotifyDeath = false;
         public bool NotifyFault = true;
+        public bool NotifyQuest = true;
+
+        /// <summary>Do the whitelisted NPCs' kill quests (see QuestBook).</summary>
+        public bool EnableQuests = true;
+
+        /// <summary>
+        /// Host-wide, first ini only, startup-only: the NPC names whose quests the bots take.
+        /// Only quests both started and finished by these NPCs, made only of kill tasks, are used.
+        /// </summary>
+        public string QuestNPCs = "Joeban";
+
+        /// <summary>
+        /// A quest whose target is a boss (Level 40 - Well done: the Crazed Warrior) is only taken
+        /// from this level - the operator's call, above the server's own level 40.
+        /// </summary>
+        public int QuestBossMinLevel = 45;
+
+        // The game store, paid for with Hunt Gold. The shopping list and its order are fixed in
+        // GameStore.Plan: every permanent first, then temporaries kept topped up.
+        public bool EnableStore = true;
+        // A temporary store buff is rebought (and the spare drunk, which extends it) once it has
+        // this little time left.
+        public int StoreRebuyMinutes = 60;
         public int NotifyIdleMinutes = 20;
         // No vendor is named: VendorDirectory derives who buys what from System.db.
         // NOTE: ScrollIfFurtherThan was removed. It decided whether to scroll to shorten a walk
@@ -1019,6 +1042,12 @@ namespace MirBot
                 case "notifyskill": config.NotifySkill = bool.Parse(value); break;
                 case "notifydeath": config.NotifyDeath = bool.Parse(value); break;
                 case "notifyfault": config.NotifyFault = bool.Parse(value); break;
+                case "notifyquest": config.NotifyQuest = bool.Parse(value); break;
+                case "enablequests": config.EnableQuests = bool.Parse(value); break;
+                case "questnpcs": config.QuestNPCs = value; break;
+                case "questbossminlevel": config.QuestBossMinLevel = int.Parse(value); break;
+                case "enablestore": config.EnableStore = bool.Parse(value); break;
+                case "storerebuyminutes": config.StoreRebuyMinutes = int.Parse(value); break;
                 case "notifyidleminutes": config.NotifyIdleMinutes = int.Parse(value); break;
                 case "returnwithin": config.ReturnWithin = int.Parse(value); break;
                 case "detoursteps": config.DetourSteps = int.Parse(value); break;

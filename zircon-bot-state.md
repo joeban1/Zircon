@@ -764,6 +764,32 @@ further Cast or MagicToggle action there. Her first trip ended with sufficient p
 but only two of three reserved town scrolls and 7 gold, so she correctly remained on beginner
 ground rather than taking Flea Cave without the configured return reserve.
 
+### Quests and the game store, 2026-09-24
+
+**Quests** (`QuestBook`, `QuestErrand`, `QuestLogMemory`): Joeban's four kill quests in Bichon Town,
+done only when passing through (or on the bot card's **Do quests** button). Accepts and hand-ins
+count only on the matching `S.QuestChanged` transition.
+- Rewards are drunk automatically. Scrolls of Boss Tracking are read on a map with a wanted boss.
+- The Level 40 boss quest is for level 45+ only.
+- Verified live:
+  - three dailies and two "Getting Started" completed and handed in;
+  - buffs used;
+  - phone notifications sent.
+- The visit watchdog was first 8 minutes from arrival. Mirbot gave up 1/5 Forest Yetis in, so it is
+  now 8 minutes without progress (30 minutes at most).
+
+**Game store** (`GameStore`, `StoreShopper`): Hunt Gold buys a fixed per-class list, all permanents
+first, then temporaries kept topped up.
+- The purchase is confirmed by Hunt Gold dropping; the reply packet proves nothing.
+- On deploy every bot held about 3,100 Hunt Gold. Within two minutes seven had bought their Mir
+  Package [P], class tonic and class mark (equipped in the torch slot), and as many other
+  permanents as they could afford.
+- Banner was mid-fight and waits for a lull.
+
+**Mana tier bug:** a warrior's 182-MP pool gave a gap of 109, just below tier II's 110, so both
+warriors bought 40-point potions and drank about one a minute. Mana potions may now overshoot by a
+tenth of the pool, and Warriors and Assassins carry `ManaPotionWeightPercent=15`.
+
 ## Open issues
 
 ### 1. Book hunting choice (updated 2026-09-22)

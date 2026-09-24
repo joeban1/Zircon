@@ -92,6 +92,32 @@ namespace MirBot
         public string Why { get; init; } = "";
     }
 
+    /// <summary>A buff the server says is on the character right now.</summary>
+    public sealed record BuffStatus
+    {
+        public string Name { get; init; } = "";
+        public bool Permanent { get; init; }
+
+        /// <summary>Seconds left now (counted down locally between S.BuffTime); null if permanent.</summary>
+        public int? RemainingSeconds { get; init; }
+
+        /// <summary>A timed item buff pauses in a safe zone.</summary>
+        public bool Paused { get; init; }
+        public IReadOnlyList<ItemStat> Stats { get; init; } = Array.Empty<ItemStat>();
+    }
+
+    /// <summary>One quest in the character's log.</summary>
+    public sealed record QuestStatus
+    {
+        public string Name { get; init; } = "";
+
+        /// <summary>"7/10 Pig".</summary>
+        public string Progress { get; init; } = "";
+        public bool Completed { get; init; }
+        public bool ReadyToHandIn { get; init; }
+        public bool Daily { get; init; }
+    }
+
     /// <summary>
     /// One looted item, recovered from the log. See BotHost.LootSearch.
     /// </summary>
@@ -342,6 +368,17 @@ namespace MirBot
         public IReadOnlyList<PetStatus> Pets { get; init; } = Array.Empty<PetStatus>();
 
         public IReadOnlyList<SkillStatus> Skills { get; init; } = Array.Empty<SkillStatus>();
+        public IReadOnlyList<BuffStatus> Buffs { get; init; } = Array.Empty<BuffStatus>();
+        public IReadOnlyList<QuestStatus> Quests { get; init; } = Array.Empty<QuestStatus>();
+
+        /// <summary>The quest errand's current step, empty when it is not running.</summary>
+        public string QuestStatusText { get; init; } = "";
+
+        /// <summary>Account Hunt Gold - the game store currency.</summary>
+        public long HuntGold { get; init; }
+
+        /// <summary>What the game store step is buying or saving for.</summary>
+        public string StoreStatusText { get; init; } = "";
         public IReadOnlyList<ItemStatus> Inventory { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<ItemStatus> Storage { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<HistoryStatus> History { get; init; } = Array.Empty<HistoryStatus>();

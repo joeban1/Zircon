@@ -70,6 +70,9 @@ namespace MirBot
         /// <summary>Boss kill log for the Info tab. Set by the host after construction.</summary>
         public Func<int, List<BossKillEntry>> BossKills;
 
+        /// <summary>Quest accept/complete log for the Info tab. Set by the host after construction.</summary>
+        public Func<int, List<QuestLogEntry>> QuestLog;
+
         private Thread _thread;
         private volatile bool _stopping;
         private bool _warnedAboutOverride;
@@ -313,6 +316,17 @@ namespace MirBot
                 return;
             }
 
+            if (path == "/api/quest-log" && !post)
+            {
+                int take = 1000;
+                string rawTake = context.Request.QueryString["take"];
+                if (rawTake != null && int.TryParse(rawTake, out int parsedTake))
+                    take = Math.Clamp(parsedTake, 1, 2000);
+                Send(context, 200, "application/json; charset=utf-8",
+                    JsonSerializer.Serialize(QuestLog?.Invoke(take) ?? new List<QuestLogEntry>(), Json));
+                return;
+            }
+
             if (path == "/api/map-trips" && !post)
             {
                 int take = 200;
@@ -486,6 +500,7 @@ namespace MirBot
                     case "travel": kind = BotCommandKind.Travel; break;
                     case "forcerepair": kind = BotCommandKind.ForceRepair; break;
                     case "nexttarget": kind = BotCommandKind.NextTarget; break;
+                    case "quests": kind = BotCommandKind.DoQuests; break;
                     case "setconfig": kind = BotCommandKind.SetConfig; break;
                     default: TryFail(context, 404, "unknown action"); return;
                 }

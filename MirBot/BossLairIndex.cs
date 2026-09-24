@@ -39,8 +39,55 @@ namespace MirBot
         public IReadOnlyList<BossLair> On(int mapIndex) =>
             _byMap.TryGetValue(mapIndex, out List<BossLair> lairs) ? lairs : Array.Empty<BossLair>();
 
+        /// <summary>Every lair of one boss, on any map.</summary>
+        public IReadOnlyList<BossLair> ForMonster(int monsterIndex) =>
+            _byMap.Values.SelectMany(x => x).Where(l => l.MonsterIndex == monsterIndex).ToList();
+
+        /// <summary>The maps one boss spawns on.</summary>
+        public IReadOnlyList<int> MapsForMonster(int monsterIndex) =>
+            ForMonster(monsterIndex).Select(l => l.MapIndex).Distinct().OrderBy(x => x).ToList();
+
+        private MapLibrary _maps;
+        private readonly Dictionary<(int Monster, int Map), List<Point>> _spawnCells =
+            new Dictionary<(int, int), List<Point>>();
+
+        /// <summary>
+        /// Walkable cells of every region where ANY monster spawns on a map - built on first use
+        /// and cached. Quest hunting uses it: Forest Yetis live only in Bichon Town's outer
+        /// "Spawn Ring 2", which random local roaming near Joeban almost never reaches.
+        /// </summary>
+        public IReadOnlyList<Point> SpawnCells(int monsterIndex, int mapIndex)
+        {
+            if (_spawnCells.TryGetValue((monsterIndex, mapIndex), out List<Point> cached)) return cached;
+
+            List<Point> cells = new List<Point>();
+            try
+            {
+                MonsterInfo monster = Globals.MonsterInfoList?.Binding?.FirstOrDefault(m => m.Index == monsterIndex);
+                MapGrid grid = _maps?.For(mapIndex);
+                if (monster?.Respawns != null && grid != null)
+                    foreach (RespawnInfo respawn in monster.Respawns)
+                    {
+                        MapRegion region = respawn?.Region;
+                        if (region?.Map?.Index != mapIndex || respawn.EventSpawn || respawn.Count <= 0) continue;
+                        if (region.PointList == null || region.PointList.Count == 0)
+                            region.CreatePoints(grid.Width);
+                        if (region.PointList != null) cells.AddRange(region.PointList.Where(grid.Walkable));
+                    }
+            }
+            catch
+            {
+                cells.Clear();
+            }
+
+            _spawnCells[(monsterIndex, mapIndex)] = cells;
+            return cells;
+        }
+
         public void Build(MapLibrary maps)
         {
+            _maps = maps;
+            _spawnCells.Clear();
             _byMap.Clear();
 
             try

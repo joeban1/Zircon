@@ -2869,6 +2869,21 @@ namespace MirBot
             return (int)Math.Min(wanted, gold / price);
         }
 
+        /// <summary>
+        /// The largest restore a potion may have and still "fit": the gap between a full pool and
+        /// the drinking threshold, plus a tenth of the pool of slack for mana (see BestPotion).
+        /// </summary>
+        public static int PotionCeiling(int pool, int threshold, bool healing)
+        {
+            if (pool <= 0) return int.MaxValue;
+
+            int gap = pool * Math.Max(1, 100 - threshold) / 100;
+
+            if (!healing) gap += pool / 10;
+
+            return gap;
+        }
+
         private NPCGood BestPotion(WorldModel world, Backpack items, bool healing)
         {
             if (_currentPage?.Goods == null) return null;
@@ -2914,9 +2929,17 @@ namespace MirBot
             int pool = healing ? world.MaxHealth : world.MaxMana;
             int threshold = healing ? _config.HealAtPercent : _config.DrinkManaAtPercent;
 
-            int gap = pool > 0
-                ? pool * Math.Max(1, 100 - threshold) / 100
-                : int.MaxValue;
+            int gap = PotionCeiling(pool, threshold, healing);
+
+            // MANA MAY OVERSHOOT A LITTLE. The gap is the least a drink ever has to fill, and on a
+            // small pool the next tier up can miss it by a point: a warrior with 182 mana drinking
+            // at 40% has a gap of 109, Mana Potion (II) restores 110, and so both warriors bought
+            // the 40-point tier and drank one a minute. Wasting a few points of mana costs nothing
+            // (mana is spent before it is drunk, so the real deficit is usually larger than the
+            // threshold gap anyway); the no-overheal rule is about HEALTH, where a wasted drink is
+            // a drink not taken while being hit. A tenth of the pool of slack for mana only.
+            //
+            // (Applied inside PotionCeiling, so the rule can be tested on its own.)
 
             // A PRICE TERM, before any of the weight ranking runs.
             //
@@ -3111,6 +3134,7 @@ namespace MirBot
         private static bool IsManaPotion(ItemInfo info) =>
             info.ItemType == ItemType.Consumable &&
             info.Shape != Backpack.TownTeleportShape &&
+            !Backpack.IsItemBuff(info) &&
             info.Stats[Stat.Health] <= 0 &&
             info.Stats[Stat.Mana] > 0;
 
@@ -3151,6 +3175,7 @@ namespace MirBot
         private static bool IsHealthPotion(ItemInfo info) =>
             info.ItemType == ItemType.Consumable &&
             info.Shape != Backpack.TownTeleportShape &&
+            !Backpack.IsItemBuff(info) &&
             info.Stats[Stat.Health] > 0;
 
         /// <summary>

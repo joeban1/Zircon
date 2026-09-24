@@ -12,7 +12,8 @@ namespace MirBot
         TownTeleport, AutoPath, AutoPathPoint, AutoPathCancel, WalkTo, Deposit, Withdraw,
         MergeParts, AssemblePart,
         NPCRepair, LearnBook, Logout, NPCCall, NPCButton, NPCSell, NPCBuy, NPCClose,
-        MagicToggle, Unlock, Cast, DropItem, Butcher
+        MagicToggle, Unlock, Cast, DropItem, Butcher, QuestAccept, QuestComplete, UseItem,
+        StoreBuy
     }
 
     public sealed class Decision
@@ -29,6 +30,12 @@ namespace MirBot
         public uint TargetID;
         public MirDirection Direction;
         public int PotionSlot = -1;
+
+        /// <summary>QuestAccept / QuestComplete: the QuestInfo index.</summary>
+        public int QuestIndex;
+
+        /// <summary>StoreBuy: the StoreInfo index, bought with Hunt Gold.</summary>
+        public int StoreIndex;
         public EquipRequest Equip;
 
         /// <summary>Tiles to move: 1 walks, 2 runs. 3 requires a horse and is rejected without one.</summary>
@@ -495,6 +502,24 @@ namespace MirBot
                     };
             }
 
+            // 0a-ii. Quest rewards: drink the stat buffs as soon as they are held (a timed one
+            //        pauses in a safe zone, so drinking it in town wastes nothing), and read a
+            //        Scroll of Boss Tracking when it can find something.
+            if (!itemUsePending && (QuestBook != null || Store != null) &&
+                world.NearestLiveMonster(2, _unreachable.Keys) == null)
+            {
+                Decision use = UseBuffItems(world, items);
+                if (use != null) return use;
+            }
+
+            // 0a-iii. The game store: buy the next thing on the class's list with Hunt Gold. No NPC
+            //         is involved, so this can happen anywhere - but not mid-fight, and one
+            //         purchase at a time, settled by the Hunt Gold actually dropping.
+            {
+                Decision buy = StoreStep(world, items, itemUsePending);
+                if (buy != null) return buy;
+            }
+
             // 0a. Throw away starter kit we have already replaced.
             //
             //     It cannot be sold - the instance is flagged Worthless whatever the database says
@@ -784,6 +809,37 @@ namespace MirBot
                 }
             }
 
+            // 2a-ii. Quest errand (QuestErrand): only on the quest NPC's map, only between town
+            //        trips. A trip that starts takes over and the errand steps aside unpunished.
+            if (Quest != null)
+            {
+                if (Town != null && Town.Active)
+                    Quest.Suspend("a town trip started");
+                else if (!itemUsePending)
+                {
+                    Decision errand = Quest.Next(world, items);
+
+                    if (errand != null)
+                    {
+                        if (errand.Action == BotAction.WalkTo)
+                        {
+                            int remaining = WorldModel.Distance(world.Location, errand.Destination);
+                            errand.Action = BotAction.Approach;
+
+                            if (!TrySteer(errand, world, errand.Destination, 0, remaining, routeKind: "town"))
+                                return new Decision
+                                {
+                                    Action = BotAction.Idle,
+                                    Reason = $"no route to {errand.Destination.X},{errand.Destination.Y}",
+                                    Subject = errand.Subject
+                                };
+                        }
+
+                        return errand;
+                    }
+                }
+            }
+
             // 2b. Cross-map travel. Below the town trip, because arriving somewhere new with a
             //     full bag and no potions is how a journey ends in a corpse; above fighting,
             //     because a bot that stops to kill everything never gets anywhere.
@@ -796,7 +852,9 @@ namespace MirBot
             // A town trip owns the bot until it finishes, even on a tick where it has no step to
             // give (Banking and Returning have those). Walking the journey in that gap is how the
             // journey's stuck clock expired mid-shop.
-            bool tripOwnsUs = Town != null && Town.Active;
+            // The quest errand owns movement the same way: a journey passing through Bichon is
+            // held for the errand and carries on afterwards, never replaced.
+            bool tripOwnsUs = Town != null && Town.Active || Quest != null && Quest.OwnsMovement;
             if (tripOwnsUs) Travel?.Hold();
 
             if (!tripOwnsUs && Travel != null && Travel.Active && FightingThrough(world))
@@ -2146,7 +2204,8 @@ namespace MirBot
             MapWideCoverage,
             FallbackSweep,
             Random,
-            BossLair
+            BossLair,
+            QuestSpawn
         }
 
         /// <summary>
@@ -2254,12 +2313,17 @@ namespace MirBot
                 AbandonSweep($"no closer than {_sweepBest} tiles for " +
                              $"{SweepPatience.TotalSeconds:0}s");
 
+            if (_roamKind == RoamTargetKind.QuestSpawn &&
+                (!QuestHunting || WorldModel.Distance(world.Location, _roamTarget) <= 3))
+                ClearRoamTarget();
+
             if (_roamKind == RoamTargetKind.BossLair &&
                 WorldModel.Distance(world.Location, _roamTarget) <= LairSightRange)
             {
                 // Standing in it with nothing to fight - a live boss in sight would have been
                 // targeted before Wander was reached - so it is dead or not yet respawned.
                 MarkLairChecked(_lair, "reached - nothing there");
+                _lairFoundEmpty = true;
                 ClearRoamTarget();
             }
 
@@ -2272,6 +2336,21 @@ namespace MirBot
                                      $"target {_roamTarget.X},{_roamTarget.Y}.");
 
                 ClearRoamTarget();
+            }
+
+            if (_roamTarget == Point.Empty && QuestHunting)
+            {
+                Point spot = QuestSpawnSpot(world);
+
+                if (spot != Point.Empty)
+                {
+                    _roamTarget = spot;
+                    _roamKind = RoamTargetKind.QuestSpawn;
+                    _sweeping = true;
+                    _sweepBest = WorldModel.Distance(world.Location, _roamTarget);
+                    _sweepProgressAt = DateTime.UtcNow;
+                    _roamUntil = DateTime.UtcNow.AddMinutes(5);
+                }
             }
 
             if (_roamTarget == Point.Empty)
@@ -2370,7 +2449,8 @@ namespace MirBot
                 if (IsCoverageTarget)
                     AbandonExploration(world, "no route", SweepSentence);
                 else if (_roamKind == RoamTargetKind.FallbackSweep ||
-                         _roamKind == RoamTargetKind.BossLair)
+                         _roamKind == RoamTargetKind.BossLair ||
+                         _roamKind == RoamTargetKind.QuestSpawn)
                     AbandonSweep("no route");
                 else
                     ClearRoamTarget();
@@ -2388,7 +2468,8 @@ namespace MirBot
         private bool IsLongRoamTarget =>
             _roamKind == RoamTargetKind.MapWideCoverage ||
             _roamKind == RoamTargetKind.FallbackSweep ||
-            _roamKind == RoamTargetKind.BossLair;
+            _roamKind == RoamTargetKind.BossLair ||
+            _roamKind == RoamTargetKind.QuestSpawn;
 
         // ---- boss lairs ------------------------------------------------------------------------
 
@@ -2397,6 +2478,55 @@ namespace MirBot
         /// wants (unlearned, or a level 4 training copy). Empty when there is nothing to seek.
         /// </summary>
         public Func<WorldModel, IReadOnlyList<BossLair>> WantedLairs;
+
+        /// <summary>Set by BotInstance: the quest errand and the quest policy behind it.</summary>
+        public QuestErrand Quest;
+        public QuestBook QuestBook;
+
+        /// <summary>Set by BotInstance: the game store shopping list and this bot's purchases.</summary>
+        public GameStore Store;
+        public StoreShopper Shopper;
+
+        /// <summary>Set by BotInstance: walkable spawn cells of a monster on a map.</summary>
+        public Func<int, int, IReadOnlyList<Point>> SpawnCells;
+
+        /// <summary>
+        /// A cell in the quest targets' own spawn region, some way from here: where to look when
+        /// none is in sight. Random, so repeated walks cover a ring-shaped region rather than
+        /// returning to one corner of it.
+        /// </summary>
+        private Point QuestSpawnSpot(WorldModel world)
+        {
+            if (SpawnCells == null || Quest == null) return Point.Empty;
+
+            List<Point> cells = new List<Point>();
+            foreach (int monster in Quest.HuntTargets)
+                cells.AddRange(SpawnCells(monster, world.MapIndex));
+
+            List<Point> away = cells.Where(c => WorldModel.Distance(world.Location, c) >= 8).ToList();
+            List<Point> pool = away.Count > 0 ? away : cells;
+            return pool.Count == 0 ? Point.Empty : pool[_random.Next(pool.Count)];
+        }
+
+        /// <summary>A boss the tracker showed us, kept after it vanished from the data channel.</summary>
+        private (int Map, Point At, string Name, DateTime Utc) _trackedBoss;
+        private static readonly TimeSpan TrackedBossMemory = TimeSpan.FromMinutes(3);
+
+        /// <summary>A lair found empty since the last tracker use - the moment a scroll is worth it.</summary>
+        private bool _lairFoundEmpty;
+        private DateTime _trackerTriedAt = DateTime.MinValue;
+        private bool _trackerConfirmed;
+
+        /// <summary>Reward items tried recently, by ItemInfo index, so a refused use is not spammed.</summary>
+        private readonly Dictionary<int, DateTime> _rewardTried = new Dictionary<int, DateTime>();
+
+        /// <summary>A data-only object vanished; remember a wanted boss's last position.</summary>
+        public void NoteDataObjectGone(WorldObject ob, int mapIndex)
+        {
+            if (ob == null || ob.MonsterIndex < 0 || ob.Dead) return;
+            if (!_lairsHere.Any(l => l.MonsterIndex == ob.MonsterIndex)) return;
+            _trackedBoss = (mapIndex, ob.Location, ob.Name, DateTime.UtcNow);
+        }
 
         /// <summary>When each lair was last checked, so a cleared one waits out its respawn.</summary>
         private readonly Dictionary<(int Map, Point Centre), DateTime> _lairChecked =
@@ -2429,6 +2559,31 @@ namespace MirBot
             int bestDistance = int.MaxValue;
             DateTime now = DateTime.UtcNow;
 
+            // KNOWN beats GUESSED. A boss the tracker is showing (any distance), or showed within
+            // the last three minutes, is a better destination than a spawn region.
+            IReadOnlyList<BossLair> lairs = LairsHere(world);
+            if (lairs.Count > 0)
+            {
+                WorldObject seen = world.Objects
+                    .Where(x => x.IsLiveMonster && !x.IsPet && x.MonsterIndex >= 0 &&
+                                !_unreachable.ContainsKey(x.ObjectID) &&
+                                lairs.Any(l => l.MonsterIndex == x.MonsterIndex))
+                    .OrderBy(x => world.DistanceTo(x.Location)).FirstOrDefault();
+
+                if (seen != null)
+                    return new BossLair { MapIndex = world.MapIndex, MonsterIndex = seen.MonsterIndex,
+                        MonsterName = seen.Name, Centre = seen.Location, Spawns = 1, RespawnMinutes = 5 };
+
+                if (_trackedBoss.Map == world.MapIndex && now - _trackedBoss.Utc < TrackedBossMemory)
+                {
+                    Point at = _trackedBoss.At;
+                    string name = _trackedBoss.Name ?? "tracked boss";
+                    _trackedBoss = default;   // one walk to it; a lair check re-arms the tracker
+                    return new BossLair { MapIndex = world.MapIndex, Centre = at, Spawns = 1,
+                        MonsterName = name, RespawnMinutes = 5 };
+                }
+            }
+
             foreach (BossLair lair in LairsHere(world))
             {
                 if (_lairChecked.TryGetValue((lair.MapIndex, lair.Centre), out DateTime at) &&
@@ -2458,6 +2613,158 @@ namespace MirBot
         /// ahead of something already hitting us, and never one the danger memory says will
         /// take us apart.
         /// </summary>
+        private Decision StoreStep(WorldModel world, Backpack items, bool itemUsePending)
+        {
+            if (Store == null || Shopper == null) return null;
+
+            DateTime now = DateTime.UtcNow;
+            Shopper.Update(world.HuntGold, now);
+
+            if (!_config.EnableStore || world.Dead)
+            {
+                Shopper.NextWant = null;
+                return null;
+            }
+
+            TimeSpan window = TimeSpan.FromMinutes(Math.Max(1, _config.StoreRebuyMinutes));
+            StoreWant want = Store.Next(world.Class, w =>
+                GameStore.Satisfied(w, world, items, window) || Shopper.JustBought(w, now));
+            Shopper.NextWant = want;
+
+            if (want?.Item == null || Shopper.Pending || itemUsePending) return null;
+            if (world.HuntGold < want.Price || Shopper.InBackoff(want, now)) return null;
+            if (world.NearestLiveMonster(2, _unreachable.Keys) != null) return null;
+            if (world.HealthPercent <= _config.HealAtPercent) return null;   // healing comes first
+            if (!items.HasRoomForRewards(new[] { (want.Item, 1L, true, false) })) return null;
+
+            Shopper.NoteSent(want, world.HuntGold, now);
+            return new Decision
+            {
+                Action = BotAction.StoreBuy,
+                StoreIndex = want.StoreIndex,
+                Reason = $"buying {want.Name} for {want.Price:N0} Hunt Gold ({world.HuntGold:N0} held)",
+                Subject = want.Name
+            };
+        }
+
+        /// <summary>
+        /// Quest rewards and store purchases that are item buffs: drink them when their buff is not
+        /// running (a temporary also when it is about to run out - a reuse extends it), and read a
+        /// Scroll of Boss Tracking when it can find something.
+        /// </summary>
+        private Decision UseBuffItems(WorldModel world, Backpack items)
+        {
+            DateTime now = DateTime.UtcNow;
+            TimeSpan window = TimeSpan.FromMinutes(Math.Max(1, _config.StoreRebuyMinutes));
+
+            if (_trackerTriedAt != DateTime.MinValue && !_trackerConfirmed &&
+                world.PlayerStats != null && world.PlayerStats[Stat.BossTracker] > 0)
+                _trackerConfirmed = true;
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in items.Carried)
+            {
+                Library.SystemModels.ItemInfo info = pair.Value?.Info;
+                if (info == null) continue;
+
+                if (_rewardTried.TryGetValue(info.Index, out DateTime tried) &&
+                    now - tried < TimeSpan.FromMinutes(1)) continue;
+
+                StoreWant bought = Store?.WantFor(world.Class, info);
+
+                if (bought != null && !bought.IsMark && info.ItemType == ItemType.Consumable &&
+                    info.Shape == 1 && _config.EnableStore)
+                {
+                    TimeSpan? left = GameStore.ItemBuffRemaining(world, info.Index, out bool running);
+
+                    // A permanent can be used once; a temporary tops up when nearly spent.
+                    bool use = !running || (!bought.Permanent && left != null && left.Value <= window);
+                    if (!use) continue;
+
+                    _rewardTried[info.Index] = now;
+                    return new Decision
+                    {
+                        Action = BotAction.UseItem,
+                        PotionSlot = pair.Key,
+                        Reason = $"using store item {info.ItemName}",
+                        Subject = info.ItemName
+                    };
+                }
+
+                if (QuestBook == null || !QuestBook.IsQuestReward(info)) continue;
+
+                if (QuestBook.IsOrdinaryBuffReward(info))
+                {
+                    // A paused buff is still running; drinking again would only extend it.
+                    if (world.HasItemBuff(info.Index)) continue;
+
+                    _rewardTried[info.Index] = now;
+                    return new Decision
+                    {
+                        Action = BotAction.UseItem,
+                        PotionSlot = pair.Key,
+                        Reason = $"using quest reward {info.ItemName}",
+                        Subject = info.ItemName
+                    };
+                }
+
+                if (QuestBook.IsBossTrackerReward(info) && TrackerWorthUsing(world, now))
+                {
+                    _rewardTried[info.Index] = now;
+                    _trackerTriedAt = now;
+                    _trackerConfirmed = false;
+                    _lairFoundEmpty = false;
+                    BrainLog?.Invoke($"Boss hunt: reading {info.ItemName} on {world.MapName}.");
+                    return new Decision
+                    {
+                        Action = BotAction.UseItem,
+                        PotionSlot = pair.Key,
+                        Reason = $"reading {info.ItemName} to find the boss",
+                        Subject = info.ItemName
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// A Scroll of Boss Tracking lasts two minutes: read it only where there is a wanted boss
+        /// to find, outside a safe zone (the buff would pause), when none is already in sight or
+        /// being tracked, and either on arrival or after a lair turned out empty. Ten minutes
+        /// between scrolls once one has worked; two after one that did not take.
+        /// </summary>
+        private bool TrackerWorthUsing(WorldModel world, DateTime now)
+        {
+            if (world.InSafeZone || LairsHere(world).Count == 0) return false;
+            if (world.PlayerStats != null && world.PlayerStats[Stat.BossTracker] > 0) return false;
+            if (WantedBossInSight(world) != null) return false;
+
+            TimeSpan wait = _trackerConfirmed ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(2);
+            if (_trackerTriedAt != DateTime.MinValue && now - _trackerTriedAt < wait) return false;
+
+            bool justArrived = now - world.MapEnteredUtc < TimeSpan.FromMinutes(1);
+            return _lairFoundEmpty || justArrived;
+        }
+
+        /// <summary>
+        /// While the quest errand is hunting: its target monsters, nearest first, ahead of other
+        /// monsters - but never ahead of something already hitting us, and never one the danger
+        /// memory refuses.
+        /// </summary>
+        private WorldObject QuestTargetInSight(WorldModel world)
+        {
+            if (Quest == null || Quest.Phase != QuestErrand.ErrandPhase.Hunting ||
+                Quest.HuntTargets.Count == 0) return null;
+            if (world.NearestLiveMonster(1, _unreachable.Keys) != null) return null;
+
+            return world.Objects
+                .Where(x => x.IsLiveMonster && !x.IsPet && Quest.HuntTargets.Contains(x.MonsterIndex) &&
+                            !_unreachable.ContainsKey(x.ObjectID) &&
+                            world.DistanceTo(x.Location) <= _config.AggroRange + 10 &&
+                            !TooDangerous(world, x))
+                .OrderBy(x => world.DistanceTo(x.Location)).FirstOrDefault();
+        }
+
         private WorldObject WantedBossInSight(WorldModel world)
         {
             IReadOnlyList<BossLair> lairs = LairsHere(world);
@@ -2511,6 +2818,10 @@ namespace MirBot
                     return $"{reason} - nothing here for {_config.SweepAfterIdleSeconds}s, " +
                            $"exploring map-wide at {_roamTarget.X},{_roamTarget.Y} " +
                            $"({remaining} tiles; {CoverageAge(_explorationChoice)})";
+
+                case RoamTargetKind.QuestSpawn:
+                    return $"{reason} - searching the quest targets' spawn area at " +
+                           $"{_roamTarget.X},{_roamTarget.Y} ({remaining} tiles)";
 
                 case RoamTargetKind.BossLair:
                     return $"{reason} - heading for the {_lair?.MonsterName ?? "boss"} lair at " +
@@ -2799,6 +3110,12 @@ namespace MirBot
             if (_roamKind == RoamTargetKind.BossLair)
             {
                 MarkLairChecked(_lair, $"abandoned - {why}");
+                ClearRoamTarget();
+                return;
+            }
+
+            if (_roamKind == RoamTargetKind.QuestSpawn)
+            {
                 ClearRoamTarget();
                 return;
             }
@@ -3269,7 +3586,13 @@ namespace MirBot
                 ForgetFight();
             }
 
-            WorldObject next = WantedBossInSight(world) ?? NearestWorthFighting(world);
+            // QUEST HUNTING IS SINGLE-MINDED. While the errand hunts, only its targets are chosen
+            // (plus anything already hitting us); cows and chickens that do not count are left
+            // alone, or every one becomes a corpse to butcher and a detour - Sindo spent minutes
+            // walking between a Pig and a Cow carcass in Bichon Town.
+            WorldObject next = QuestHunting
+                ? QuestTargetInSight(world) ?? world.NearestLiveMonster(1, _unreachable.Keys)
+                : WantedBossInSight(world) ?? NearestWorthFighting(world);
 
             if (next != null)
             {
@@ -3492,9 +3815,15 @@ namespace MirBot
         /// the meat is only reachable this way - so for a bot working low-level ground this is
         /// the difference between earning gold and earning none.
         /// </summary>
+        /// <summary>The quest errand is hunting its targets on this map.</summary>
+        private bool QuestHunting => Quest != null && Quest.Phase == QuestErrand.ErrandPhase.Hunting;
+
         private Decision TryButcher(WorldModel world)
         {
             if (!_config.ButcherEnabled || _butcher == null) return null;
+
+            // Not while hunting quest targets: a carcass is a detour, and the target moves on.
+            if (QuestHunting) return null;
 
             // No room for what it yields, so there is no point making it.
             if (world.MaxBagWeight > 0 && world.WeightPercent >= _config.HeavyWeightPercent)

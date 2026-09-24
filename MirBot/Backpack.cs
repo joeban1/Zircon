@@ -99,6 +99,59 @@ namespace MirBot
             return false;
         }
 
+        /// <summary>
+        /// Would a quest hand-in fit? A batch version of HasRoomFor, mirroring the server's
+        /// CanGainItems(false, checks) over every reward at once (PlayerObject.QuestComplete): a
+        /// refused hand-in is only a chat line, so guessing wrong is a silent loop.
+        ///
+        /// Currency and experience take no slot (Fame Point is currency); a stackable,
+        /// non-expiring reward first tops up matching stacks, the rest - and every non-stackable
+        /// one - needs free slots, and the rewards cannot share a slot between them.
+        /// </summary>
+        public bool HasRoomForRewards(IEnumerable<(ItemInfo Info, long Amount, bool Bound,
+            bool Expirable)> rewards)
+        {
+            int free = FreeSlotCount;
+            Dictionary<int, long> stackRoom = new Dictionary<int, long>();
+
+            foreach ((ItemInfo info, long amount, bool bound, bool expirable) in rewards)
+            {
+                if (info == null || amount <= 0) continue;
+                if (info.ItemEffect == ItemEffect.Experience || IsCurrency(info)) continue;
+
+                long left = amount;
+                int stack = Math.Max(1, info.StackSize);
+
+                if (stack > 1 && !expirable)
+                {
+                    foreach (KeyValuePair<int, ClientUserItem> pair in _inventory)
+                    {
+                        ClientUserItem existing = pair.Value;
+                        if (existing?.Info != info) continue;
+                        if ((existing.Flags & UserItemFlags.Expirable) == UserItemFlags.Expirable) continue;
+                        if (((existing.Flags & UserItemFlags.Bound) == UserItemFlags.Bound) != bound) continue;
+                        if ((existing.Flags & (UserItemFlags.Worthless | UserItemFlags.NonRefinable)) != 0) continue;
+
+                        if (!stackRoom.TryGetValue(pair.Key, out long room))
+                            room = Math.Max(0, stack - existing.Count);
+                        long used = Math.Min(room, left);
+                        stackRoom[pair.Key] = room - used;
+                        left -= used;
+                        if (left <= 0) break;
+                    }
+                }
+
+                if (left <= 0) continue;
+
+                // A new stack still holds up to StackSize even when it cannot MERGE.
+                long slots = (left + stack - 1) / stack;
+                if (slots > free) return false;
+                free -= (int)slots;
+            }
+
+            return true;
+        }
+
         private static bool IsCurrency(ItemInfo info) =>
             Globals.CurrencyInfoList?.Binding != null &&
             Globals.CurrencyInfoList.Binding.Any(x => x.DropItem == info);
@@ -979,9 +1032,20 @@ namespace MirBot
         /// Restoring nothing at all still falls through to the keep list: that is genuinely
         /// unknown territory (food, quest oddities) and not ours to sell on a guess.
         /// </summary>
+        /// <summary>
+        /// A stat buff you drink once (Shape 1, ItemBuffAdd) - tonics, Mir Packages, quest buffs.
+        /// Several carry Health or Mana (Tonic Of Life +70, Tonic Of Mana +70) and looked exactly
+        /// like potions to every rule that reads only stats: counted as potion stock, drunk as a
+        /// heal, offered for unlocking and sale. They are buffs, never potions.
+        /// </summary>
+        public static bool IsItemBuff(ItemInfo info) =>
+            info != null && info.ItemType == ItemType.Consumable &&
+            (info.Shape == 1 || info.Stats[Stat.Duration] != 0);
+
         public static bool IsWeakRestorative(ClientUserItem item) =>
             item?.Info != null &&
             item.Info.ItemType == ItemType.Consumable &&
+            !IsItemBuff(item.Info) &&
             item.Info.Shape != TownTeleportShape &&
             (item.Info.Stats[Stat.Health] > 0 || item.Info.Stats[Stat.Mana] > 0) &&
             !IsHealthPotion(item) && !IsManaPotion(item);
@@ -989,6 +1053,7 @@ namespace MirBot
         public static bool IsHealthPotion(ClientUserItem item) =>
             item?.Info != null &&
             item.Info.ItemType == ItemType.Consumable &&
+            !IsItemBuff(item.Info) &&
             item.Info.Stats[Stat.Health] > 0 &&
             RestoresEnough(item, Stat.Health);
 
@@ -1134,6 +1199,7 @@ namespace MirBot
         public static bool IsManaPotion(ClientUserItem item) =>
             item?.Info != null &&
             item.Info.ItemType == ItemType.Consumable &&
+            !IsItemBuff(item.Info) &&
             item.Info.Stats[Stat.Health] <= 0 &&
             item.Info.Stats[Stat.Mana] > 0 &&
             RestoresEnough(item, Stat.Mana);
@@ -1954,6 +2020,10 @@ namespace MirBot
                 if (item?.Info == null) continue;
                 if (all.Contains(pair.Key)) continue;
                 if ((item.Flags & UserItemFlags.Locked) != UserItemFlags.Locked) continue;
+
+                // Worthless (store purchases, starter kit) can never be sold: unlocking it for a
+                // sale is pointless, and one worthless link voids the whole NPCSell order.
+                if ((item.Flags & UserItemFlags.Worthless) == UserItemFlags.Worthless) continue;
 
                 // Only consumables past their reserve - never gear we might still want.
                 if (item.Info.ItemType != ItemType.Consumable) continue;

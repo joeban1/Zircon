@@ -22,7 +22,7 @@ namespace MirBot
         Banned        // the server IP-banned us; do not retry until it expires
     }
 
-    public enum BotCommandKind { Start, Stop, ForceTownTrip, Revive, Travel, SetConfig, ForceRepair, NextTarget }
+    public enum BotCommandKind { Start, Stop, ForceTownTrip, Revive, Travel, SetConfig, ForceRepair, NextTarget, DoQuests }
 
     /// <summary>A queued command and, for Travel, the map it names.</summary>
     public readonly struct BotCommand
@@ -230,6 +230,10 @@ namespace MirBot
 
                     case BotCommandKind.Travel:
                         StartTravel(queued.Argument);
+                        break;
+
+                    case BotCommandKind.DoQuests:
+                        DoQuests();
                         break;
 
                     case BotCommandKind.SetConfig:
@@ -480,7 +484,15 @@ namespace MirBot
                 if (here.Count == 0) return here;
                 HashSet<int> wanted = _host.BookDrops.Wanted(world.Class, world.Level,
                     world.PlayerStats, world);
-                return here.Where(l => IsMiniBoss(here, l.MonsterIndex) &&
+                // Plus the boss an accepted quest needs (Level 40 - Well done: Crazed Warrior),
+                // chosen deliberately so not filtered to mini-bosses.
+                HashSet<int> questBosses = Config.EnableQuests &&
+                                           world.Level >= Config.QuestBossMinLevel
+                    ? _host.Quests.KillTargets(world).Where(t => t.IsBoss)
+                        .Select(t => t.MonsterIndex).ToHashSet()
+                    : new HashSet<int>();
+                return here.Where(l => questBosses.Contains(l.MonsterIndex) ||
+                                       IsMiniBoss(here, l.MonsterIndex) &&
                                        _host.BookDrops.BossTeaches(l.MonsterIndex, wanted).Any())
                     .ToList();
             };
@@ -518,6 +530,29 @@ namespace MirBot
             _town = new TownTrip(Config, _host.Vendors, _host.Books, _host.SafeZones);
             _brain.Town = _town;
 
+            // Quests (QuestBook/QuestErrand). Everything here runs on this bot's thread - packets
+            // are drained by _connection.Process() in Advance - so no locking is needed.
+            _questErrand = new QuestErrand(Config, _host.Quests, message => _log.Write(message));
+            _brain.Quest = _questErrand;
+            _brain.QuestBook = _host.Quests;
+            _brain.SpawnCells = (monster, map) => _host.BossLairs.SpawnCells(monster, map);
+            _questsLogged = false;
+            _connection.OnQuestChanged = NoteQuestChanged;
+            _connection.OnQuestCancelled = quest => _log.Write(
+                $"Quest: '{quest?.Quest?.QuestName}' cleared by the server (daily reset) - " +
+                "it can be taken again.");
+            _connection.OnDataObjectGone = ob => _brain?.NoteDataObjectGone(ob, _connection.World.MapIndex);
+
+            // The game store (GameStore/StoreShopper), same thread rules as the quests above.
+            _shopper = new StoreShopper
+            {
+                Log = message => _log.Write(message),
+                OnBought = (want, left) => _history.Note("Store", $"bought {want.Name}")
+            };
+            _brain.Store = _host.Store;
+            _brain.Shopper = _shopper;
+            _connection.OnSystemChat = text => _shopper.NoteServerLine(text);
+
             _connection.OnNPCPage = page =>
             {
                 // The trip has to see the page FIRST: PageChanged is what moves it from Talking to
@@ -531,6 +566,7 @@ namespace MirBot
                 // Safe here: packets are drained by _connection.Process() on this bot's own thread,
                 // so this runs on the same thread as Decide and touches no shared state.
                 _town.PageChanged(page);
+                _questErrand?.PageChanged(page);
 
                 string kind = page == null ? "(none)" : page.DialogType.ToString();
                 _log.Write($"NPC page: {kind} | trip {_town.Phase} {_town.Status}" +
@@ -713,6 +749,16 @@ namespace MirBot
             _connection.CheckPendingBuy();
             CheckPendingLearn(decision);
 
+            if (!_questsLogged && _connection.Stage == BotStage.InGame)
+            {
+                _questsLogged = true;
+                List<string> quests = _connection.World.Quests.Where(q => q.Quest != null)
+                    .Select(q => $"{q.Quest.QuestName} ({(q.Completed ? "done" : QuestBook.ProgressText(q))})")
+                    .ToList();
+                _log.Write("Quests: " + (quests.Count == 0 ? "none in the log" : string.Join("; ", quests)));
+                _log.Write($"Store: {_connection.World.HuntGold:N0} Hunt Gold; {StoreStatusText()}.");
+            }
+
             if (decision.TargetID != 0 &&
                 (decision.Action == BotAction.Attack || decision.Action == BotAction.Cast))
                 _attackedAt[decision.TargetID] = DateTime.UtcNow;
@@ -815,6 +861,48 @@ namespace MirBot
         /// Kept manual for now - the button is the trigger, not a timer - so the first journeys can
         /// be watched rather than discovered in a log.
         /// </summary>
+        /// <summary>
+        /// The operator's "Do quests" button: forget an earlier give-up and go to the quest NPC's
+        /// map if there is anything to do there. The errand itself starts on arrival, exactly as
+        /// it does when a bot passes through.
+        /// </summary>
+        private void DoQuests()
+        {
+            if (_connection == null || _connection.Stage != BotStage.InGame || _questErrand == null)
+            {
+                _log.Write("Do quests requested but the bot is not in game.");
+                return;
+            }
+
+            WorldModel world = _connection.World;
+            MapInfo map = _questErrand.QuestNpcMap;
+
+            if (!Config.EnableQuests || map == null)
+            {
+                _log.Write("Do quests: quests are off or no quest NPC is configured.");
+                return;
+            }
+
+            if (!_questErrand.HasWorkOn(world, map.Index))
+            {
+                _log.Write($"Do quests: nothing to do on {map.Description} " +
+                           "(dailies done, nothing acceptable, nothing to hunt there).");
+                return;
+            }
+
+            _questErrand.ClearCooldown();
+            _history.Note("Quest", "requested");
+
+            if (world.MapIndex == map.Index)
+            {
+                _log.Write($"Do quests: already on {map.Description} - starting the errand.");
+                return;
+            }
+
+            _log.Write($"Do quests: heading for {map.Description}.");
+            StartTravel(map.Index.ToString());
+        }
+
         private void StartTravel(string requestedMap = null)
         {
             if (_connection == null || _connection.Stage != BotStage.InGame || _brain?.Travel == null)
@@ -1086,6 +1174,10 @@ namespace MirBot
                                "reachable - falling back to the ordinary choice.");
                 }
             }
+
+            // An accepted quest whose target is a boss (Level 40 - Well done: Crazed Warrior, 45+).
+            // After recovery and supplies, before the ordinary choice; never replaces a journey.
+            if (TryQuestBossJourney(world, hops, Affordable, Permitted, deadly)) return;
 
             // Explore or exploit?
             //
@@ -1457,6 +1549,98 @@ namespace MirBot
             new ConcurrentDictionary<uint, DateTime>();
 
         private volatile BossKillEntry _lastBossKill;
+
+        private QuestErrand _questErrand;
+        private StoreShopper _shopper;
+
+        /// <summary>What the store step is doing, for the log and the bot panel.</summary>
+        private string StoreStatusText()
+        {
+            if (!Config.EnableStore) return "store buying is off";
+
+            StoreWant next = _shopper?.NextWant;
+            long held = _connection?.World.HuntGold ?? 0;
+
+            if (_shopper == null || !_shopper.Evaluated) return "not checked yet";
+            if (next == null) return "every store item on the list is owned";
+            if (_shopper.Pending) return $"buying {next.Name}";
+            if (held < next.Price) return $"saving for {next.Name}: {held:N0} / {next.Price:N0} Hunt Gold";
+            return $"next {next.Name} ({next.Price:N0} Hunt Gold)";
+        }
+        private bool _questsLogged;
+
+        /// <summary>
+        /// S.QuestChanged, already classified. Only real transitions are logged: a quest that
+        /// appears is an accept, Completed going true is a hand-in; kill updates write nothing.
+        /// </summary>
+        private void NoteQuestChanged(QuestTransition transition)
+        {
+            _questErrand?.QuestChanged(transition);
+
+            ClientUserQuest quest = transition?.Quest;
+            if (quest?.Quest == null || (!transition.Accepted && !transition.Completed)) return;
+
+            WorldModel world = _connection.World;
+            string rewards = QuestBook.RewardNames(quest.Quest, world.Class);
+            string evt = transition.Completed ? "completed" : "accepted";
+
+            _log.Write($"Quest: {evt} '{quest.Quest.QuestName}'" +
+                       (transition.Completed ? $" - {rewards}" : $" - {QuestBook.ProgressText(quest)}") + ".");
+
+            _host.QuestLog.Record(new QuestLogEntry
+            {
+                Bot = Id, Character = world.Name, Class = world.Class.ToString(), Level = world.Level,
+                QuestIndex = quest.QuestIndex, Quest = quest.Quest.QuestName, Event = evt,
+                MapIndex = world.MapIndex, Map = world.MapName, Utc = DateTime.UtcNow,
+                Rewards = transition.Completed ? rewards : ""
+            });
+
+            if (transition.Completed && Config.NotifyQuest)
+                Notify($"quest:{quest.QuestIndex}", $"{world.Name} completed {quest.Quest.QuestName}",
+                    string.IsNullOrEmpty(rewards) ? "quest complete" : rewards, TimeSpan.FromMinutes(5));
+        }
+
+        /// <summary>
+        /// Journey to the boss an accepted quest needs, if the rules allow: quests enabled, level
+        /// at least QuestBossMinLevel, no more than two such journeys per quest in six hours
+        /// (counted in the quest log, so a restart does not reset it), not already on a map it
+        /// lives on, and a reachable, affordable, permitted map that has not killed us.
+        /// </summary>
+        private bool TryQuestBossJourney(WorldModel world, Dictionary<int, int> hops,
+            AffordableCheck affordable, Func<int, bool> permitted, HashSet<int> deadly)
+        {
+            if (!Config.EnableQuests || world.Level < Config.QuestBossMinLevel) return false;
+
+            QuestKillTarget target = _host.Quests.KillTargets(world).FirstOrDefault(t => t.IsBoss);
+            if (target == null) return false;
+
+            if (_host.QuestLog.JourneysSince(Id, target.Quest.Index,
+                    DateTime.UtcNow - TimeSpan.FromHours(6)) >= 2) return false;
+
+            HashSet<int> maps = new HashSet<int>(_host.BossLairs.MapsForMonster(target.MonsterIndex));
+            maps.UnionWith(target.Maps);
+            if (maps.Contains(world.MapIndex)) return false;   // here already: the lairs do the rest
+
+            int best = maps.Where(m => hops.ContainsKey(m) && permitted(m) &&
+                                       (deadly == null || !deadly.Contains(m)) && affordable(m, out _))
+                .OrderBy(m => hops[m]).ThenBy(m => m).DefaultIfEmpty(-1).First();
+            if (best < 0) return false;
+
+            string mapName = _host.Profiles.For(best)?.MapName ?? $"map {best}";
+            Begin(best, mapName, $"quest '{target.Quest.QuestName}': kill {target.MonsterName}",
+                  displayReason: $"quest: kill {target.MonsterName}");
+
+            if (_brain.Travel == null || !_brain.Travel.Active) return false;
+
+            _host.QuestLog.Record(new QuestLogEntry
+            {
+                Bot = Id, Character = world.Name, Class = world.Class.ToString(), Level = world.Level,
+                QuestIndex = target.Quest.Index, Quest = target.Quest.QuestName, Event = "journey",
+                MapIndex = best, Map = mapName, Utc = DateTime.UtcNow,
+                Rewards = $"setting off to kill {target.MonsterName}"
+            });
+            return true;
+        }
 
         /// <summary>
         /// The rule that separates mini-bosses from bosses in System.db, which has no flag for it:
@@ -2282,8 +2466,22 @@ namespace MirBot
                                 DateTime.UtcNow - UnproductiveSince() >
                                     TimeSpan.FromMinutes(Config.UnproductiveMinutes);
 
+            // A quest errand that just ended (Bichon: handed in, accepted, hunted) is the moment
+            // to move on - it is not a town trip, so nothing else would reconsider travel.
+            bool questFinished = _questErrand != null && _questErrand.JustFinished;
+            if (questFinished) _questErrand.JustFinished = false;
+
+            // While the errand owns the bot here, "this town is outgrown / pays nothing" must not
+            // walk it off mid-errand; it ends within minutes and triggers travel itself.
+            if (_questErrand != null && _questErrand.OwnsMovement)
+            {
+                barren = false;
+                outgrownHere = false;
+                unproductive = false;
+            }
+
             if (!tripJustFinished && !barren && !outgrownHere && !storageTravel &&
-                !unproductive && !recoveryRoute)
+                !unproductive && !recoveryRoute && !questFinished)
                 return;
 
             if (unproductive)
@@ -3239,6 +3437,7 @@ namespace MirBot
         {
             if (_state != BotRunState.Playing) return "offline";
             if (_town != null && _town.Active) return "town";
+            if (_questErrand != null && _questErrand.Active) return "quest";
             if (_brain?.Travel != null && _brain.Travel.Active) return "travel";
 
             return "hunting";
@@ -3497,6 +3696,28 @@ namespace MirBot
                 MoneyDiagnostic = _moneyDiagnostic,
 
                 Skills = skills,
+                Buffs = world.Buffs.Select(b => new BuffStatus
+                {
+                    Name = b.Type == BuffType.ItemBuff
+                        ? Globals.ItemInfoList?.Binding?.FirstOrDefault(i => i.Index == b.ItemIndex)?.ItemName
+                          ?? "Item buff"
+                        : b.Type.ToString(),
+                    Permanent = b.RemainingTime == TimeSpan.MaxValue,
+                    RemainingSeconds = world.BuffRemaining(b) is TimeSpan left ? (int)left.TotalSeconds : null,
+                    Paused = b.Pause,
+                    Stats = FlattenStats(b.Stats)
+                }).OrderBy(b => b.Name).ToList(),
+                Quests = world.Quests.Where(q => q.Quest != null).Select(q => new QuestStatus
+                {
+                    Name = q.Quest.QuestName ?? "",
+                    Progress = QuestBook.ProgressText(q),
+                    Completed = q.Completed,
+                    ReadyToHandIn = !q.Completed && QuestBook.AllTasksDone(q),
+                    Daily = q.Quest.QuestType == QuestType.Daily
+                }).OrderBy(q => q.Completed).ThenBy(q => q.Name).ToList(),
+                QuestStatusText = _questErrand?.Status ?? "",
+                HuntGold = world.HuntGold,
+                StoreStatusText = StoreStatusText(),
                 PetMode = world.PetMode.ToString(),
                 Pets = pets,
                 Equipment = equipment,
