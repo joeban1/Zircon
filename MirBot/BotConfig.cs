@@ -261,6 +261,19 @@ namespace MirBot
         public bool NotifyFault = true;
         public bool NotifyQuest = true;
         public bool NotifyFame = true;
+        public bool NotifyCombine = true;
+
+        /// <summary>
+        /// Take a full set of combination pieces (Rusty / Cracked / Worn ...) to the NPC and
+        /// combine them. Pieces are banked until a set is complete (see CombineBook).
+        /// </summary>
+        public bool EnableCombine = true;
+
+        /// <summary>
+        /// NPCs whose page trees are read for combination recipes. Host-wide: the book is built
+        /// once, so the host uses the default unless the first bot's ini overrides it.
+        /// </summary>
+        public string CombineNPCs = "Payton";
 
         /// <summary>Take and complete the database's quests (see QuestBook).</summary>
         public bool EnableQuests = true;
@@ -1091,6 +1104,9 @@ namespace MirBot
                 case "maxconsecutivequesthunts": config.MaxConsecutiveQuestHunts = int.Parse(value); break;
                 case "enablefame": config.EnableFame = bool.Parse(value); break;
                 case "notifyfame": config.NotifyFame = bool.Parse(value); break;
+                case "notifycombine": config.NotifyCombine = bool.Parse(value); break;
+                case "enablecombine": config.EnableCombine = bool.Parse(value); break;
+                case "combinenpcs": config.CombineNPCs = value; break;
                 case "questbossminlevel": config.QuestBossMinLevel = int.Parse(value); break;
                 case "enablestore": config.EnableStore = bool.Parse(value); break;
                 case "storerebuyminutes": config.StoreRebuyMinutes = int.Parse(value); break;

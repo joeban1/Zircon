@@ -33,11 +33,27 @@ namespace Client.Envir
 
         public decimal ChancePercent => Chance <= 0 ? 0m : 100m / Chance;
 
+        /// <summary>Set for an NPC combination instead of a monster drop; Monster is then null.</summary>
+        public NPCInfo Npc { get; }
+
+        /// <summary>"Rusty + Cracked + Worn Seal Of Overlord + 2,000,000 gold" for a combination.</summary>
+        public string Recipe { get; }
+
+        public bool IsCraft => Npc != null;
+
         public MonsterDropSource(MonsterInfo monster, MapInfo map, int chance)
         {
             Monster = monster;
             Map = map;
             Chance = chance;
+        }
+
+        public MonsterDropSource(NPCInfo npc, MapInfo map, int chance, string recipe)
+        {
+            Npc = npc;
+            Map = map;
+            Chance = chance;
+            Recipe = recipe;
         }
     }
 
@@ -134,6 +150,144 @@ namespace Client.Envir
                 .ToList();
 
             return _DroppableItems;
+        }
+
+        private static List<BrowsableItem> _BrowsableItems;
+        private static Dictionary<ItemInfo, List<MonsterDropSource>> _CraftSources;
+
+        /// <summary>
+        /// What the item browser lists: every droppable item, plus every item an NPC combination
+        /// makes. Without the second half the finished lair accessories (Seal/Bracelet/Medallion
+        /// Of Overlord and the rest) never appeared - no monster drops them, only Payton does.
+        /// </summary>
+        public static IReadOnlyList<BrowsableItem> GetBrowsableItems()
+        {
+            if (_BrowsableItems != null) return _BrowsableItems;
+
+            List<BrowsableItem> items = GetDroppableItems().ToList();
+            HashSet<ItemInfo> listed = new HashSet<ItemInfo>(items.Select(x => x.Item));
+
+            foreach (ItemInfo item in CraftSources().Keys)
+                if (listed.Add(item))
+                    items.Add(new BrowsableItem(item));
+
+            _BrowsableItems = items
+                .OrderBy(x => x.Item.ItemName, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+
+            return _BrowsableItems;
+        }
+
+        /// <summary>The NPC combinations that make this item, as source rows.</summary>
+        public static List<MonsterDropSource> GetCraftSources(ItemInfo item)
+        {
+            if (item != null && CraftSources().TryGetValue(item, out List<MonsterDropSource> sources))
+                return sources;
+
+            return new List<MonsterDropSource>();
+        }
+
+        /// <summary>
+        /// Every NPC combination, keyed by what it makes. A combination is a page whose actions
+        /// TakeItem (and usually TakeGold), whose SuccessPage then gives an item - GiveItem or
+        /// GiveItemExperience - after an optional Random(N) Equal roll. That is exactly what the
+        /// server runs (NPCObject: checks, then actions, then the success page), so the chance
+        /// shown is the real one: Payton's Random(10) is 1 in 10.
+        /// </summary>
+        private static Dictionary<ItemInfo, List<MonsterDropSource>> CraftSources()
+        {
+            if (_CraftSources != null) return _CraftSources;
+
+            Dictionary<ItemInfo, List<MonsterDropSource>> result = new Dictionary<ItemInfo, List<MonsterDropSource>>();
+
+            // Which NPC each page belongs to, by walking each NPC's buttons from its entry page.
+            Dictionary<NPCPage, NPCInfo> owner = new Dictionary<NPCPage, NPCInfo>();
+
+            if (Globals.NPCInfoList?.Binding != null)
+            {
+                foreach (NPCInfo npc in Globals.NPCInfoList.Binding)
+                {
+                    if (npc?.EntryPage == null) continue;
+
+                    Queue<(NPCPage Page, int Depth)> queue = new Queue<(NPCPage, int)>();
+                    queue.Enqueue((npc.EntryPage, 0));
+
+                    while (queue.Count > 0)
+                    {
+                        (NPCPage page, int depth) = queue.Dequeue();
+                        if (page == null || owner.ContainsKey(page)) continue;
+
+                        owner[page] = npc;
+                        if (depth >= 8 || page.Buttons == null) continue;
+
+                        foreach (NPCButton button in page.Buttons)
+                            if (button?.DestinationPage != null)
+                                queue.Enqueue((button.DestinationPage, depth + 1));
+                    }
+                }
+            }
+
+            foreach (KeyValuePair<NPCPage, NPCInfo> pair in owner)
+            {
+                NPCPage page = pair.Key;
+                if (page.Actions == null) continue;
+
+                List<NPCAction> takes = page.Actions
+                    .Where(x => x?.ActionType == NPCActionType.TakeItem && x.ItemParameter1 != null)
+                    .ToList();
+                if (takes.Count == 0) continue;
+
+                NPCPage success = page.SuccessPage;
+                NPCAction give = success?.Actions?.FirstOrDefault(IsGiveItem) ?? page.Actions.FirstOrDefault(IsGiveItem);
+                if (give == null) continue;
+
+                NPCCheck roll = success?.Checks?.FirstOrDefault(x =>
+                    x?.CheckType == NPCCheckType.Random && x.Operator == Operator.Equal &&
+                    x.IntParameter1 > 1 && x.IntParameter2 >= 0 && x.IntParameter2 < x.IntParameter1);
+
+                long gold = page.Actions.Where(x => x?.ActionType == NPCActionType.TakeGold)
+                    .Sum(x => (long)x.IntParameter1);
+
+                string recipe = RecipeText(takes) + (gold > 0 ? $" + {gold:N0} gold" : string.Empty);
+
+                if (!result.TryGetValue(give.ItemParameter1, out List<MonsterDropSource> list))
+                    result[give.ItemParameter1] = list = new List<MonsterDropSource>();
+
+                list.Add(new MonsterDropSource(pair.Value, pair.Value.Region?.Map, roll?.IntParameter1 ?? 1, recipe));
+            }
+
+            _CraftSources = result;
+            return _CraftSources;
+        }
+
+        private static bool IsGiveItem(NPCAction action) =>
+            (action?.ActionType == NPCActionType.GiveItem || action?.ActionType == NPCActionType.GiveItemExperience) &&
+            action.ItemParameter1 != null;
+
+        /// <summary>"Rusty + Cracked + Worn Seal Of Overlord" when the pieces share a name.</summary>
+        private static string RecipeText(List<NPCAction> takes)
+        {
+            List<string> names = takes.Select(x => x.ItemParameter1.ItemName ?? string.Empty).ToList();
+
+            if (names.Count > 1)
+            {
+                List<string[]> words = names.Select(x => x.Split(' ')).ToList();
+                int common = 0;
+
+                while (words.All(w => common < w.Length - 1) &&
+                       words.All(w => w[w.Length - 1 - common] == words[0][words[0].Length - 1 - common]))
+                    common++;
+
+                if (common > 0)
+                {
+                    string suffix = string.Join(" ", words[0].Skip(words[0].Length - common));
+                    string prefixes = string.Join(" + ", words.Select(w => string.Join(" ", w.Take(w.Length - common))));
+                    return prefixes + " " + suffix;
+                }
+            }
+
+            return string.Join(" + ", takes.Select(x =>
+                (x.IntParameter1 > 1 ? $"{x.IntParameter1} x " : string.Empty) + x.ItemParameter1.ItemName));
         }
 
         /// <summary>

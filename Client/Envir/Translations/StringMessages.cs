@@ -155,6 +155,8 @@ namespace Client.Envir.Translations
         public abstract string BigMapBrowserSelectItem { get; set; }
         public abstract string BigMapBrowserLevelFormat { get; set; }
         public abstract string BigMapBrowserNotSpawned { get; set; }
+        public abstract string BigMapBrowserCraftFormat { get; set; }
+        public abstract string BigMapBrowserCraftHint { get; set; }
         public abstract string GuidesTitle { get; set; }
         public abstract string GuidesItemProgressionTitle { get; set; }
         public abstract string GuidesSectionWeapons { get; set; }

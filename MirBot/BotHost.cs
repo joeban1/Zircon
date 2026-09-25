@@ -56,6 +56,9 @@ namespace MirBot
 
         /// <summary>Fame ranks and the fame NPC.</summary>
         public FameBook Fame { get; } = new FameBook();
+
+        /// <summary>NPC combinations (Payton's Rusty / Lair accessories) and their pieces.</summary>
+        public CombineBook Combines { get; } = new CombineBook();
         public ProgressHistory Progress { get; private set; }
 
         /// <summary>Phone notifications; a disabled no-op until Prepare has run.</summary>
@@ -624,6 +627,10 @@ namespace MirBot
 
             Fame.Build();
             foreach (string line in Fame.Report) Log.Write("Fame: " + line);
+
+            Combines.Build(new BotConfig().CombineNPCs);
+            Backpack.Combines = Combines;
+            foreach (string line in Combines.Report) Log.Write("Combine: " + line);
 
             Progress = new ProgressHistory(Path.Combine(memory, "progress.json"));
             Gold = new GoldLog(Path.Combine(memory, "gold.ndjson"));

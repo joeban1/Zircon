@@ -155,6 +155,8 @@ namespace Client.Envir.Translations
         public override string BigMapBrowserSelectItem { get; set; } = "Select an item.";
         public override string BigMapBrowserLevelFormat { get; set; } = "Lv{0}";
         public override string BigMapBrowserNotSpawned { get; set; } = "Not spawned";
+        public override string BigMapBrowserCraftFormat { get; set; } = "{0} (combine)";
+        public override string BigMapBrowserCraftHint { get; set; } = "Combined by {0} in {1}: {2}";
         public override string GuidesTitle { get; set; } = "Guides";
         public override string GuidesItemProgressionTitle { get; set; } = "{0} Item Progression";
         public override string GuidesSectionWeapons { get; set; } = "Weapons";

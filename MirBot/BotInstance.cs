@@ -563,6 +563,13 @@ namespace MirBot
                 OnPromoted = NotePromoted
             };
             _brain.Fame = _fameErrand;
+
+            // Combinations (CombineBook/CombineErrand): a full set of pieces taken to Payton.
+            _combineErrand = new CombineErrand(Config, _host.Combines, message => _log.Write(message))
+            {
+                OnCombined = NoteCombined
+            };
+            _brain.Combine = _combineErrand;
             _connection.OnSystemChat = text =>
             {
                 _shopper.NoteServerLine(text);
@@ -584,6 +591,7 @@ namespace MirBot
                 _town.PageChanged(page);
                 _questErrand?.PageChanged(page);
                 _fameErrand?.PageChanged(page);
+                _combineErrand?.PageChanged(page);
 
                 string kind = page == null ? "(none)" : page.DialogType.ToString();
                 _log.Write($"NPC page: {kind} | trip {_town.Phase} {_town.Status}" +
@@ -1777,6 +1785,96 @@ namespace MirBot
 
         private DateTime _lastFameTrip = DateTime.MinValue;
         private DateTime _famePendingUntil = DateTime.MinValue;
+
+        private CombineErrand _combineErrand;
+        private DateTime _combinePendingUntil = DateTime.MinValue;
+
+        /// <summary>Gold kept back beyond a combination's fee: fares there and back, and the floor.</summary>
+        private long CombineReserve => Config.TeleportGoldFloor + 50000;
+
+        private int _combineReachMap = -1, _combineReachFrom = -1;
+        private bool _combineReachable;
+        private DateTime _combineReachAt = DateTime.MinValue;
+
+        /// <summary>Can this character get to the recipe's NPC from here? Cached ten minutes.</summary>
+        private bool CombineReachable(CombineRecipe recipe)
+        {
+            WorldModel world = _connection.World;
+            int map = recipe.Map?.Index ?? -1;
+
+            if (map != _combineReachMap || world.MapIndex != _combineReachFrom ||
+                DateTime.UtcNow - _combineReachAt > TimeSpan.FromMinutes(10))
+            {
+                _combineReachMap = map;
+                _combineReachFrom = world.MapIndex;
+                _combineReachAt = DateTime.UtcNow;
+                _combineReachable = map >= 0 && (world.MapIndex == map ||
+                    _host.World.HopCounts(world.MapIndex, world.Class, world.Level, world.Gold,
+                        Config.TeleportGoldFloor, world.PKPoints, Config.TeleportMaxGoldPercent)
+                    .ContainsKey(map));
+            }
+
+            return _combineReachable;
+        }
+
+        /// <summary>
+        /// Tell the bag which combination (if any) is ready - a full set across bag and bank, the
+        /// fee on top of the reserve, and the NPC reachable - so the town trip withdraws its pieces
+        /// and does not bank them again.
+        /// </summary>
+        private DateTime _nextCombineCheck = DateTime.MinValue;
+
+        private void UpdateCombineReady()
+        {
+            if (_connection?.Items == null || DateTime.UtcNow < _nextCombineCheck) return;
+            _nextCombineCheck = DateTime.UtcNow.AddSeconds(2);
+
+            CombineRecipe ready = null;
+
+            if (Config.EnableCombine && _connection.Stage == BotStage.InGame && !_connection.World.Dead)
+            {
+                ready = _host.Combines.Ready(_connection.Items, _connection.World.Gold, CombineReserve,
+                    bagOnly: false);
+                if (ready != null && !CombineReachable(ready)) ready = null;
+            }
+
+            if (ready?.RequestPage.Index != _connection.Items.CombineReady?.RequestPage.Index)
+                _log.Write(ready == null
+                    ? "Combine: no set ready any more."
+                    : $"Combine: full {ready.Name} set held - withdrawing it at the next town trip.");
+
+            _connection.Items.CombineReady = ready;
+        }
+
+        private void NoteCombined(CombineRecipe recipe, bool success)
+        {
+            WorldModel world = _connection.World;
+
+            _history.Note("Combine", $"{recipe.Name} {(success ? "succeeded" : "failed")}");
+            _host.QuestLog.Record(new QuestLogEntry
+            {
+                Bot = Id, Character = world.Name, Class = world.Class.ToString(), Level = world.Level,
+                QuestIndex = 0, Quest = $"Combine: {recipe.Name}", Event = success ? "combined" : "combine failed",
+                MapIndex = world.MapIndex, Map = world.MapName, Utc = DateTime.UtcNow,
+                Rewards = success ? recipe.Name : $"lost {recipe}"
+            });
+
+            if (Config.NotifyCombine)
+                Notify($"combine:{recipe.Output.Index}:{DateTime.UtcNow.Ticks}",
+                    success ? $"{world.Name} combined {recipe.Name}!"
+                            : $"{world.Name}'s {recipe.Name} combination failed",
+                    recipe.ToString(), TimeSpan.Zero);
+        }
+
+        /// <summary>"Seal Of Overlord - Rusty ✓ Cracked ✓ Worn ✗" plus what the errand is doing.</summary>
+        private string CombineStatusText()
+        {
+            if (_connection?.Items == null || !Config.EnableCombine) return "";
+
+            string progress = _host.Combines.Progress(_connection.Items);
+            string errand = _combineErrand?.Status ?? "";
+            return string.Join(" - ", new[] { errand, progress }.Where(s => !string.IsNullOrEmpty(s)));
+        }
         private DateTime _fameNoRouteUntil = DateTime.MinValue;
 
         private void NoteQuestChanged(QuestTransition transition)
@@ -2770,11 +2868,19 @@ namespace MirBot
                 _fameErrand.JustFinished = false;
                 questFinished = true;           // same meaning: an errand ended, move on
             }
+            if (_combineErrand != null && _combineErrand.JustFinished)
+            {
+                _combineErrand.JustFinished = false;
+                questFinished = true;
+            }
+
+            UpdateCombineReady();
 
             // While the errand owns the bot here, "this town is outgrown / pays nothing" must not
             // walk it off mid-errand; it ends within minutes and triggers travel itself.
             if (_questErrand != null && _questErrand.OwnsMovement ||
-                _fameErrand != null && _fameErrand.OwnsMovement)
+                _fameErrand != null && _fameErrand.OwnsMovement ||
+                _combineErrand != null && _combineErrand.OwnsMovement)
             {
                 barren = false;
                 outgrownHere = false;
@@ -2811,7 +2917,33 @@ namespace MirBot
             // a quest errand about to start - Wizzler hit level 45 with 11,500 FP and, trip after
             // trip in Lost Paradise, the quest errand took the moment every time.
             if (tripJustFinished && _town != null && _town.LastTripTraded)
+            {
                 _famePendingUntil = DateTime.UtcNow.AddMinutes(10);
+                _combinePendingUntil = DateTime.UtcNow.AddMinutes(10);
+            }
+
+            // COMBINE: the town trip withdrew a full set (Backpack.CombineReady drove the reclaim),
+            // so take it to the NPC - same window and same "nothing else owed" rules as fame.
+            if (DateTime.UtcNow < _combinePendingUntil && !active && _town != null && !recoveryRoute &&
+                !townNeed && _connection != null && !_connection.World.Dead && Config.EnableCombine &&
+                _combineErrand != null && !_combineErrand.Active &&
+                (_brain?.Travel == null || !_brain.Travel.Active) &&
+                (_questErrand == null || !_questErrand.Active) &&
+                (_fameErrand == null || !_fameErrand.Active))
+            {
+                WorldModel cw = _connection.World;
+                CombineRecipe set = _host.Combines.Ready(_connection.Items, cw.Gold, CombineReserve, bagOnly: true);
+
+                if (set?.Map != null && cw.MapIndex != set.Map.Index && CombineReachable(set))
+                {
+                    _combinePendingUntil = DateTime.MinValue;
+                    _log.Write($"Combine: full {set.Name} set in the bag - heading for {set.Map.Description} " +
+                               $"({set.Npc.NPCName}, {set.Gold:N0} gold, 1 in {set.ChanceOneIn}).");
+                    _town.ClearReturn();
+                    StartTravel(set.Map.Index.ToString());
+                    return;
+                }
+            }
 
             if (DateTime.UtcNow < _famePendingUntil && !active && _town != null && !recoveryRoute &&
                 _host.Vendors.TownMaps.Contains(_connection?.World.MapIndex ?? -1) &&
@@ -2860,6 +2992,7 @@ namespace MirBot
                 (_brain?.Travel == null || !_brain.Travel.Active) &&
                 (_questErrand == null || !_questErrand.Active) &&
                 (_fameErrand == null || !_fameErrand.Active) &&
+                (_combineErrand == null || !_combineErrand.Active) &&
                 DateTime.UtcNow >= _nextNoHuntCheck)
             {
                 _nextNoHuntCheck = DateTime.UtcNow.AddMinutes(2);
@@ -3902,6 +4035,7 @@ namespace MirBot
             if (_town != null && _town.Active) return "town";
             if (_questErrand != null && _questErrand.Active) return "quest";
             if (_fameErrand != null && _fameErrand.Active) return "quest";
+            if (_combineErrand != null && _combineErrand.Active) return "quest";
             if (_brain?.Travel != null && _brain.Travel.Active) return "travel";
 
             return "hunting";
@@ -4186,6 +4320,7 @@ namespace MirBot
                 StoreStatusText = StoreStatusText(),
                 FamePoints = world.FamePoints,
                 FameStatusText = FameStatusText(),
+                CombineStatusText = CombineStatusText(),
                 PetMode = world.PetMode.ToString(),
                 Pets = pets,
                 Equipment = equipment,

@@ -497,7 +497,8 @@ const CARD_HTML = `
              <path class="fill" data-r="sparkfill"></path><path data-r="sparkline"></path></svg></div>
       <div><div class="k">Hunt Gold</div><div class="v" data-r="huntgold"></div>
            <div class="detail" data-r="storestatus"></div>
-           <div class="detail" data-r="famestatus"></div></div>
+           <div class="detail" data-r="famestatus"></div>
+           <div class="detail" data-r="combinestatus"></div></div>
       <div><div class="k">Bag</div><div class="v" data-r="bag"></div></div>
       <div><div class="k">Location</div><div class="v" data-r="loc"></div>
            <div class="detail" data-r="locdetail"></div></div>
@@ -804,6 +805,7 @@ function patch(card, b) {
   text(el.huntgold, String(b.huntGold ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, ","));
   text(el.storestatus, b.storeStatusText ? "Store: " + b.storeStatusText : "");
   text(el.famestatus, b.fameStatusText ? "Fame: " + b.fameStatusText : "");
+  text(el.combinestatus, b.combineStatusText ? "Combine: " + b.combineStatusText : "");
 
   drawSpark(card, goldSeries.get(b.id));
   drawMap(card, b);
@@ -1801,6 +1803,7 @@ const NOTIFY_TYPES = [
   { key:"NotifySkill",   label:"Skills learned", example:"Jill learned Soul Shield" },
   { key:"NotifyQuest",   label:"Quests completed", example:"Sindo completed Do your dailies 2 - Daily Buffs v2 [T], Scroll Of Boss Tracking x2" },
   { key:"NotifyFame",    label:"Fame ranks", example:"Mirbot reached fame rank Village Explorer - DC/MC/SC +4" },
+  { key:"NotifyCombine", label:"Combinations", example:"Toby combined Seal Of Overlord!" },
   { key:"NotifyFault",   label:"Bot faults",     example:"Mirbot4 stopped - needs attention" },
   { key:"NotifyDeath",   label:"Deaths",         example:"Sindo died - killed by Stone Golem on Desert (can be noisy)" }
 ];

@@ -556,6 +556,10 @@ namespace MirBot
         {
             if (item?.Info == null) return false;
 
+            // Combination pieces and what they combine into: always worth the bank. Checked first
+            // so no gear rule below - a Cracked ring is wearable at level 20 - decides their fate.
+            if (IsCombinePiece(item) || IsCombineOutput(item)) return true;
+
             // Supplies are for the bag, not future equipment. This also guards against a
             // consumable with an unusual level requirement entering the storage path.
             if (item.Info.ItemType == ItemType.Consumable) return false;
@@ -630,9 +634,36 @@ namespace MirBot
             int level, Stats stats, MagicBooks books, WorldModel world)
         {
             if (!WorthStoring(item, mirClass, gender, level, stats, books, world)) return false;
+
+            // Pieces are banked - except the ones a ready combination is carrying to the NPC, or
+            // the trip that withdrew them would put them straight back.
+            if (IsCombinePiece(item)) return CombineReady == null || !CombineReady.Uses(item.Info);
+            if (IsCombineOutput(item)) return true;
+
             if (item.Info.ItemType == ItemType.Book || IsItemPart(item) || IsPartCrafted(item)) return true;
             return BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass);
         }
+
+        /// <summary>The NPC combinations the pieces are for. Host-wide, built once (BotHost).</summary>
+        public static CombineBook Combines;
+
+        /// <summary>
+        /// A combination whose full set this bot holds and can pay for: its pieces come out of the
+        /// bank and stay in the bag until the NPC takes them. Set by BotInstance each tick.
+        /// </summary>
+        public CombineRecipe CombineReady;
+
+        /// <summary>A piece of an NPC combination (Rusty / Cracked / Worn / Scratched ...).</summary>
+        public static bool IsCombinePiece(ClientUserItem item) =>
+            item?.Info != null && Combines?.IsPiece(item.Info) == true;
+
+        public static bool IsCombinePiece(ItemInfo info) => Combines?.IsPiece(info) == true;
+
+        /// <summary>What a combination yields (Seal Of Overlord ...): kept like part-crafted gear.</summary>
+        public static bool IsCombineOutput(ClientUserItem item) =>
+            item?.Info != null && Combines?.IsOutput(item.Info) == true;
+
+        public static bool IsCombineOutput(ItemInfo info) => Combines?.IsOutput(info) == true;
 
         /// <summary>Gear that item parts combine into (its ItemInfo has a PartCount).</summary>
         public static bool IsPartCrafted(ClientUserItem item) =>
@@ -706,8 +737,16 @@ namespace MirBot
                 // the only way out of storage used to be becoming USABLE.
                 if (IsItemPart(item)) continue;
 
-                // Part-crafted gear only ever comes out to be WORN - never to be sold.
-                if (IsPartCrafted(item))
+                // Combination pieces come out only for the combination their set completes.
+                if (IsCombinePiece(item))
+                {
+                    if (CombineReady != null && CombineReady.Uses(item.Info))
+                        found.Add(new Reclaim(pair.Key, item, $"combination: {CombineReady.Name} set complete"));
+                    continue;
+                }
+
+                // Part-crafted and combined gear only ever comes out to be WORN - never to be sold.
+                if (IsPartCrafted(item) || IsCombineOutput(item))
                 {
                     if (CanEquip(item, mirClass, gender) && MeetsRequirement(item.Info, level, stats) &&
                         BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass))
@@ -1498,6 +1537,9 @@ namespace MirBot
             // overweight blocks running, so the bot ends up slow AND unable to carry anything.
             if (full) return false;
 
+            // Combination pieces: rare, and a set is only as good as its rarest piece.
+            if (IsCombinePiece(info) || IsCombineOutput(info)) return true;
+
             if (isConsumable)
             {
                 // Potions are the difference between fighting safely and dying, but they are not
@@ -1577,6 +1619,8 @@ namespace MirBot
             if (info.ItemType == ItemType.Currency || !OccupiesASlot(probe)) return true;
 
             if (info.ItemType == ItemType.ItemPart) return true;
+
+            if (IsCombinePiece(info) || IsCombineOutput(info)) return true;
 
             // Stackable materials (Zombie Bone: 400 each, stacks) cost one slot for the whole
             // stack, so a pile of them is worth carrying even when a single drop is not.
@@ -2110,6 +2154,9 @@ namespace MirBot
 
             // Likewise what parts combine into: kept (worn or banked), never sold.
             if (IsPartCrafted(item)) return false;
+
+            // Combination pieces and results are never vendor fodder.
+            if (IsCombinePiece(item) || IsCombineOutput(item)) return false;
 
             if (!item.Info.CanSell) return false;
             if ((item.Flags & UserItemFlags.Locked) == UserItemFlags.Locked) return false;
@@ -2760,6 +2807,9 @@ namespace MirBot
                 ClientUserItem item = pair.Value;
 
                 if (!CanEquip(item, mirClass, gender)) continue;
+
+                // A Cracked or Worn ring is wearable at level 20, but worn it cannot be combined.
+                if (IsCombinePiece(item)) continue;
 
                 bool locked = (item.Flags & UserItemFlags.Locked) == UserItemFlags.Locked;
                 if (locked != lockedOnly) continue;

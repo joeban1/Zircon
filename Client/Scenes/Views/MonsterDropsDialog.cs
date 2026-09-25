@@ -588,7 +588,7 @@ namespace Client.Scenes.Views
 
             _FilteredItems.Clear();
 
-            foreach (BrowsableItem entry in MonsterDropHelper.GetDroppableItems())
+            foreach (BrowsableItem entry in MonsterDropHelper.GetBrowsableItems())
             {
                 if (type.HasValue && entry.Item.ItemType != type.Value) continue;
                 if (mirClass.HasValue && !MonsterDropHelper.MatchesClass(entry.Item, mirClass.Value)) continue;
@@ -670,7 +670,10 @@ namespace Client.Scenes.Views
             _Sources.Clear();
 
             if (item != null)
+            {
                 _Sources.AddRange(MonsterDropHelper.GetDropSources(item));
+                _Sources.AddRange(MonsterDropHelper.GetCraftSources(item));
+            }
 
             if (SourceScrollBar != null)
             {
@@ -970,9 +973,28 @@ namespace Client.Scenes.Views
                 LevelLabel.Text = string.Empty;
                 MapLabel.Text = string.Empty;
                 ChanceLabel.Text = string.Empty;
+                MonsterLabel.Hint = null;
+                MapLabel.Hint = null;
+            }
+            else if (source.IsCraft)
+            {
+                // An NPC combination: who makes it, where, the recipe, and the real odds.
+                string where = source.Map?.PlayerDescription ?? CEnvir.Language.BigMapBrowserNotSpawned;
+                string full = string.Format(CEnvir.Language.BigMapBrowserCraftHint, source.Npc.NPCName, where, source.Recipe);
+
+                MonsterLabel.Text = string.Format(CEnvir.Language.BigMapBrowserCraftFormat, source.Npc.NPCName);
+                MonsterLabel.ForeColour = Color.LightGreen;
+                MonsterLabel.Hint = full;
+                LevelLabel.Text = string.Empty;
+                MapLabel.Text = source.Recipe;
+                MapLabel.ForeColour = Color.LightSteelBlue;
+                MapLabel.Hint = full;
+                ChanceLabel.Text = MonsterDropHelper.FormatChance(source.ChancePercent);
             }
             else
             {
+                MonsterLabel.Hint = null;
+                MapLabel.Hint = null;
                 MonsterLabel.Text = source.Monster.MonsterName;
                 MonsterLabel.ForeColour = source.Monster.IsBoss ? Color.OrangeRed : Constants.PrimaryColour;
                 LevelLabel.Text = string.Format(CEnvir.Language.BigMapBrowserLevelFormat, source.Monster.Level);

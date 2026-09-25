@@ -156,6 +156,8 @@ namespace Client.Envir.Translations
         public override string BigMapBrowserSelectItem { get; set; } = "请选择物品。";
         public override string BigMapBrowserLevelFormat { get; set; } = "{0}级";
         public override string BigMapBrowserNotSpawned { get; set; } = "未刷新";
+        public override string BigMapBrowserCraftFormat { get; set; } = "{0}（合成）";
+        public override string BigMapBrowserCraftHint { get; set; } = "{0}（{1}）合成：{2}";
         public override string GuidesTitle { get; set; } = "指南";
         public override string GuidesItemProgressionTitle { get; set; } = "{0} 装备进阶";
         public override string GuidesSectionWeapons { get; set; } = "武器";

@@ -931,6 +931,39 @@ namespace MirBot
                 }
             }
 
+            // 2a-iv. Combine errand (CombineErrand): a full set in the bag on the NPC's map, between
+            //        town trips and after quest and fame work.
+            if (Combine != null)
+            {
+                if (Town != null && Town.Active)
+                    Combine.Suspend("a town trip started");
+                else if (!itemUsePending && (Quest == null || !Quest.Active) && (Fame == null || !Fame.Active))
+                {
+                    Decision combine = Combine.Next(world, items);
+
+                    if (combine != null)
+                    {
+                        if (combine.Action == BotAction.WalkTo)
+                        {
+                            int remaining = WorldModel.Distance(world.Location, combine.Destination);
+                            combine.Action = BotAction.Approach;
+
+                            NoteNpcWalk(world, combine.Subject);
+                            if (!TrySteer(combine, world, combine.Destination,
+                                    Math.Max(1, _config.VendorTalkRange - 1), remaining, routeKind: "town"))
+                                return new Decision
+                                {
+                                    Action = BotAction.Idle,
+                                    Reason = $"no route to {combine.Destination.X},{combine.Destination.Y}",
+                                    Subject = combine.Subject
+                                };
+                        }
+
+                        return combine;
+                    }
+                }
+            }
+
             // 2b. Cross-map travel. Below the town trip, because arriving somewhere new with a
             //     full bag and no potions is how a journey ends in a corpse; above fighting,
             //     because a bot that stops to kill everything never gets anywhere.
@@ -946,7 +979,7 @@ namespace MirBot
             // The quest errand owns movement the same way: a journey passing through Bichon is
             // held for the errand and carries on afterwards, never replaced.
             bool tripOwnsUs = Town != null && Town.Active || Quest != null && Quest.OwnsMovement ||
-                              Fame != null && Fame.OwnsMovement;
+                              Fame != null && Fame.OwnsMovement || Combine != null && Combine.OwnsMovement;
             if (tripOwnsUs) Travel?.Hold();
 
             if (!tripOwnsUs && Travel != null && Travel.Active && FightingThrough(world))
@@ -2289,12 +2322,22 @@ namespace MirBot
             }
             if (pets >= 2) return null;
 
-            // The best wanted pet that is not out. A plain Skeleton is never added as a SECOND pet
-            // beside a better one - it would only take the slot the better summon wants.
+            // The best wanted pet that is not out.
             var missing = wanted.Where(w => !out_.Contains(w.Pet)).ToList();
             if (missing.Count == 0) return null;
             (ClientUserMagic magic, MonsterFlag flag, int amulets) = missing[0];
-            if (pets == 1 && magic.Info.Magic == MagicType.SummonSkeleton) return null;
+
+            // A plain Skeleton as the SECOND pet only when no better summon is waiting for that
+            // slot. The old rule refused it outright - right for Jill (Jin + Shinsu), wrong for
+            // Toby, who has no Shinsu: his two best ARE Jin + Skeleton, and he fought with one
+            // pet. A better summon left out of `wanted` only for want of amulets still holds the
+            // slot, or a Skeleton would take it and Shinsu could never follow.
+            if (pets == 1 && magic.Info.Magic == MagicType.SummonSkeleton &&
+                Summons.Any(s => s.Magic != MagicType.SummonSkeleton && !out_.Contains(s.Pet) &&
+                                 world.TryGetMagic(s.Magic, out ClientUserMagic better) &&
+                                 better.Info != null && !better.ItemRequired &&
+                                 world.Level >= better.Info.NeedLevel1))
+                return null;
 
             // No reagent, no summon - and the server would take the amulet it does not have and
             // tell us nothing. Checked here so the refusal is ours and is logged.
@@ -2789,6 +2832,9 @@ namespace MirBot
 
         /// <summary>Set by BotInstance: buying fame ranks at the fame NPC.</summary>
         public FameErrand Fame;
+
+        /// <summary>Taking a full set of combination pieces to the NPC (see CombineErrand).</summary>
+        public CombineErrand Combine;
 
         /// <summary>Set by BotInstance: walkable spawn cells of a monster on a map.</summary>
         public Func<int, int, IReadOnlyList<Point>> SpawnCells;

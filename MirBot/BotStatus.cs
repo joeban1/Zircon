@@ -388,6 +388,9 @@ namespace MirBot
 
         /// <summary>The fame rank held and progress to the next.</summary>
         public string FameStatusText { get; init; } = "";
+
+        /// <summary>Combination pieces held per recipe, and what the combine errand is doing.</summary>
+        public string CombineStatusText { get; init; } = "";
         public IReadOnlyList<ItemStatus> Inventory { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<ItemStatus> Storage { get; init; } = Array.Empty<ItemStatus>();
         public IReadOnlyList<HistoryStatus> History { get; init; } = Array.Empty<HistoryStatus>();
