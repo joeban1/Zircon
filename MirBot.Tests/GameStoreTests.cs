@@ -227,6 +227,26 @@ namespace MirBot.Tests
             Assert.False(Backpack.Sellable(Held(life), null));
         }
 
+        // ---- part-crafted gear --------------------------------------------------------------
+
+        [Fact]
+        public void GearThatPartsCombineIntoIsNeverSoldAndIsBanked()
+        {
+            ItemInfo crafted = Item(970, "Dragon Necklace Of Revival", ItemType.Necklace, 0);
+            Set(crafted, "_PartCount", 10);
+            ItemInfo plain = Item(971, "Iron Plate Necklace", ItemType.Necklace, 0);
+            ClientUserItem craftedItem = new ClientUserItem { Info = crafted, Count = 1 };
+            ClientUserItem plainItem = new ClientUserItem { Info = plain, Count = 1 };
+            Set(crafted, "_CanSell", true);
+            Set(plain, "_CanSell", true);
+
+            Assert.True(Backpack.IsPartCrafted(craftedItem));
+            Assert.False(Backpack.IsPartCrafted(plainItem));
+            Assert.False(Backpack.Sellable(craftedItem, null));
+            Assert.True(Backpack.Sellable(plainItem, null));
+            Assert.True(Backpack.WorthStoring(craftedItem, MirClass.Taoist, MirGender.Male, 44, new Stats(), null, null));
+        }
+
         // ---- mana potion ceiling ---------------------------------------------------------------
 
         [Theory]

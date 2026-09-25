@@ -573,6 +573,12 @@ namespace MirBot
             // good gear is assembled - so the bank is where they go rather than the bag.
             if (IsItemPart(item)) return true;
 
+            // Gear that parts combine into (Info.PartCount > 0) is the reward for collecting a
+            // full set of parts: never sold, banked when it is not worn. An assembled item is an
+            // ordinary instance on the server (CreateDropItem, no flag), so the ITEM TYPE is what
+            // identifies it - a dropped whole copy counts too, and is just as worth keeping.
+            if (IsPartCrafted(item)) return true;
+
             // Books first: CanEquip reads ItemInfo.RequiredClass, which books normally leave at
             // All, so it would wave every class's books through. MagicBooks does the real test.
             if (item.Info.ItemType == ItemType.Book)
@@ -624,9 +630,14 @@ namespace MirBot
             int level, Stats stats, MagicBooks books, WorldModel world)
         {
             if (!WorthStoring(item, mirClass, gender, level, stats, books, world)) return false;
-            if (item.Info.ItemType == ItemType.Book || IsItemPart(item)) return true;
+            if (item.Info.ItemType == ItemType.Book || IsItemPart(item) || IsPartCrafted(item)) return true;
             return BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass);
         }
+
+        /// <summary>Gear that item parts combine into (its ItemInfo has a PartCount).</summary>
+        public static bool IsPartCrafted(ClientUserItem item) =>
+            item?.Info != null && item.Info.PartCount > 0 && item.Info.ItemType != ItemType.ItemPart &&
+            !IsItemPart(item);
 
         /// <summary>One banked item that is worth pulling back out, and why.</summary>
         public readonly struct Reclaim
@@ -694,6 +705,15 @@ namespace MirBot
                 // mistake and, once the rule was fixed, it would have sat there for ever, because
                 // the only way out of storage used to be becoming USABLE.
                 if (IsItemPart(item)) continue;
+
+                // Part-crafted gear only ever comes out to be WORN - never to be sold.
+                if (IsPartCrafted(item))
+                {
+                    if (CanEquip(item, mirClass, gender) && MeetsRequirement(item.Info, level, stats) &&
+                        BeatsWeakestSlot(item.Info.ItemType, Score(item, mirClass), mirClass))
+                        found.Add(new Reclaim(pair.Key, item, "beats what we are wearing"));
+                    continue;
+                }
 
                 if (!CanEquip(item, mirClass, gender))
                 {
@@ -1930,6 +1950,9 @@ namespace MirBot
 
             // Belt and braces: even if a part reached a sell batch some other way, refuse it here.
             if (IsItemPart(item)) return false;
+
+            // Likewise what parts combine into: kept (worn or banked), never sold.
+            if (IsPartCrafted(item)) return false;
 
             if (!item.Info.CanSell) return false;
             if ((item.Flags & UserItemFlags.Locked) == UserItemFlags.Locked) return false;

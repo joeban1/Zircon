@@ -171,6 +171,9 @@ namespace MirBot
         public int Weight { get; init; }
         public long Price { get; init; }
 
+        /// <summary>What a vendor pays for ONE of these now (list price x SellRate x wear), as in game.</summary>
+        public long SalePrice { get; init; }
+
         /// <summary>What the item demands of its wearer, as the client phrases it.</summary>
         public string Requirement { get; init; } = "";
 

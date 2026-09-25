@@ -95,12 +95,20 @@ namespace MirBot
         public bool IsSceneryNode => AI == 4;
 
         /// <summary>
+        /// The Arachnid Gazer's Larva (AI 18, MonsterFlag.Larva): 5 health, no experience, kills
+        /// itself when it has no target and explodes on everything adjacent when it dies. Hitting
+        /// one is paying for the explosion. Not Wedge Moth Larva (AI 44), a real monster and a
+        /// quest target.
+        /// </summary>
+        public bool IsLarva => AI == 18;
+
+        /// <summary>
         /// Attackable at all. Pets are excluded outright: under the ordinary attack mode the server
         /// silently refuses attacks on an owned monster, so swinging at one is a decision that can
         /// never succeed and produces no error to learn from.
         /// </summary>
         public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet &&
-                                     !IsSceneryNode && !IsSummonedPuppet;
+                                     !IsSceneryNode && !IsSummonedPuppet && !IsLarva;
 
         public override string ToString() => $"{Kind}:{Name}#{ObjectID}@{Location.X},{Location.Y}" +
                                              (Dead ? " (dead)" : "");

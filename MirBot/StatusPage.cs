@@ -2089,8 +2089,12 @@ function showTip(item, x, y) {
     parts.push(`<div class="st"><b>Sockets</b><span>${esc(item.sockets.join(", "))}</span></div>`);
 
   parts.push(`<hr><div class="st"><b>Weight</b><span>${item.weight}</span></div>`);
+  // What a vendor pays now (the number the game shows), then the database list price.
+  if (item.salePrice > 0)
+    parts.push(`<div class="st"><b>Sells for</b><span>${group(item.salePrice)}` +
+      (item.count > 1 ? ` each, ${group(item.salePrice * item.count)} for ${item.count}` : "") + `</span></div>`);
   if (item.price > 0)
-    parts.push(`<div class="st"><b>Price</b><span>${group(item.price)}</span></div>`);
+    parts.push(`<div class="st"><b>List price</b><span>${group(item.price)}</span></div>`);
   if (item.flags) parts.push(`<div class="st"><b>Flags</b><span>${esc(item.flags)}</span></div>`);
   if (!item.canSell) parts.push(`<div class="req">cannot be sold</div>`);
   if (item.requirement) parts.push(`<div class="req">needs ${esc(item.requirement)}</div>`);

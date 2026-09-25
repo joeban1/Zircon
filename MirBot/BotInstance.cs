@@ -4219,6 +4219,7 @@ namespace MirBot
                 MaxDurability = Backpack.Displayed(item.MaxDurability),
                 Weight = item.Weight,
                 Price = info.Price,
+                SalePrice = item.Price(1),
 
                 // RequiredType and RequiredAmount, not a level: the server has no single "required
                 // level" field, and the same pair expresses a level, an AC, an attack power or any
