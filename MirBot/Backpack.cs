@@ -1712,7 +1712,52 @@ namespace MirBot
             stat(Stat.CriticalChance) * 2 +
             stat(Stat.CriticalDamage) +
             stat(Stat.WearWeight) + stat(Stat.HandWeight) + stat(Stat.BagWeight) +
-            stat(Stat.Comfort);
+            stat(Stat.Comfort) +
+            ElementsFrom(stat);
+
+        private static readonly Stat[] ElementAttacks =
+        {
+            Stat.FireAttack, Stat.IceAttack, Stat.LightningAttack, Stat.WindAttack,
+            Stat.HolyAttack, Stat.DarkAttack, Stat.PhantomAttack
+        };
+
+        private static readonly Stat[] ElementResistances =
+        {
+            Stat.FireResistance, Stat.IceResistance, Stat.LightningResistance, Stat.WindResistance,
+            Stat.HolyResistance, Stat.DarkResistance, Stat.PhantomResistance
+        };
+
+        /// <summary>
+        /// Elemental attack and resistance, small on purpose.
+        ///
+        /// Mirbot kept a MaxDC 6 Butcher's Necklace on over an identical one that had also rolled
+        /// Fire +1 and Holy +1: neither stat was scored, the two tied at 48, and a swap needs a
+        /// strictly higher score. On the server a melee hit takes the element of the character's
+        /// HIGHEST elemental attack (Functions.GetAttackElement) for +2 power a point, a spell only
+        /// when its own element matches, and each resistance point takes 10% off that element,
+        /// capped at 5 per character. All of that is whole-character context this per-item score
+        /// cannot see, so it is a heuristic: the item's largest element 4 a point (half a MaxDC
+        /// point on an accessory), every other element 1, resistances 1 (physical 2). Enough to
+        /// break ties and near-ties, never enough to outweigh real DC, AC or MR.
+        /// </summary>
+        private static int ElementsFrom(Func<Stat, int> stat)
+        {
+            int largest = 0, total = 0;
+
+            foreach (Stat element in ElementAttacks)
+            {
+                int value = Math.Max(0, stat(element));
+                total += value;
+                if (value > largest) largest = value;
+            }
+
+            int score = largest * 4 + (total - largest);
+
+            foreach (Stat resistance in ElementResistances)
+                score += Math.Max(0, stat(resistance));
+
+            return score + Math.Max(0, stat(Stat.PhysicalResistance)) * 2;
+        }
 
         public static int ScoreInfo(ItemInfo info, MirClass mirClass) =>
             info == null ? 0 : ScoreFrom(s => info.Stats[s], info.ItemType, mirClass);
@@ -2549,6 +2594,9 @@ namespace MirBot
                 case ItemType.Shield: return EquipmentSlot.Shield;
                 case ItemType.Poison: return EquipmentSlot.Poison;
                 case ItemType.Amulet: return EquipmentSlot.Amulet;
+                // Emblems were missing, so none could ever be worn: a looted Masters Emblem (no
+                // level requirement, AC/MR 12-12, Crit 5) sat in the bag, unsellable and unused.
+                case ItemType.Emblem: return EquipmentSlot.Emblem;
                 default: return null;
             }
         }
@@ -2717,6 +2765,10 @@ namespace MirBot
                 if (locked != lockedOnly) continue;
 
                 int candidateScore = Score(item, mirClass);
+
+                // An emblem with nothing on it (the PVP emblems) is not worth the empty slot. Only
+                // emblems: statless torches, poison and amulets DO belong in an empty slot.
+                if (item.Info.ItemType == ItemType.Emblem && candidateScore <= 0) continue;
 
                 // Rings and bracelets have a left and a right slot. Prefer an empty one; otherwise
                 // displace whichever side is currently weaker.

@@ -1955,7 +1955,8 @@ const TYPE_CLASS = {
   Weapon:"t-weapon", Armour:"t-armour", Helmet:"t-armour", Shoes:"t-armour", Belt:"t-armour",
   Necklace:"t-jewel", Bracelet:"t-jewel", Ring:"t-jewel", Torch:"t-scroll",
   Consumable:"t-potion", Book:"t-book", Ore:"t-ore", Meat:"t-ore", Nothing:"t-ore",
-  Amulet:"t-reagent", Poison:"t-reagent", ItemPart:"t-part", Gem:"t-jewel"
+  Amulet:"t-reagent", Poison:"t-reagent", ItemPart:"t-part", Gem:"t-jewel", Emblem:"t-jewel",
+  Shield:"t-armour"
 };
 
 // Every item on show, by cell id, so the tooltip can find one without another lookup.
@@ -2028,7 +2029,8 @@ const EQUIP_ORDER = [
   "Weapon", "BraceletR",
   "Shoes",  "RingL",
   "Torch",  "RingR",
-  "Amulet", "Poison"
+  "Amulet", "Poison",
+  "Shield", "Emblem"
 ];
 
 function renderSlots(card, node, equipment) {

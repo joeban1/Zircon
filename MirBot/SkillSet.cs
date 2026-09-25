@@ -122,7 +122,36 @@ namespace MirBot
         {
             if (canUse) _armed.Add(magic);
             else _armed.Remove(magic);
+
+            if (magic == _awaiting) _awaiting = MagicType.None;
         }
+
+        /// <summary>
+        /// One clock for every C.MagicToggle - sustained, charge before a swing, charge during the
+        /// swing cooldown. The toggle used to hold the whole action gate for a second, which cost
+        /// warriors a second on every swing; the server never needed it (FlamingSword.Toggle does
+        /// not touch AttackTime), only the client's own one-second anti-spam, which this keeps.
+        /// </summary>
+        private DateTime _nextToggle = DateTime.MinValue;
+
+        public bool ToggleReady => DateTime.UtcNow >= _nextToggle;
+
+        public void ToggleIssued() => _nextToggle = DateTime.UtcNow.AddSeconds(1);
+
+        /// <summary>A charge asked for and not yet confirmed armed by S.MagicToggle.</summary>
+        private MagicType _awaiting = MagicType.None;
+        private DateTime _awaitingUntil = DateTime.MinValue;
+
+        /// <summary>How long a swing waits for a requested charge to be confirmed.</summary>
+        public static readonly TimeSpan ChargeAckWait = TimeSpan.FromMilliseconds(400);
+
+        /// <summary>
+        /// Hold the swing: a charge was just requested and the server has not armed it yet. A
+        /// swing sent now would go out plain and the charge would be wasted on the one after.
+        /// </summary>
+        public bool AwaitingCharge =>
+            _awaiting != MagicType.None && DateTime.UtcNow < _awaitingUntil &&
+            !_armed.Contains(_awaiting);
 
         public bool IsArmed(MagicType magic) => _armed.Contains(magic);
 
@@ -136,6 +165,8 @@ namespace MirBot
             _enabled.Clear();
             _cooldowns.Clear();
             _nextCharge = DateTime.MinValue;
+            _nextToggle = DateTime.MinValue;
+            _awaiting = MagicType.None;
         }
 
         /// <summary>
@@ -168,6 +199,13 @@ namespace MirBot
         }
 
         public void ChargeSent() => _nextCharge = DateTime.UtcNow.AddMilliseconds(1500);
+
+        public void ChargeSent(MagicType magic)
+        {
+            ChargeSent();
+            _awaiting = magic;
+            _awaitingUntil = DateTime.UtcNow + ChargeAckWait;
+        }
 
         /// <summary>
         /// A sustained toggle we know, can use at this level, and have not switched on yet, or None.

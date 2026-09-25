@@ -517,7 +517,8 @@ namespace MirBot
                         if (shape == AoeShape.Meteor) covered = Math.Min(covered, 6 + magic.Level);
                         if (covered < _config.AoeMinimumFor(world.Class)) continue;
                         if (best != null && (covered < best.Value.Covered ||
-                            covered == best.Value.Covered && magic.Cost >= bestCost)) continue;
+                            covered == best.Value.Covered &&
+                            !BetterAreaSpell(world, magic, best.Value.Magic))) continue;
                         best = new AreaAim(magic, aim, direction, covered);
                         bestCost = magic.Cost;
                     }
@@ -525,6 +526,58 @@ namespace MirBot
             }
             return best;
         }
+
+        /// <summary>
+        /// Between two area spells covering the same monsters: train, then hit hardest, then save
+        /// mana.
+        ///
+        /// The tie used to go to the cheaper spell, and cost rises with skill level, so a level 0
+        /// spell always looked best and a level 3 one - the one actually worth casting - lost. A
+        /// "highest requirement wins" rule starved the rest instead. So:
+        ///   1. a spell still below skill level 3, and able to gain experience at this character
+        ///      level, is cast to train it - the least trained first. Dragon Tornado and Lightning
+        ///      Wave arrived at level 0 for a level 45 wizard and would otherwise never level;
+        ///   2. otherwise the higher estimated power at the current skill level;
+        ///   3. otherwise the cheaper.
+        /// Trained, the four 3x3 spells are close (Fire Storm and Lightning Wave 28-36, Dragon
+        /// Tornado 27-35, Ice Storm 26-34 base, against 14-18 untrained) - training is what makes
+        /// them all available.
+        /// </summary>
+        internal static bool BetterAreaSpell(WorldModel world, ClientUserMagic candidate,
+            ClientUserMagic current)
+        {
+            if (current?.Info == null) return true;
+            if (candidate?.Info == null) return false;
+
+            bool trainC = Trainable(world, candidate), trainB = Trainable(world, current);
+            if (trainC != trainB) return trainC;
+            if (trainC && candidate.Level != current.Level) return candidate.Level < current.Level;
+
+            int powerC = EstimatedPower(candidate), powerB = EstimatedPower(current);
+            if (powerC != powerB) return powerC > powerB;
+
+            return candidate.Cost < current.Cost;
+        }
+
+        /// <summary>Below skill level 3 and past the character-level gate for the next one.</summary>
+        private static bool Trainable(WorldModel world, ClientUserMagic magic)
+        {
+            switch (magic.Level)
+            {
+                case 0: return world.Level >= magic.Info.NeedLevel1;
+                case 1: return world.Level >= magic.Info.NeedLevel2;
+                case 2: return world.Level >= magic.Info.NeedLevel3;
+                default: return false;
+            }
+        }
+
+        /// <summary>
+        /// Average base power at the current skill level, as UserMagic.GetPower: base + level x
+        /// per-level / 3 (MC is added to every spell alike). Doubled to keep the halves.
+        /// </summary>
+        internal static int EstimatedPower(ClientUserMagic magic) =>
+            magic.Info.MinBasePower + magic.Info.MaxBasePower +
+            magic.Level * (magic.Info.MinLevelPower + magic.Info.MaxLevelPower) / 3;
 
         /// <summary>Predictive protection: no spell-object confirmation is available to this bot.</summary>
         public void ReserveIssued(MagicType type, WorldModel world, Point aim,

@@ -14,7 +14,11 @@ namespace MirBot.Tests
         [Fact]
         public void RegistryCoversVerifiedPlayerSpellsButNotMonsterThunderStorm()
         {
-            Assert.Equal(12, AoeGeometry.Shapes.Count);
+            Assert.Equal(14, AoeGeometry.Shapes.Count);
+            Assert.Equal(AoeShape.Square1, AoeGeometry.Shapes[MagicType.DragonTornado]);
+            Assert.Equal(AoeShape.Square1, AoeGeometry.Shapes[MagicType.LightningWave]);
+            Assert.True(SpellBook.IsSupported(MagicType.DragonTornado, out _));
+            Assert.True(SpellBook.IsSupported(MagicType.LightningWave, out _));
             Assert.False(AoeGeometry.Shapes.ContainsKey(MagicType.MonsterThunderStorm));
             Assert.Equal(AoeShape.Plus, AoeGeometry.Shapes[MagicType.FireWall]);
             Assert.Equal(AoeShape.Meteor, AoeGeometry.Shapes[MagicType.MeteorShower]);

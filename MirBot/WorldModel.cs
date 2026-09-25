@@ -827,6 +827,7 @@ namespace MirBot
             Gender = start.Gender;
             Level = start.Level;
             InSafeZone = start.InSafeZone;
+            SelfPoison = start.Poison;
             if (start.InSafeZone) BindMapIndex = MapIndex;
             ApplyMagics(start.Magics);
 
@@ -924,8 +925,21 @@ namespace MirBot
             Touch();
         }
 
+        /// <summary>
+        /// Poison on US. The player is never in _objects, so S.ObjectPoison for SelfID used to be
+        /// dropped - and Neutralize doubles the server's swing delay (PlayerObject.Attack).
+        /// </summary>
+        public PoisonType SelfPoison;
+
         public void ApplyPoison(uint objectID, PoisonType poison)
         {
+            if (objectID != 0 && objectID == SelfID)
+            {
+                SelfPoison = poison;
+                Touch();
+                return;
+            }
+
             if (!_objects.TryGetValue(objectID, out WorldObject ob)) return;
 
             ob.Poison = poison;
@@ -1008,7 +1022,31 @@ namespace MirBot
             if (stats == null) return;
 
             PlayerStats = stats;
+            PlayerStatsKnown = true;
             ApplyMaxWeight(stats[Stat.BagWeight]);
+        }
+
+        /// <summary>A S.StatsUpdate has arrived. PlayerStats starts as an empty Stats, never null.</summary>
+        public bool PlayerStatsKnown;
+
+        /// <summary>
+        /// The server's swing gate (PlayerObject.Attack): 1500 - 47 x AttackSpeed ms, never below
+        /// 800, doubled while over the bag limit or under Neutralize. AttackSpeed is the server's
+        /// full figure, including the +min(3, Level/15) every character gets - the bot used a flat
+        /// 1500 and lost a swing in nine at level 45.
+        /// </summary>
+        public TimeSpan SwingDelay()
+        {
+            int delay = Globals.AttackDelay;
+
+            if (PlayerStatsKnown)
+                delay = Math.Max(800, Globals.AttackDelay - PlayerStats[Stat.AttackSpeed] * Globals.ASpeedRate);
+
+            if (MaxBagWeight > 0 && BagWeight > MaxBagWeight ||
+                (SelfPoison & PoisonType.Neutralize) == PoisonType.Neutralize)
+                delay *= 2;
+
+            return TimeSpan.FromMilliseconds(delay);
         }
 
         public void ApplyMaxWeight(int maxBagWeight)

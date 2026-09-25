@@ -16,6 +16,10 @@ namespace MirBot
             {
                 [MagicType.IceStorm] = AoeShape.Square1,
                 [MagicType.FireStorm] = AoeShape.Square1,
+                // Both cast exactly like the storms: a ground aim within magic range, the 3x3
+                // around it (DragonTornado.cs / LightningWave.cs: GetCells(location, 0, 1)).
+                [MagicType.DragonTornado] = AoeShape.Square1,
+                [MagicType.LightningWave] = AoeShape.Square1,
                 [MagicType.FireWall] = AoeShape.Plus,
                 [MagicType.IceRain] = AoeShape.Square3,
                 [MagicType.Asteroid] = AoeShape.Square3,

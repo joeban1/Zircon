@@ -96,7 +96,6 @@ namespace MirBot
     {
         private static readonly TimeSpan MoveTime = TimeSpan.FromMilliseconds(600);
         private static readonly TimeSpan TurnTime = TimeSpan.FromMilliseconds(300);
-        private static readonly TimeSpan AttackDelay = TimeSpan.FromMilliseconds(1500);
         private static readonly TimeSpan CastTime = TimeSpan.FromMilliseconds(600);
         private static readonly TimeSpan ItemUseDelay = TimeSpan.FromMilliseconds(1000);
         private static readonly TimeSpan Margin = TimeSpan.FromMilliseconds(120);
@@ -314,6 +313,12 @@ namespace MirBot
 
             if (!Ready)
             {
+                // The one thing worth doing inside a swing's cooldown: arming the next swing's
+                // charge, as a player does. It costs the server no swing time, so the toggle hides
+                // behind the cooldown instead of adding a second after it.
+                Decision midSwing = MidSwingCharge(world, itemUsePending);
+                if (midSwing != null) return midSwing;
+
                 IdleReason = $"action gate until {_nextAction:HH:mm:ss.fff}";
                 return null;
             }
@@ -453,7 +458,7 @@ namespace MirBot
             //    session per skill; the server keeps them on from there.
             MagicType pending = FrugalRecoveryCombat ? MagicType.None : Skills.PendingToggle(world);
 
-            if (pending != MagicType.None)
+            if (pending != MagicType.None && Skills.ToggleReady)
             {
                 Skills.ToggleSent(pending);
 
@@ -1408,9 +1413,9 @@ namespace MirBot
                         ? MagicType.None
                         : Skills.PendingCharge(world);
 
-                    if (charge != MagicType.None)
+                    if (charge != MagicType.None && Skills.ToggleReady)
                     {
-                        Skills.ChargeSent();
+                        Skills.ChargeSent(charge);
 
                         return new Decision
                         {
@@ -1419,6 +1424,14 @@ namespace MirBot
                             Subject = charge.ToString(),
                             Magic = charge
                         };
+                    }
+
+                    // A charge was just asked for and is not armed yet: a swing now would go out
+                    // plain. Wait for S.MagicToggle, bounded by SkillSet.ChargeAckWait.
+                    if (!FrugalRecoveryCombat && Skills.AwaitingCharge)
+                    {
+                        IdleReason = "waiting for the charge to arm";
+                        return null;
                     }
 
                     MagicType magic = FrugalRecoveryCombat
@@ -4205,6 +4218,35 @@ namespace MirBot
             return walk;
         }
 
+        private static readonly TimeSpan SwingMargin = TimeSpan.FromMilliseconds(60);
+        private TimeSpan _loggedSwing = TimeSpan.Zero;
+
+        /// <summary>
+        /// Arm the next swing's charge while this one's cooldown runs - or null. Only straight
+        /// after a swing, only on a live valid target still beside us, and on the toggle clock.
+        /// </summary>
+        private Decision MidSwingCharge(WorldModel world, bool itemUsePending)
+        {
+            if (LastAction != BotAction.Attack || world.Dead || world.SelfID == 0 ||
+                itemUsePending || FrugalRecoveryCombat || !Skills.ToggleReady) return null;
+
+            WorldObject target = _committedTarget == 0 ? null : world.Find(_committedTarget);
+            if (target == null || !target.IsValidTarget ||
+                WorldModel.Distance(world.Location, target.Location) != 1) return null;
+
+            MagicType charge = Skills.PendingCharge(world);
+            if (charge == MagicType.None) return null;
+
+            Skills.ChargeSent(charge);
+            return new Decision
+            {
+                Action = BotAction.MagicToggle,
+                Reason = $"charging {charge} for {target.Name} during the swing",
+                Subject = charge.ToString(),
+                Magic = charge
+            };
+        }
+
         /// <summary>Record that an action was issued, and pace the next one accordingly.</summary>
         public void Issued(Decision decision, WorldModel world)
         {
@@ -4249,8 +4291,12 @@ namespace MirBot
                     _nextAction = DateTime.Now + TurnTime + Margin;
                     break;
                 case BotAction.MagicToggle:
-                    // The client's own anti-spam on these is one second.
-                    _nextAction = DateTime.Now + TimeSpan.FromSeconds(1);
+                    // The client's one-second anti-spam lives on SkillSet's own toggle clock now.
+                    // Holding the whole action gate for that second cost warriors a second per
+                    // swing (Mirbot: a swing every 2.65 s against 1.36 s allowed). A toggle sent
+                    // inside a swing's cooldown must not move that cooldown either.
+                    Skills.ToggleIssued();
+                    if (_nextAction < DateTime.Now + Margin) _nextAction = DateTime.Now + Margin;
                     break;
 
                 case BotAction.SetPetMode:
@@ -4309,7 +4355,20 @@ namespace MirBot
                     _nextPotion = DateTime.Now + ItemUseDelay + Margin;
                     break;
                 case BotAction.Attack:
-                    _nextAction = DateTime.Now + AttackDelay + Margin;
+                    // The server's own swing gate, attack speed included (WorldModel.SwingDelay).
+                    // A small margin only: the server queues one slightly early swing.
+                    TimeSpan swing = world.SwingDelay();
+                    _nextAction = DateTime.Now + swing + SwingMargin;
+
+                    if (swing != _loggedSwing)
+                    {
+                        _loggedSwing = swing;
+                        BrainLog?.Invoke($"Swing pace: {swing.TotalMilliseconds:0} ms " +
+                                         $"(AttackSpeed {world.PlayerStats[Stat.AttackSpeed]}, " +
+                                         $"stats {(world.PlayerStatsKnown ? "known" : "not yet")}, " +
+                                         $"bag {world.BagWeight}/{world.MaxBagWeight}, " +
+                                         $"poison {world.SelfPoison}).");
+                    }
                     break;
                 case BotAction.Flee:
                 case BotAction.Approach:
