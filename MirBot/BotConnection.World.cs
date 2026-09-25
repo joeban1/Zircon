@@ -289,6 +289,17 @@ namespace MirBot
             // Nothing else reports a completed repair, so apply the server's own formula locally.
             // Without it the bot re-requests the same repair next trip and the server answers
             // RepairFailRepaired, which aborts the WHOLE batch.
+            // No repair of ours pending: an Oil of the War God (PlayerObject.SpecialRepair), which
+            // reports itself as a special NPC repair of the slots it mended. Record it, but it is
+            // not the reply a town trip's repair is waiting for.
+            if (_pendingRepair == null)
+            {
+                if (p.Success && p.Links != null)
+                    Items.NoteRepaired(p.Links.Where(x => x.GridType == GridType.Equipment)
+                        .Select(x => x.Slot).ToList(), p.Special);
+                return;
+            }
+
             if (p.Success) Items.NoteRepaired(_pendingRepair, _pendingSpecial);
 
             _pendingRepair = null;
@@ -322,6 +333,13 @@ namespace MirBot
 
         public void Process(S.ItemDurability p) =>
             Items.NoteDurability(p.GridType, p.Slot, p.CurrentDurability);
+
+        /// <summary>An oil's +1 / -1 Luck or Strength on the weapon (added to what it had).</summary>
+        public void Process(S.ItemStatsChanged p) =>
+            Items.NoteStatsChanged(p.GridType, p.Slot, p.NewStats, replace: false);
+
+        public void Process(S.ItemStatsRefreshed p) =>
+            Items.NoteStatsChanged(p.GridType, p.Slot, p.NewStats, replace: true);
 
         public void Process(S.CombatTime p) => World.ApplyCombat();
 

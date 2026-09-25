@@ -579,13 +579,19 @@ namespace MirBot
         /// not. Lost Paradise town has a tree between two vendors and the bots walked into it,
         /// were refused, re-planned the identical route and walked into it again, back and forth,
         /// for as long as the trip lasted.
+        ///
+        /// NPCs count too: they never move either. Lost Paradise's Companion Manager stands in the
+        /// one-cell alley on the short way from Hardy to Melisa. Seen only as a creature, it was
+        /// avoided after a refused move and forgotten after the next good one, so every bot swung
+        /// between the alley and the long way round until the town trip gave up.
         /// </summary>
         public HashSet<Point> SceneryCells()
         {
             HashSet<Point> cells = new HashSet<Point>();
 
             foreach (WorldObject ob in _objects.Values)
-                if (ob.Kind == ObjectKind.Monster && ob.IsSceneryNode && !ob.Dead)
+                if (ob.Kind == ObjectKind.Monster && ob.IsSceneryNode && !ob.Dead ||
+                    ob.Kind == ObjectKind.NPC)
                     cells.Add(ob.Location);
 
             return cells;

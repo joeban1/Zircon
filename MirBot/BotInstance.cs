@@ -1776,6 +1776,7 @@ namespace MirBot
         private const long FameRouteGold = 30000;
 
         private DateTime _lastFameTrip = DateTime.MinValue;
+        private DateTime _famePendingUntil = DateTime.MinValue;
         private DateTime _fameNoRouteUntil = DateTime.MinValue;
 
         private void NoteQuestChanged(QuestTransition transition)
@@ -2804,7 +2805,16 @@ namespace MirBot
             // FAME: after a successful town trip, when Fame Points cover the next rank, go to the
             // fame NPC - level 45+ (the Frost Village gate), enough gold for both fares on top of
             // the teleport floor, a real route, nothing else owed. Never mid-hunt.
-            if (tripJustFinished && _town != null && _town.LastTripTraded && !recoveryRoute &&
+            //
+            // The chance stays open for ten minutes while the bot is still in a town, not only on
+            // the tick the trip ends. That tick usually lands with a journey held for the trip or
+            // a quest errand about to start - Wizzler hit level 45 with 11,500 FP and, trip after
+            // trip in Lost Paradise, the quest errand took the moment every time.
+            if (tripJustFinished && _town != null && _town.LastTripTraded)
+                _famePendingUntil = DateTime.UtcNow.AddMinutes(10);
+
+            if (DateTime.UtcNow < _famePendingUntil && !active && _town != null && !recoveryRoute &&
+                _host.Vendors.TownMaps.Contains(_connection?.World.MapIndex ?? -1) &&
                 !townNeed && _connection != null && !_connection.World.Dead && Config.EnableFame &&
                 _fameErrand != null && _host.Fame.Ready && _host.Fame.Map != null &&
                 (_brain?.Travel == null || !_brain.Travel.Active) &&
@@ -2824,6 +2834,7 @@ namespace MirBot
                         Config.TeleportMaxGoldPercent);
 
                     _lastFameTrip = DateTime.UtcNow;
+                    _famePendingUntil = DateTime.MinValue;
 
                     if (!fameHops.ContainsKey(fameMap))
                     {

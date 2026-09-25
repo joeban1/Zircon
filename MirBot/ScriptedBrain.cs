@@ -512,6 +512,34 @@ namespace MirBot
                 if (use != null) return use;
             }
 
+            // 0a-ii-b. Weapon oils on a level 33+ weapon: Benediction / Conservation up to Luck /
+            //          Strength 2, War God when it is worn below 30%. See Backpack.WeaponOilKeep.
+            if (!itemUsePending && DateTime.UtcNow >= _nextOilUse &&
+                world.NearestLiveMonster(2, _unreachable.Keys) == null)
+            {
+                int oil = items.WeaponOilToUse();
+
+                if (oil >= 0)
+                {
+                    ClientUserItem weapon = items.Weapon;
+                    ClientUserItem bottle = items.InSlot(oil);
+
+                    // Paced so the stat change from the last one is in before the next is judged.
+                    _nextOilUse = DateTime.UtcNow.AddSeconds(3);
+                    BrainLog?.Invoke($"Weapon oil: using {bottle.Info.ItemName} on {weapon.Info.ItemName} " +
+                                     $"(Luck {Backpack.WeaponStat(weapon, Stat.Luck)}, " +
+                                     $"Strength {Backpack.WeaponStat(weapon, Stat.Strength)}, " +
+                                     $"durability {weapon.CurrentDurability:N0}/{weapon.MaxDurability:N0}).");
+                    return new Decision
+                    {
+                        Action = BotAction.UseItem,
+                        PotionSlot = oil,
+                        Reason = $"using {bottle.Info.ItemName} on {weapon.Info.ItemName}",
+                        Subject = bottle.Info.ItemName
+                    };
+                }
+            }
+
             // 0a-iii. The game store: buy the next thing on the class's list with Hunt Gold. No NPC
             //         is involved, so this can happen anywhere - but not mid-fight, and one
             //         purchase at a time, settled by the Hunt Gold actually dropping.
@@ -2621,6 +2649,7 @@ namespace MirBot
         /// <summary>A lair found empty since the last tracker use - the moment a scroll is worth it.</summary>
         private bool _lairFoundEmpty;
         private DateTime _trackerTriedAt = DateTime.MinValue;
+        private DateTime _nextOilUse = DateTime.MinValue;
         private bool _trackerConfirmed;
 
         /// <summary>Reward items tried recently, by ItemInfo index, so a refused use is not spammed.</summary>

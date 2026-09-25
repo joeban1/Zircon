@@ -1062,6 +1062,118 @@ namespace MirBot
             info != null && info.ItemType == ItemType.Consumable &&
             (info.Shape == 1 || info.Stats[Stat.Duration] != 0);
 
+        // Weapon oils (Consumable shapes 4-6, PlayerObject.ItemUse): each works on the WORN weapon.
+        //   Benediction  - weapon Luck: 5% chance of -1 on every use, otherwise +1 with a chance of
+        //                  1/(10 x Luck) (always from 0). Past Luck 2 a use loses more than it gains.
+        //   Conservation - weapon Strength: the same odds (5% loss once it has any). Strength N wears
+        //                  the weapon 1 hit in N, so Strength 1 does nothing and 2 halves the wear.
+        //   War God      - a special repair of weapon and shield: full durability, no max loss.
+        public const int OilOfBenedictionShape = 4;
+        public const int OilOfConservationShape = 5;
+        public const int OilOfTheWarGodShape = 6;
+
+        /// <summary>Luck / Strength the weapon is oiled up to; above it the odds turn against us.</summary>
+        public const int WeaponOilTarget = 2;
+
+        /// <summary>
+        /// Operator rule: no oil on a weapon needing less than level 33. Luck and Strength belong to
+        /// the weapon, and a low one is soon replaced - taking them with it.
+        /// </summary>
+        public const int WeaponOilMinLevel = 33;
+
+        /// <summary>War God oils carried for the next worn-down weapon; the rest are sold.</summary>
+        public const int WarGodOilsKept = 2;
+
+        /// <summary>A War God oil is used once the weapon is below this share of its durability.</summary>
+        public const int WarGodRepairPercent = 30;
+
+        /// <summary>
+        /// Enhancement oils held for a later weapon while the worn one is below the level rule.
+        /// </summary>
+        public const int OilsKeptForLaterWeapon = 5;
+
+        public static bool IsWeaponOil(ClientUserItem item) =>
+            item?.Info != null && item.Info.ItemType == ItemType.Consumable &&
+            item.Info.Shape >= OilOfBenedictionShape && item.Info.Shape <= OilOfTheWarGodShape;
+
+        public ClientUserItem Weapon =>
+            _equipment.TryGetValue((int)EquipmentSlot.Weapon, out ClientUserItem weapon) ? weapon : null;
+
+        /// <summary>Level 33+ (or a rebirth weapon): the only weapons oils are spent on.</summary>
+        public static bool OilWorthyWeapon(ClientUserItem weapon) =>
+            weapon?.Info != null &&
+            (weapon.Info.RequiredType == RequiredType.Level && weapon.Info.RequiredAmount >= WeaponOilMinLevel ||
+             weapon.Info.RequiredType == RequiredType.RebirthLevel);
+
+        /// <summary>
+        /// The weapon's Luck or Strength as the client sees it. The server counts only the
+        /// Enhancement part (oils); the client's AddedStats merges every source, so a weapon that
+        /// dropped with Luck reads high and is oiled less - the safe direction.
+        /// </summary>
+        public static int WeaponStat(ClientUserItem weapon, Stat stat) => weapon?.AddedStats?[stat] ?? 0;
+
+        /// <summary>Would one of these oils do the worn weapon good right now?</summary>
+        public static bool OilWanted(ClientUserItem weapon, int shape)
+        {
+            if (!OilWorthyWeapon(weapon)) return false;
+
+            switch (shape)
+            {
+                case OilOfBenedictionShape: return WeaponStat(weapon, Stat.Luck) < WeaponOilTarget;
+                case OilOfConservationShape: return WeaponStat(weapon, Stat.Strength) < WeaponOilTarget;
+                case OilOfTheWarGodShape:
+                    return weapon.Info.CanRepair && weapon.MaxDurability > 0 && weapon.CurrentDurability > 0 &&
+                           weapon.CurrentDurability * 100L < weapon.MaxDurability * (long)WarGodRepairPercent;
+                default: return false;
+            }
+        }
+
+        /// <summary>The bag slot of an oil worth using on the worn weapon now, or -1.</summary>
+        public int WeaponOilToUse()
+        {
+            ClientUserItem weapon = Weapon;
+            if (!OilWorthyWeapon(weapon)) return -1;
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
+                if (IsWeaponOil(pair.Value) && OilWanted(weapon, pair.Value.Info.Shape))
+                    return pair.Key;
+
+            return -1;
+        }
+
+        /// <summary>
+        /// How many of this kind of oil to keep in total; the rest is sold. War God: a couple for
+        /// the next worn-down weapon. Benediction and Conservation: all of them while the weapon is
+        /// still below Luck / Strength 2, none once it is there, and a few for later while the worn
+        /// weapon is below the level rule.
+        /// </summary>
+        public long WeaponOilKeep(int shape)
+        {
+            if (shape == OilOfTheWarGodShape) return WarGodOilsKept;
+
+            ClientUserItem weapon = Weapon;
+            if (!OilWorthyWeapon(weapon)) return OilsKeptForLaterWeapon;
+
+            return OilWanted(weapon, shape) ? long.MaxValue : 0;
+        }
+
+        /// <summary>
+        /// S.ItemStatsChanged adds to the item's stats (an oil's +1 or -1 Luck or Strength);
+        /// S.ItemStatsRefreshed replaces them. Without this the bot would never see an oil work.
+        /// </summary>
+        public void NoteStatsChanged(GridType grid, int slot, Stats stats, bool replace)
+        {
+            Dictionary<int, ClientUserItem> target =
+                grid == GridType.Equipment ? _equipment :
+                grid == GridType.Inventory ? _inventory : null;
+
+            if (target == null || stats == null) return;
+            if (!target.TryGetValue(slot, out ClientUserItem item)) return;
+
+            if (replace || item.AddedStats == null) item.AddedStats = new Stats(stats);
+            else item.AddedStats.Add(stats);
+        }
+
         public static bool IsWeakRestorative(ClientUserItem item) =>
             item?.Info != null &&
             item.Info.ItemType == ItemType.Consumable &&
@@ -2142,11 +2254,26 @@ namespace MirBot
             List<KeyValuePair<int, ClientUserItem>> mana =
                 new List<KeyValuePair<int, ClientUserItem>>();
 
-            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory)
+            Dictionary<int, long> oilsLeft = new Dictionary<int, long>();
+
+            foreach (KeyValuePair<int, ClientUserItem> pair in _inventory.OrderBy(x => x.Key))
             {
                 ClientUserItem item = pair.Value;
 
                 if (item?.Info == null || item.Info.ItemType != ItemType.Consumable) continue;
+
+                // Weapon oils used to fall into "oddities" below and pile up for ever, neither used
+                // nor sold. Keep what the worn weapon can use (see WeaponOilKeep); sell the rest.
+                if (IsWeaponOil(item))
+                {
+                    int shape = item.Info.Shape;
+                    if (!oilsLeft.TryGetValue(shape, out long left)) left = WeaponOilKeep(shape);
+
+                    long kept = Math.Min(item.Count, left);
+                    if (kept > 0) keep[pair.Key] = kept;
+                    oilsLeft[shape] = left - kept;
+                    continue;
+                }
 
                 if (item.Info.Shape == TownTeleportShape) scrolls.Add(pair);
                 else if (IsHealthPotion(item)) health.Add(pair);
