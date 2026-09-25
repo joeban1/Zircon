@@ -155,6 +155,29 @@ namespace MirBot
             }
         }
 
+        /// <summary>
+        /// Skills never worth a hunting trip (NoHuntSkills), by MagicInfo.Index. Potion Mastery is
+        /// sold by vendors, and its level 4 training copies are too rare a drop to chase - bots
+        /// were picking maps for them. A copy that drops anyway is still looted and read.
+        /// </summary>
+        private readonly HashSet<int> _noHunt = new HashSet<int>();
+
+        /// <summary>Resolve NoHuntSkills names ("Potion Mastery, ...") to magic indexes.</summary>
+        public void SetNoHunt(string names)
+        {
+            _noHunt.Clear();
+
+            HashSet<string> wanted = new HashSet<string>(
+                (names ?? "").Split(',').Select(x => x.Trim()).Where(x => x.Length > 0),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (MagicInfo magic in Globals.MagicInfoList?.Binding ?? Enumerable.Empty<MagicInfo>())
+                if (magic != null && wanted.Contains(magic.Name ?? ""))
+                    _noHunt.Add(magic.Index);
+        }
+
+        public bool NoHunt(int magic) => _noHunt.Contains(magic);
+
         /// <summary>A book for this magic drops only from bosses and mini-bosses.</summary>
         public bool BossOnly(int magic) => _anyBook.ContainsKey(magic) && !_fromOrdinary.Contains(magic);
 
@@ -175,6 +198,7 @@ namespace MirBot
                 if (!Backpack.CanClassUseInfo(pair.Value, mirClass)) continue;
                 if (!Backpack.MeetsRequirement(pair.Value, level, stats)) continue;
 
+                if (_noHunt.Contains(pair.Key)) continue;
                 wanted.Add(pair.Key);
             }
 
@@ -186,7 +210,7 @@ namespace MirBot
             // is separate); learning such a skill the FIRST time is still sought above.
             if (world != null)
                 foreach (KeyValuePair<int, ItemInfo> pair in _anyBook)
-                    if (world.Trainable(pair.Key) && !BossOnly(pair.Key) &&
+                    if (world.Trainable(pair.Key) && !BossOnly(pair.Key) && !_noHunt.Contains(pair.Key) &&
                         Backpack.MeetsRequirement(pair.Value, level, stats))
                         wanted.Add(pair.Key);
 

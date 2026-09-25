@@ -293,6 +293,30 @@ namespace MirBot.Tests
             Assert.Contains(2, wanted);
         }
 
+        [Fact]
+        public void ANoHuntSkillIsNeverAHuntingTarget()
+        {
+            BookDropIndex index = new BookDropIndex();
+            var anyBook = (Dictionary<int, ItemInfo>)typeof(BookDropIndex)
+                .GetField("_anyBook", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(index);
+            var ordinary = (HashSet<int>)typeof(BookDropIndex)
+                .GetField("_fromOrdinary", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(index);
+            var noHunt = (HashSet<int>)typeof(BookDropIndex)
+                .GetField("_noHunt", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(index);
+
+            anyBook[3] = Item(963, "Potion Mastery", ItemType.Book, 0);    // ordinary monsters drop it
+            ordinary.Add(3);
+
+            WorldModel world = World();
+            world.ApplyMagic(new ClientUserMagic { InfoIndex = 3, Level = 3 });
+
+            Assert.Contains(3, index.Wanted(MirClass.Warrior, 45, new Stats(), world));
+
+            noHunt.Add(3);                                                   // NoHuntSkills=Potion Mastery
+            Assert.True(index.NoHunt(3));
+            Assert.DoesNotContain(3, index.Wanted(MirClass.Warrior, 45, new Stats(), world));
+        }
+
         // ---- helpers -------------------------------------------------------------------------
 
         private static readonly TimeSpan Hour = TimeSpan.FromHours(1);

@@ -587,8 +587,9 @@ namespace MirBot
             Log.Write($"Butcherable monsters - {Butcher.Describe()}");
 
             BookDrops.Build(Books);
+            BookDrops.SetNoHunt(new BotConfig().NoHuntSkills);
             Log.Write($"Drop-only skill books: {BookDrops.BookCount} across " +
-                      $"{BookDrops.MapCount} map(s)");
+                      $"{BookDrops.MapCount} map(s); never hunted for: {new BotConfig().NoHuntSkills}");
             GearDrops.Build();
             Log.Write($"Equipment drops indexed across {GearDrops.MapCount} map(s)");
             BotConnection.Monsters = Monsters;

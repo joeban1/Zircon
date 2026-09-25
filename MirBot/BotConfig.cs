@@ -275,6 +275,13 @@ namespace MirBot
         /// </summary>
         public string CombineNPCs = "Payton";
 
+        /// <summary>
+        /// Skills whose books are never a reason to choose a hunting map, first learn or level 4
+        /// training. Potion Mastery is sold by vendors and its training drops are too rare to
+        /// chase. Host-wide like CombineNPCs. A copy that drops is still looted and read.
+        /// </summary>
+        public string NoHuntSkills = "Potion Mastery";
+
         /// <summary>Take and complete the database's quests (see QuestBook).</summary>
         public bool EnableQuests = true;
 
@@ -1107,6 +1114,7 @@ namespace MirBot
                 case "notifycombine": config.NotifyCombine = bool.Parse(value); break;
                 case "enablecombine": config.EnableCombine = bool.Parse(value); break;
                 case "combinenpcs": config.CombineNPCs = value; break;
+                case "nohuntskills": config.NoHuntSkills = value; break;
                 case "questbossminlevel": config.QuestBossMinLevel = int.Parse(value); break;
                 case "enablestore": config.EnableStore = bool.Parse(value); break;
                 case "storerebuyminutes": config.StoreRebuyMinutes = int.Parse(value); break;
