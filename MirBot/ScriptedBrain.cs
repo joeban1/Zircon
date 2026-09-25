@@ -2048,24 +2048,22 @@ namespace MirBot
             if (world.Dead || DateTime.UtcNow < _nextSummon) return null;
             if (Town != null && Town.Active) return null;
 
-            // The strongest summon we know. Summon Shinsu (30) and Summon Jin Skeleton (33) drop
-            // from the Lv 3 cave bosses; each one keys its pet by MonsterFlag, so recasting the SAME
-            // summon recalls that pet rather than adding one, and the server caps pets at two.
-            ClientUserMagic magic = null;
-            MonsterFlag flag = MonsterFlag.None;
-            int amulets = 1;
+            // The TWO strongest summons we know and can pay for - the server caps pets at two, and
+            // each summon keys its pet by MonsterFlag (recasting the same one recalls rather than
+            // adds). It used to pick only the single best: Jill, with Jin Skeleton AND Shinsu, kept
+            // a Jin and the old plain Skeleton for good, because once the Jin was out it looked no
+            // further and Shinsu was never cast.
+            var wanted = new List<(ClientUserMagic Magic, MonsterFlag Pet, int Amulets)>();
             foreach ((MagicType type, MonsterFlag petFlag, int cost) in Summons)
             {
                 if (!world.TryGetMagic(type, out ClientUserMagic known) || known.Info == null ||
                     known.ItemRequired || world.Level < known.Info.NeedLevel1) continue;
                 // A better summon we cannot pay amulets for yields to the next one down.
                 if (items.EquippedReagentCount(ItemType.Amulet) < cost) continue;
-                magic = known;
-                flag = petFlag;
-                amulets = cost;
-                break;
+                wanted.Add((known, petFlag, cost));
+                if (wanted.Count == 2) break;
             }
-            if (magic == null)
+            if (wanted.Count == 0)
             {
                 if (Summons.Any(s => world.CanUseMagic(s.Magic)))
                 {
@@ -2075,15 +2073,22 @@ namespace MirBot
                 return null;
             }
 
-            // Already have the best pet out - or two of anything, the server's cap. One weaker pet
-            // (the old skeleton) is kept and the better summon added beside it.
+            // What is out already, by flag - two of anything is the server's cap.
+            HashSet<MonsterFlag> out_ = new HashSet<MonsterFlag>();
             int pets = 0;
             foreach (WorldObject pet in world.OwnPets)
             {
                 pets++;
-                if (BotConnection.Monsters?.Find(pet.MonsterIndex)?.Flag == flag) return null;
+                MonsterFlag f = BotConnection.Monsters?.Find(pet.MonsterIndex)?.Flag ?? MonsterFlag.None;
+                out_.Add(f);
             }
             if (pets >= 2) return null;
+
+            // The best wanted pet that is not out. A plain Skeleton is never added as a SECOND pet
+            // beside a better one - it would only take the slot the better summon wants.
+            var missing = wanted.Where(w => !out_.Contains(w.Pet)).ToList();
+            if (missing.Count == 0) return null;
+            (ClientUserMagic magic, MonsterFlag flag, int amulets) = missing[0];
             if (pets == 1 && magic.Info.Magic == MagicType.SummonSkeleton) return null;
 
             // No reagent, no summon - and the server would take the amulet it does not have and
