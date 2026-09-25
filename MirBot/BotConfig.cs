@@ -345,6 +345,13 @@ namespace MirBot
         // Maps worth trying first, in order, before falling back to a random reachable one.
         // Comma separated map descriptions, e.g. "Deserted Mine Lv 1,Ant Cave North".
         public string PreferredMaps = "";
+
+        // Maps never chosen as a place to HUNT - by any goal: experience, exploring, books, gear,
+        // quests or boss journeys. Routes still cross them (fighting whatever blocks the way, the
+        // same as a journey through the upper floors of a cave). Bichon Castle: a huge map whose
+        // monsters crowd one small, hard-to-reach corner; its Oma Warlords (Advanced Bloody
+        // Flower) also live in Goru Cave, which is well populated.
+        public string NoHuntMaps = "Bichon Castle";
         // Experience rates are recorded per band of levels rather than per exact level, so a
         // measurement survives levelling up. 1 reverts to exact-level records.
         public int LevelBandSize = 5;
@@ -1078,6 +1085,7 @@ namespace MirBot
                 case "notifyquest": config.NotifyQuest = bool.Parse(value); break;
                 case "enablequests": config.EnableQuests = bool.Parse(value); break;
                 case "questnpcs": config.QuestNPCs = value; break;
+                case "nohuntmaps": config.NoHuntMaps = value; break;
                 case "questminibossminlevel": config.QuestMiniBossMinLevel = int.Parse(value); break;
                 case "questhuntchancepercent": config.QuestHuntChancePercent = int.Parse(value); break;
                 case "maxconsecutivequesthunts": config.MaxConsecutiveQuestHunts = int.Parse(value); break;

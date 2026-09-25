@@ -967,6 +967,29 @@ namespace MirBot
 
         private DateTime _lastQuestTownTrip = DateTime.MinValue;
 
+        private HashSet<int> _noHunt;
+        private string _noHuntFrom;
+        private DateTime _nextNoHuntCheck = DateTime.MinValue;
+
+        /// <summary>
+        /// A map in NoHuntMaps: never a hunting destination, but still a way through. Resolved by
+        /// exact map name, and re-resolved if the setting changes.
+        /// </summary>
+        private bool NoHunt(int mapIndex)
+        {
+            if (_noHunt == null || _noHuntFrom != Config.NoHuntMaps)
+            {
+                HashSet<string> names = new HashSet<string>(
+                    (Config.NoHuntMaps ?? "").Split(',').Select(x => x.Trim()).Where(x => x.Length > 0),
+                    StringComparer.OrdinalIgnoreCase);
+                _noHunt = new HashSet<int>((Globals.MapInfoList?.Binding ?? Enumerable.Empty<MapInfo>())
+                    .Where(m => m?.Description != null && names.Contains(m.Description))
+                    .Select(m => m.Index));
+                _noHuntFrom = Config.NoHuntMaps;
+            }
+            return _noHunt.Contains(mapIndex);
+        }
+
         private DateTime _lastSlowTickLog = DateTime.MinValue;
 
         /// <summary>
@@ -1193,7 +1216,8 @@ namespace MirBot
                 return true;
             }
 
-            bool Permitted(int mapIndex) => allowed == null || allowed.Contains(mapIndex);
+            bool Permitted(int mapIndex) =>
+                (allowed == null || allowed.Contains(mapIndex)) && !NoHunt(mapIndex);
 
             // BROKE: the beginner ground and nowhere else, until we can afford to leave.
             //
@@ -1869,11 +1893,11 @@ namespace MirBot
                 IReadOnlyCollection<int> towns = _host.Vendors.TownMaps;
                 int level = world.Level, maxHealth = world.MaxHealth;
 
-                rules.Huntable = map =>
+                rules.Huntable = map => !NoHunt(map) && (
                     towns.Contains(map) ||
                     (hops.ContainsKey(map) && !lethal.Contains(map) &&
                      !_host.Danger.TooDangerous(map, maxHealth) &&
-                     _host.Profiles.WorthExploring(map, level, Config.ExploreLevelsAbove, out _));
+                     _host.Profiles.WorthExploring(map, level, Config.ExploreLevelsAbove, out _)));
             }
 
             _questRules = rules;
@@ -2533,7 +2557,7 @@ namespace MirBot
             // Deserted Mine Lv 3 with no scrolls and nothing bought. The resume waits.
             if (_town != null && (_town.ShortOfSupplies || _town.NeedsVendor)) return false;
 
-            if (_connection.World.MapIndex == resume.MapIndex ||
+            if (_connection.World.MapIndex == resume.MapIndex || NoHunt(resume.MapIndex) ||
                 DateTime.UtcNow - resume.FirstFailureUtc >
                     TimeSpan.FromMinutes(Config.JourneyRetryWindowMinutes))
             {
@@ -2816,6 +2840,22 @@ namespace MirBot
                         return;
                     }
                 }
+            }
+
+            // STANDING ON A NO-HUNT MAP with no journey carrying us through it (arrived before the
+            // rule, a journey ended here, a restart): choose somewhere else, as for a barren map.
+            if (!active && _connection != null && _connection.Stage == BotStage.InGame &&
+                !_connection.World.Dead && NoHunt(_connection.World.MapIndex) &&
+                (_brain?.Travel == null || !_brain.Travel.Active) &&
+                (_questErrand == null || !_questErrand.Active) &&
+                (_fameErrand == null || !_fameErrand.Active) &&
+                DateTime.UtcNow >= _nextNoHuntCheck)
+            {
+                _nextNoHuntCheck = DateTime.UtcNow.AddMinutes(2);
+                _log.Write($"Travel: {_connection.World.MapName} is a no-hunt map (NoHuntMaps) - " +
+                           "choosing somewhere else to hunt.");
+                StartTravel();
+                return;
             }
 
             // QUEST TOWNS: after a successful town trip, go where quest work is waiting - a hand-in
