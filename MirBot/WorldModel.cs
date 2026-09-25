@@ -107,8 +107,16 @@ namespace MirBot
         /// silently refuses attacks on an owned monster, so swinging at one is a decision that can
         /// never succeed and produces no error to learn from.
         /// </summary>
+        /// <summary>
+        /// Lesser Wedge Moth (MonsterFlag.LesserWedgeMoth): 3 HP, no experience, no drops, and a
+        /// Wedge Moth Larva keeps spawning them until the larva itself dies. Banner spent Carved
+        /// Stone Tomb killing the endless stream instead of the larva. Not a target - except when
+        /// they have us boxed in (ScriptedBrain.BoxedInBySpawnling).
+        /// </summary>
+        public bool IsSpawnling;
+
         public bool IsValidTarget => IsLiveMonster && !IsGuard && !IsPet &&
-                                     !IsSceneryNode && !IsSummonedPuppet && !IsLarva;
+                                     !IsSceneryNode && !IsSummonedPuppet && !IsLarva && !IsSpawnling;
 
         public override string ToString() => $"{Kind}:{Name}#{ObjectID}@{Location.X},{Location.Y}" +
                                              (Dead ? " (dead)" : "");
@@ -901,10 +909,17 @@ namespace MirBot
             // Zircon's Puppet sometimes arrives without PetOwner even though it belongs to an
             // assassin. It is a five-second decoy and the server refuses its owner's attack;
             // do not let a newly summoned puppet displace the hostile we were fighting.
+            MonsterInfo known = monsterIndex >= 0
+                ? Globals.MonsterInfoList?.Binding?.FirstOrDefault(info => info.Index == monsterIndex)
+                : null;
+
             ob.IsSummonedPuppet = string.Equals(name, "SummonPuppet",
                 StringComparison.OrdinalIgnoreCase) ||
-                monsterIndex >= 0 && Globals.MonsterInfoList?.Binding?.Any(info =>
-                    info.Index == monsterIndex && info.Flag == MonsterFlag.SummonPuppet) == true;
+                known?.Flag == MonsterFlag.SummonPuppet;
+
+            if (known != null || !string.IsNullOrEmpty(name))
+                ob.IsSpawnling = known?.Flag == MonsterFlag.LesserWedgeMoth ||
+                                 string.Equals(name, "Lesser Wedge Moth", StringComparison.OrdinalIgnoreCase);
 
             // Null means "this packet does not carry poison" - S.DataObjectMonster has no such
             // field. Writing None for it would erase a state the server has already told us about

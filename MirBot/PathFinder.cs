@@ -34,15 +34,34 @@ namespace MirBot
         public const int NodeBudget = 20000;
 
         /// <summary>
+        /// Budget for a journey leg: one long walk across a map to its exit, searched once per leg
+        /// and then followed (ScriptedBrain caches it), not every step. Taoist Temple is 500x500 and
+        /// its walk from the arrival stone to Hyunmoon Temple's entrance needs about 22,400 cells
+        /// examined - over NodeBudget - so Sindo was told "no route" to a map it could reach, twice.
+        /// A search this size takes a few tens of milliseconds.
+        /// </summary>
+        public const int JourneyNodeBudget = 150000;
+
+        public static List<Point> Find(MapGrid grid, Point start, Point goal, int goalRange,
+            HashSet<Point> avoid) =>
+            Find(grid, start, goal, goalRange, avoid, NodeBudget, out _);
+
+        /// <summary>
         /// Steps from start to within goalRange of the goal, start excluded. Null when no route
         /// exists, or when the search ran out of budget.
         ///
         /// goalRange is what makes this usable for both jobs: 0 to stand on a dropped item, 1 to
         /// end up adjacent to a monster, whose own cell is not somewhere we can stand.
         /// </summary>
+        /// <param name="budgetExhausted">
+        /// True when the search gave up for lack of budget rather than proving there is no route.
+        /// The two used to be the same null, and a journey abandoned on the first as if it were the
+        /// second.
+        /// </param>
         public static List<Point> Find(MapGrid grid, Point start, Point goal, int goalRange,
-            HashSet<Point> avoid)
+            HashSet<Point> avoid, int budget, out bool budgetExhausted)
         {
+            budgetExhausted = false;
             if (grid == null) return null;
             if (Reached(start, goal, goalRange)) return new List<Point>();
 
@@ -62,7 +81,11 @@ namespace MirBot
                 if (Reached(current, goal, goalRange))
                     return Reconstruct(previous, start, current);
 
-                if (++examined > NodeBudget) return null;
+                if (++examined > budget)
+                {
+                    budgetExhausted = true;
+                    return null;
+                }
 
                 foreach (MirDirection direction in Directions)
                 {

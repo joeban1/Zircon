@@ -800,6 +800,27 @@ namespace MirBot
                 };
             }
 
+            // Walled in by Lesser Wedge Moths: nothing that walks - town trip, quest or fame errand,
+            // journey - can get anywhere until one is cut down, and none of them count the moths
+            // as a fight. So this sits above all of them. A 3 HP moth needs one plain swing.
+            {
+                WorldObject boxing = BoxedInBySpawnling(world);
+
+                if (boxing != null && !itemUsePending)
+                {
+                    if (Travel != null && Travel.Active) Travel.NoteFightingThrough();
+
+                    return new Decision
+                    {
+                        Action = BotAction.Attack,
+                        Reason = $"{boxing.Name} (boxed in)",
+                        Subject = boxing.Name,
+                        TargetID = boxing.ObjectID,
+                        Direction = WorldModel.DirectionTo(world.Location, boxing.Location)
+                    };
+                }
+            }
+
             // Trip steps come after survival but before picking a fight.
             // A trip may decide to spend a scroll and advance its own phase before the packet is
             // sent. Pause that state machine while another item use is outstanding; survival
@@ -943,6 +964,13 @@ namespace MirBot
                                      "tiles rather than walking deeper into them.");
                 }
                 // Fall through to combat; the journey resumes once nothing is in contact.
+            }
+            else if (!tripOwnsUs && Travel != null && Travel.Active && FindBoxingSpawnling(world) != null)
+            {
+                // Walled in by Lesser Wedge Moths. They are not targets, so nothing above counts
+                // them as a fight, and the leg would keep walking into them. Fall through to
+                // combat, where SelectTarget cuts a way out; the stall watchdog is held meanwhile.
+                Travel.NoteFightingThrough();
             }
             else if (!tripOwnsUs && Travel != null && Travel.Active)
             {
@@ -1694,6 +1722,96 @@ namespace MirBot
 
         /// <summary>True only while TrySteer is steering a journey leg (routeKind "travel").</summary>
         private bool _steeringJourney;
+
+        /// <summary>
+        /// A Lesser Wedge Moth to cut our way out through, or null. Only when every one of the
+        /// eight cells around us is a wall or occupied, at least one by a spawnling, and nothing
+        /// that IS a real target is adjacent (that fight comes first).
+        /// </summary>
+        private WorldObject BoxedInBySpawnling(WorldModel world)
+        {
+            WorldObject found = FindBoxingSpawnling(world);
+
+            if (found != null && !_saidBoxedBySpawnlings)
+                BrainLog?.Invoke($"Boxed in by {found.Name}s on {world.MapName} - cutting a way out.");
+
+            _saidBoxedBySpawnlings = found != null;
+            return found;
+        }
+
+        private WorldObject FindBoxingSpawnling(WorldModel world)
+        {
+            if (world.Dead) return null;
+
+            MapGrid grid = Maps?.For(world.MapIndex);
+            HashSet<Point> occupied = world.OccupiedCells(0);
+            WorldObject spawnling = null;
+
+            for (int d = 0; d < 8; d++)
+            {
+                Point cell = WorldModel.Step(world.Location, (MirDirection)d);
+                bool wall = grid != null && !grid.Walkable(cell);
+                if (wall) continue;
+                if (!occupied.Contains(cell)) return null;          // a way out
+
+                foreach (WorldObject ob in world.Objects)
+                {
+                    if (ob.Location != cell || !ob.IsLiveMonster) continue;
+                    if (ob.IsValidTarget) return null;             // a real fight beside us
+                    if (ob.IsSpawnling && spawnling == null) spawnling = ob;
+                }
+            }
+
+            return spawnling;
+        }
+
+        private bool _saidBoxedBySpawnlings;
+
+        private List<Point> _legRoute;
+        private int _legRouteMap = -1;
+        private Point _legRouteGoal = Point.Empty;
+        private bool _saidSearchExhausted;
+
+        /// <summary>
+        /// The rest of the remembered leg route from where we stand, or null to search again: a
+        /// different map or exit, a refused move, or we are no longer on the route (a fight pulled
+        /// us off it).
+        /// </summary>
+        private List<Point> CachedLegRoute(WorldModel world, Point destination)
+        {
+            if (_legRoute == null || _legRouteMap != world.MapIndex || _legRouteGoal != destination ||
+                _blockedMoves > 0) return null;
+
+            int at = _legRoute.IndexOf(world.Location);
+            if (at < 0) return null;
+
+            List<Point> rest = _legRoute.GetRange(at + 1, _legRoute.Count - at - 1);
+            return rest.Count > 0 ? rest : null;
+        }
+
+        private int _legExhaustedMap = -1;
+        private Point _legExhaustedGoal = Point.Empty;
+        private DateTime _legExhaustedAt = DateTime.MinValue;
+
+        private void RememberLegRoute(WorldModel world, Point destination, List<Point> path)
+        {
+            // A new leg (map or exit) gets its own "ran out of budget" line.
+            if (_legRouteGoal != destination || _legRouteMap != world.MapIndex)
+                _saidSearchExhausted = false;
+
+            _legRouteMap = world.MapIndex;
+            _legRouteGoal = destination;
+
+            if (path == null || path.Count == 0)
+            {
+                _legRoute = null;
+                return;
+            }
+
+            // Stored with our own cell at the front, so IndexOf finds the start too.
+            _legRoute = new List<Point>(path.Count + 1) { world.Location };
+            _legRoute.AddRange(path);
+        }
         private DateTime _routeAt = DateTime.MinValue;
 
         /// <summary>
@@ -1817,9 +1935,55 @@ namespace MirBot
                     }
                 }
 
-                List<Point> path = PathFinder.Find(grid, world.Location, destination, goalRange, avoid);
+                // A journey leg's route is searched once and then followed: the leg is one long
+                // walk to an exit, and searching the whole of it again on every step was both
+                // wasteful and what the node budget was protecting against. Reused only while we
+                // are standing on it and nothing has refused a move.
+                List<Point> path = _steeringJourney ? CachedLegRoute(world, destination) : null;
+                bool exhausted = false;
 
-                if (path == null) return false;
+                // A search that already ran out for this leg is not repeated every step - that
+                // would be 150,000 cells a tick. Blind steering carries on for a minute, then one
+                // fresh attempt from wherever we have got to.
+                if (path == null && _steeringJourney && _legExhaustedMap == world.MapIndex &&
+                    _legExhaustedGoal == destination &&
+                    DateTime.UtcNow - _legExhaustedAt < TimeSpan.FromMinutes(1))
+                    exhausted = true;
+                else if (path == null)
+                {
+                    path = PathFinder.Find(grid, world.Location, destination, goalRange, avoid,
+                        _steeringJourney ? PathFinder.JourneyNodeBudget : PathFinder.NodeBudget,
+                        out exhausted);
+
+                    if (_steeringJourney) RememberLegRoute(world, destination, path);
+
+                    if (exhausted && _steeringJourney)
+                    {
+                        _legExhaustedMap = world.MapIndex;
+                        _legExhaustedGoal = destination;
+                        _legExhaustedAt = DateTime.UtcNow;
+                    }
+                }
+
+                if (path == null)
+                {
+                    // Out of search budget is not "no route". For a journey leg, walk straight at
+                    // the exit and let the stall watchdog judge it, rather than abandoning a map
+                    // that is reachable.
+                    if (!exhausted || !_steeringJourney) return false;
+
+                    if (!_saidSearchExhausted)
+                    {
+                        _saidSearchExhausted = true;
+                        BrainLog?.Invoke($"Travel: route search to {destination.X},{destination.Y} on " +
+                                         $"{world.MapName} ran out of budget - heading straight " +
+                                         "for it instead of abandoning the journey.");
+                    }
+
+                    decision.Direction = Unstick(WorldModel.DirectionTo(world.Location, destination));
+                    decision.Distance = RunDistance(world, straightDistance);
+                    return true;
+                }
 
                 route = path;
 
@@ -2920,7 +3084,8 @@ namespace MirBot
             if (world.NearestLiveMonster(1, _unreachable.Keys) != null) return null;
 
             return world.Objects
-                .Where(x => x.IsLiveMonster && !x.IsPet && Quest.HuntTargets.Contains(x.MonsterIndex) &&
+                .Where(x => x.IsLiveMonster && !x.IsPet && !x.IsSpawnling &&
+                            Quest.HuntTargets.Contains(x.MonsterIndex) &&
                             !_unreachable.ContainsKey(x.ObjectID) &&
                             world.DistanceTo(x.Location) <= _config.AggroRange + 10 &&
                             !TooDangerous(world, x))
@@ -3708,6 +3873,10 @@ namespace MirBot
         /// </summary>
         private WorldObject SelectTarget(WorldModel world)
         {
+            // Walled in by Lesser Wedge Moths: the one case one is worth a swing.
+            WorldObject boxedBy = BoxedInBySpawnling(world);
+            if (boxedBy != null) return boxedBy;
+
             if (_committedTarget != 0)
             {
                 WorldObject current = world.Objects.FirstOrDefault(x => x.ObjectID == _committedTarget);
